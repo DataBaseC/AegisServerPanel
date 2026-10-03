@@ -64,9 +64,11 @@ class MetricsSampler:
         swap = self._safe(psutil.swap_memory)
         rates = self._rates(now)
 
-        # 线程总数需要遍历整个进程表，开销大，每 10 次采样（约 20 秒）算一次即可
+        # 线程总数需要遍历整个进程表：在 PRoot 上每个 /proc 访问都是 ptrace 慢速
+        # 调用，300 进程要数秒——io 受限（Android/PRoot）或首次采样直接跳过，
+        # 否则采样线程会饿死整个事件循环（实测教训）。
         self._sample_count += 1
-        if self._sample_count % 10 == 1:
+        if not self._io_limited and self._sample_count > 1 and self._sample_count % 10 == 1:
             try:
                 self._cached_threads = sum(
                     p.info["num_threads"]

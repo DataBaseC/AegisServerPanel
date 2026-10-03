@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import sys
@@ -38,7 +39,8 @@ async def info():
 
 @router.get("/metrics")
 async def current_metrics():
-    data = metrics.sample()
+    # 采样含 psutil 系统调用，PRoot 上单次可达数百毫秒，绝不能阻塞事件循环
+    data = await asyncio.to_thread(metrics.sample)
     data["mode"] = config.mode  # 前端据此实时感知模式变化
     return data
 

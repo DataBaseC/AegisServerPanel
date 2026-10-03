@@ -312,6 +312,9 @@ def main() -> int:
         access_log=False,
         ssl_certfile=args.ssl_certfile,
         ssl_keyfile=args.ssl_keyfile,
+        # 优雅关闭限时：默认无限等待，一个未完成的 WebSocket 就能把重启
+        # 卡成几分钟甚至永久（实测教训），守护脚本会被它堵死
+        timeout_graceful_shutdown=10,
     )
     return 0
 

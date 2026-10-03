@@ -69,9 +69,14 @@ async def run(
 
     try:
         if shell:
-            proc = await asyncio.create_subprocess_shell(args[0], **kwargs)
+            spawning = asyncio.create_subprocess_shell(args[0], **kwargs)
         else:
-            proc = await asyncio.create_subprocess_exec(*args, **kwargs)
+            spawning = asyncio.create_subprocess_exec(*args, **kwargs)
+        # spawn 本身也可能挂住（多线程 fork 在 PRoot 上有持锁风险），
+        # 必须一并纳入超时保护，否则 wait_for 的超时永远轮不到
+        proc = await asyncio.wait_for(spawning, timeout=min(timeout, 15))
+    except asyncio.TimeoutError:
+        return Result(-1, "", "子进程创建超时")
     except (OSError, ValueError) as exc:
         return Result(-1, "", f"无法启动命令: {exc}")
 

@@ -287,9 +287,12 @@ def _health_targets(host: str) -> list[str]:
 
 
 def health_check(port: int, host: str = "127.0.0.1",
-                 expect_version: str | None = None) -> dict | None:
+                 expect_version: str | None = None,
+                 tries: int | None = None, delay: float | None = None) -> dict | None:
     """轮询 /healthz。expect_version 给定时，返回旧版本视为未就绪。"""
-    deadline = time.time() + HEALTH_TRIES * HEALTH_DELAY
+    tries = HEALTH_TRIES if tries is None else tries
+    delay = HEALTH_DELAY if delay is None else delay
+    deadline = time.time() + tries * delay
     last: dict | None = None
     while time.time() < deadline:
         for base in _health_targets(host):
@@ -301,7 +304,7 @@ def health_check(port: int, host: str = "127.0.0.1",
                     return data
             except (OSError, ValueError):
                 pass
-        time.sleep(HEALTH_DELAY)
+        time.sleep(delay)
     return last  # 不为 None 说明服务在跑但版本不符，调用方据此回滚
 
 

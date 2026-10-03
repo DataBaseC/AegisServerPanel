@@ -1,10 +1,18 @@
-"""会话管理：登录令牌签发、校验、失败锁定。"""
+"""会话管理：登录令牌签发、校验、失败锁定。
+
+会话写穿到 sessions.json（0600，与配置文件同目录）：
+重启后面板登录态不丢，升级对浏览器用户无感。
+暴力破解计数只留内存——重启清零可接受，不值得落盘。
+"""
 
 from __future__ import annotations
 
+import json
+import os
 import secrets
 import threading
 import time
+from pathlib import Path
 
 from fastapi import HTTPException, Request, WebSocket, status
 
@@ -14,6 +22,8 @@ INTERNAL_HINT = "该功能仅在内网模式可用，请在服务器上执行 se
 
 MAX_FAILURES = 5
 LOCKOUT_SECONDS = 60
+SESSIONS_FILE = "sessions.json"
+PERSIST_MIN_INTERVAL = 60.0  # 滑动续期的落盘节流（秒）
 
 
 class SessionStore:
@@ -22,6 +32,43 @@ class SessionStore:
         self._sessions: dict[str, dict] = {}
         self._failures: dict[str, list[float]] = {}
         self._lock = threading.Lock()
+        self._last_persist = 0.0
+        self._load()
+
+    def _file(self) -> Path:
+        return Path(config.path).parent / SESSIONS_FILE
+
+    def _load(self) -> None:
+        try:
+            data = json.loads(self._file().read_text("utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
+        now = time.time()
+        for token, session in data.items():
+            if isinstance(session, dict) and session.get("expires", 0) >= now:
+                self._sessions[token] = session
+
+    def _persist(self, force: bool = False) -> None:
+        """落盘。create/revoke 立即写；滑动续期按 PERSIST_MIN_INTERVAL 节流。"""
+        now = time.time()
+        if not force and now - self._last_persist < PERSIST_MIN_INTERVAL:
+            return
+        self._last_persist = now
+        path = self._file()
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(self._sessions), "utf-8")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except OSError:
+            # 落盘失败只影响"重启不掉线"，内存会话照常工作
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def create(self, ip: str) -> str:
         token = secrets.token_urlsafe(32)
@@ -29,6 +76,7 @@ class SessionStore:
         with self._lock:
             self._sessions[token] = {"ip": ip, "created": now, "expires": now + self.ttl}
             self._prune()
+            self._persist(force=True)
         return token
 
     def validate(self, token: str | None) -> dict | None:
@@ -40,19 +88,23 @@ class SessionStore:
                 return None
             if session["expires"] < time.time():
                 self._sessions.pop(token, None)
+                self._persist()
                 return None
             session["expires"] = time.time() + self.ttl  # 滑动续期
+            self._persist()
             return dict(session)
 
     def revoke(self, token: str | None) -> None:
         if not token:
             return
         with self._lock:
-            self._sessions.pop(token, None)
+            if self._sessions.pop(token, None) is not None:
+                self._persist(force=True)
 
     def revoke_all(self) -> None:
         with self._lock:
             self._sessions.clear()
+            self._persist(force=True)
 
     def active_count(self) -> int:
         with self._lock:

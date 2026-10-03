@@ -170,11 +170,21 @@ rotate_log() {{
   return 0
 }}
 
+# 退出后 1 秒即重试拉起（升级切换的总间隙 ≈ 1.5s）；
+# 连续崩溃超过 10 次放慢到 5 秒，防止瞬时故障拖垮设备
+fails=0
 while :; do
   rotate_log
   "{_venv_python(target_dir)}" -m app.main --host {host} --port {port} >> "$LOG" 2>&1
-  echo "[$(date '+%F %T')] panel exited (code=$?), 3s 后重启" >> "$LOG"
-  sleep 3
+  code=$?
+  if [ "$code" = "0" ] || [ "$code" = "143" ]; then fails=0; else fails=$((fails+1)); fi
+  if [ "$fails" -gt 10 ]; then
+    echo "[$(date '+%F %T')] panel exited (code=$code), 连续失败 $fails 次，5s 后重启" >> "$LOG"
+    sleep 5
+  else
+    echo "[$(date '+%F %T')] panel exited (code=$code), 1s 后重启" >> "$LOG"
+    sleep 1
+  fi
 done
 """
     path = target_dir / SUPERVISOR_NAME
@@ -387,7 +397,7 @@ def cmd_install(target_dir: Path, host: str, port: int) -> int:
         print("==> 未检测到 systemd，安装守护脚本（崩溃自动拉起）")
         write_supervisor(target_dir, host, port)
         _start_supervisor(target_dir)
-        print("    守护方式：panel-supervisor.sh（崩溃 3 秒内自动拉起，flock 单实例）")
+        print("    守护方式：panel-supervisor.sh（崩溃 1 秒内自动拉起，flock 单实例）")
         print("    注意：容器 / PRoot 环境的开机自启需在容器层配置，例如 Termux：")
         print("    安装 Termux:Boot APP 并添加 proot-distro login 启动脚本，")
         print("    并在容器 root 的 crontab 中加 @reboot 拉起守护。")

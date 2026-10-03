@@ -21,43 +21,60 @@ class MetricsSampler:
         self._last: tuple[float, object, object] | None = None
         self._sample_count = 0
         self._cached_threads = 0
+        # Android / PRoot 等环境可能屏蔽 /sys/block、/proc/net/dev，
+        # 对应计数器读不到时降级为 0 并在快照里标记 io_limited
+        self._io_limited = False
         self.history: deque[dict] = deque(maxlen=HISTORY_SIZE)
         # 首次调用只用于初始化基线
         psutil.cpu_percent(interval=None)
         psutil.cpu_percent(interval=None, percpu=True)
 
+    @staticmethod
+    def _safe(fn, default=None):
+        """读系统计数器：Android / PRoot 可能屏蔽对应 /proc、/sys 文件。"""
+        try:
+            return fn()
+        except (OSError, psutil.Error):
+            return default
+
     def _rates(self, now: float) -> dict:
-        disk = psutil.disk_io_counters()
-        net = psutil.net_io_counters()
+        disk = self._safe(psutil.disk_io_counters)
+        net = self._safe(psutil.net_io_counters)
+        self._io_limited = disk is None or net is None
         rates = {"disk_read": 0.0, "disk_write": 0.0, "net_sent": 0.0, "net_recv": 0.0}
-        if self._last is not None and disk is not None and net is not None:
-            ts, last_disk, last_net = self._last
-            delta = max(now - ts, 1e-6)
-            if last_disk is not None:
-                rates["disk_read"] = max(0.0, (disk.read_bytes - last_disk.read_bytes) / delta)
-                rates["disk_write"] = max(0.0, (disk.write_bytes - last_disk.write_bytes) / delta)
-            if last_net is not None:
-                rates["net_sent"] = max(0.0, (net.bytes_sent - last_net.bytes_sent) / delta)
-                rates["net_recv"] = max(0.0, (net.bytes_recv - last_net.bytes_recv) / delta)
+        last = self._last
         self._last = (now, disk, net)
+        if last is None:
+            return rates  # 首次采样没有基线
+        ts, last_disk, last_net = last
+        delta = max(now - ts, 1e-6)
+        if disk is not None and last_disk is not None:
+            rates["disk_read"] = max(0.0, (disk.read_bytes - last_disk.read_bytes) / delta)
+            rates["disk_write"] = max(0.0, (disk.write_bytes - last_disk.write_bytes) / delta)
+        if net is not None and last_net is not None:
+            rates["net_sent"] = max(0.0, (net.bytes_sent - last_net.bytes_sent) / delta)
+            rates["net_recv"] = max(0.0, (net.bytes_recv - last_net.bytes_recv) / delta)
         return rates
 
     def sample(self) -> dict:
         now = time.time()
         cpu_total = psutil.cpu_percent(interval=None)
         cpu_per_core = psutil.cpu_percent(interval=None, percpu=True)
-        memory = psutil.virtual_memory()
-        swap = psutil.swap_memory()
+        memory = self._safe(psutil.virtual_memory)
+        swap = self._safe(psutil.swap_memory)
         rates = self._rates(now)
 
         # 线程总数需要遍历整个进程表，开销大，每 10 次采样（约 20 秒）算一次即可
         self._sample_count += 1
         if self._sample_count % 10 == 1:
-            self._cached_threads = sum(
-                p.info["num_threads"]
-                for p in psutil.process_iter(["num_threads"])
-                if p.info["num_threads"]
-            )
+            try:
+                self._cached_threads = sum(
+                    p.info["num_threads"]
+                    for p in psutil.process_iter(["num_threads"])
+                    if p.info["num_threads"]
+                )
+            except (OSError, psutil.Error):
+                pass
 
         try:
             load = list(psutil.getloadavg())
@@ -83,34 +100,36 @@ class MetricsSampler:
         except (AttributeError, OSError):
             temps = []
 
-        disk_usage = psutil.disk_usage("/")
+        disk_usage = self._safe(lambda: psutil.disk_usage("/"))
+        boot = self._safe(psutil.boot_time, 0.0)
         snapshot = {
             "time": now,
+            "io_limited": self._io_limited,
             "cpu": round(cpu_total, 1),
             "cpu_per_core": [round(v, 1) for v in cpu_per_core],
             "cpu_mhz": cpu_mhz,
             "mem": {
-                "total": memory.total,
-                "used": memory.total - memory.available,
-                "available": memory.available,
-                "percent": round(memory.percent, 1),
-                "cached": getattr(memory, "cached", 0),
+                "total": memory.total if memory else 0,
+                "used": (memory.total - memory.available) if memory else 0,
+                "available": memory.available if memory else 0,
+                "percent": round(memory.percent, 1) if memory else 0.0,
+                "cached": getattr(memory, "cached", 0) if memory else 0,
             },
             "swap": {
-                "total": swap.total,
-                "used": swap.used,
-                "percent": round(swap.percent, 1),
+                "total": swap.total if swap else 0,
+                "used": swap.used if swap else 0,
+                "percent": round(swap.percent, 1) if swap else 0.0,
             },
             "disk": {
                 **{k: round(v) for k, v in rates.items() if k.startswith("disk")},
-                "total": disk_usage.total,
-                "used": disk_usage.used,
-                "percent": round(disk_usage.percent, 1),
+                "total": disk_usage.total if disk_usage else 0,
+                "used": disk_usage.used if disk_usage else 0,
+                "percent": round(disk_usage.percent, 1) if disk_usage else 0.0,
             },
             "net": {k: round(v) for k, v in rates.items() if k.startswith("net")},
             "load": [round(v, 2) for v in load],
-            "uptime": int(now - psutil.boot_time()),
-            "processes": len(psutil.pids()),
+            "uptime": int(now - boot) if boot else 0,
+            "processes": len(self._safe(psutil.pids, [])),
             "threads": self._cached_threads,
             "temps": temps,
         }

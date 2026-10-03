@@ -39,11 +39,15 @@ STATIC_DIR = BASE_DIR / "static"
 
 async def _sampler() -> None:
     """每 2 秒采集一次性能数据，供历史图表使用。"""
+    last_error: tuple[str, float] | None = None
     while True:
         try:
             await asyncio.to_thread(metrics.sample)
-        except Exception:  # 采集失败不应影响服务
-            pass
+        except Exception as exc:  # 采集失败不应影响服务，但要留下线索（限频防日志洪水）
+            now = asyncio.get_running_loop().time()
+            if last_error is None or last_error[0] != repr(exc) or now - last_error[1] > 300:
+                logger.warning("性能采样失败: %r", exc)
+                last_error = (repr(exc), now)
         await asyncio.sleep(2)
 
 
@@ -108,7 +112,11 @@ for module in (
 
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "version": __version__, "initialized": config.initialized}
+    build = None
+    version_file = BASE_DIR / "VERSION"
+    if version_file.exists():
+        build = version_file.read_text("utf-8").strip() or None
+    return {"ok": True, "version": __version__, "build": build, "initialized": config.initialized}
 
 
 @app.get("/")

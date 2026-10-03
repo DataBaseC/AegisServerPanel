@@ -960,6 +960,7 @@ registerView('terminal', {
     term.open($('#terminal-host'));
 
     let socket = null, disposed = false, reconnectTimer = null, fontSize = 13.5;
+    let everConnected = false;
     const statusEl = $('#term-status');
 
     const doFit = () => {
@@ -979,6 +980,10 @@ registerView('terminal', {
       socket.onopen = () => {
         statusEl.textContent = '已连接';
         statusEl.className = 'badge ok';
+        if (everConnected) {
+          term.write('\r\n\x1b[33m[连接已恢复。每次连接都是新终端会话，服务升级后原会话已结束]\x1b[0m\r\n');
+        }
+        everConnected = true;
         doFit();
         term.focus();
       };
@@ -989,7 +994,10 @@ registerView('terminal', {
       socket.onclose = () => {
         statusEl.textContent = '已断开';
         statusEl.className = 'badge danger';
-        if (!disposed) reconnectTimer = setTimeout(connect, 1500);
+        if (!disposed) {
+          term.write('\r\n\x1b[31m[连接已断开，1.5 秒后自动重连…]\x1b[0m\r\n');
+          reconnectTimer = setTimeout(connect, 1500);
+        }
       };
       socket.onerror = () => { statusEl.textContent = '连接错误'; statusEl.className = 'badge danger'; };
     }
@@ -2154,6 +2162,7 @@ registerView('settings', {
   async render(root) {
     const caps = live.capabilities || {};
     const info = await api.get('/api/system/info').catch(() => ({}));
+    const hz = await fetch('/healthz').then((r) => r.json()).catch(() => null);
     root.innerHTML = `
       <div class="grid c2">
         <div class="card">
@@ -2193,10 +2202,27 @@ registerView('settings', {
         </div>
 
         <div class="card">
+          <h2>面板升级</h2>
+          <dl class="kv">
+            <dt>当前版本</dt><dd id="upd-version">${esc(hz?.version || '-')}</dd>
+            <dt>部署标记</dt><dd class="mono">${esc(hz?.build || '未知')}</dd>
+          </dl>
+          <div class="row" style="margin-top:12px">
+            <button class="btn primary" id="btn-self-update" ${isInternal() ? '' : 'disabled'}>一键升级（git 拉取最新代码）</button>
+            <span class="dim" style="font-size:12px">${isInternal() ? '' : '仅内网模式可用'}</span>
+          </div>
+          <div class="dim" style="font-size:12px;margin-top:12px">
+            升级在后台执行：自动备份配置 → 拉取 → 装依赖 → 重启 → 健康检查，<b>失败自动回滚</b>。
+            过程约 1 分钟，期间登录态保持、指标曲线中断一拍，正在打开的网页终端会断开并自动重连。
+            详情见 <span class="mono">panel.log</span>。
+          </div>
+        </div>
+
+        <div class="card">
           <h2>安全说明</h2>
           <ul style="line-height:1.9;padding-left:18px;margin:0;font-size:13px">
             <li>密码使用 PBKDF2-HMAC-SHA256（26 万次迭代 + 随机盐）存储在本地配置文件，权限 0600。</li>
-            <li>登录会话默认 12 小时，写入 HttpOnly Cookie，服务重启后需重新登录。</li>
+            <li>登录会话默认 12 小时，写入 HttpOnly Cookie，并落盘保存——服务重启后面板登录态保持。</li>
             <li>连续 5 次密码错误后，该来源 IP 会被锁定 60 秒。</li>
             <li>默认处于<b>公网模式</b>：即使登录成功，也只开放只读监控，终端与写操作全部锁定。</li>
             <li>只有 <b>内网模式</b>才能获得完整控制权；它必须登录服务器本机执行命令才能激活。</li>
@@ -2246,6 +2272,42 @@ serverpanel --show-mode          # 查看当前模式</div>
         toast(res.message);
         $('#pwd-form').reset();
       } catch (err) { toast(err.message, 'err'); }
+    };
+
+    $('#btn-self-update').onclick = async () => {
+      const before = hz?.build || hz?.version || '';
+      const ok = await confirmDialog({
+        title: '面板一键升级', confirmText: '开始升级',
+        message: '将拉取远端最新代码并重启面板。失败会自动回滚到当前版本，确定继续吗？',
+      });
+      if (!ok) return;
+      const btn = $('#btn-self-update');
+      btn.disabled = true;
+      btn.textContent = '升级中…';
+      try {
+        await api.post('/api/system/self-update', {});
+      } catch (err) { toast(err.message, 'err'); btn.disabled = false; btn.textContent = '一键升级（git 拉取最新代码）'; return; }
+      toast('升级已在后台启动，等待面板重启…');
+      const deadline = Date.now() + 180000;
+      const timer = setInterval(async () => {
+        let done = false;
+        try {
+          const v = await fetch('/healthz').then((r) => r.json());
+          if ((v.build || v.version) && (v.build || v.version) !== before) {
+            clearInterval(timer);
+            toast(`升级完成：${v.version}（${v.build || ''}）`, 'ok');
+            setTimeout(() => location.reload(), 1200);
+            done = true;
+          }
+        } catch (err) { /* 重启间隙，继续等 */ }
+        if (done) return;
+        if (Date.now() > deadline) {
+          clearInterval(timer);
+          toast('升级未在预期时间内完成，请通过终端查看 panel.log', 'err');
+          btn.disabled = false;
+          btn.textContent = '一键升级（git 拉取最新代码）';
+        }
+      }, 3000);
     };
 
     root.onclick = async (event) => {

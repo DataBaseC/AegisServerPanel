@@ -1,8 +1,11 @@
-"""系统信息、性能指标、电源操作。"""
+"""系统信息、性能指标、电源操作、面板自升级。"""
 
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -15,10 +18,17 @@ from ..utils import is_root
 
 router = APIRouter(prefix="/api/system", tags=["system"], dependencies=[Depends(require_auth)])
 
+# 仓库根目录（app/ 的上级）
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+
 
 class PowerBody(BaseModel):
     action: str  # reboot | shutdown | cancel
     confirm: str = ""
+
+
+class SelfUpdateBody(BaseModel):
+    ref: str = ""  # 目标分支/标签/commit，空 = 默认 origin/main
 
 
 @router.get("/info")
@@ -107,3 +117,39 @@ async def power(body: PowerBody):
     if not result.ok and body.action != "cancel":
         raise HTTPException(500, result.text or "执行失败")
     return {"ok": True, "message": message}
+
+
+@router.post("/self-update", dependencies=[Depends(require_internal)])
+async def self_update(body: SelfUpdateBody | None = None):
+    """面板内一键升级。
+
+    关键点：更新进程必须脱离本面板的进程组（setsid）——升级流程会重启面板，
+    跟面板同组的进程会被一起带走，更新和其中的健康检查/回滚就都没了。
+    更新过程（含失败原因）写入 panel.log，前端轮询 /healthz 观察版本变化。
+    """
+    update_cmd = [
+        sys.executable, "-m", "app.main", "--update", "--app-dir", str(BASE_DIR),
+    ]
+    if body and body.ref:
+        update_cmd += ["--update-ref", body.ref]
+
+    log_path = BASE_DIR / "panel.log"
+    log_fh = open(log_path, "ab")  # O_APPEND，多进程并发写安全
+    try:
+        subprocess.Popen(
+            update_cmd,
+            cwd=BASE_DIR,
+            stdin=subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=log_fh,
+            start_new_session=True,
+        )
+    finally:
+        log_fh.close()  # 子进程持有自己的 fd 副本，父进程随即关闭
+
+    return {
+        "ok": True,
+        "message": "升级已在后台启动：面板数秒内重启，登录态保持；"
+                   "完成后版本号见 /healthz，失败自动回滚。详情见 panel.log。",
+        "log": str(log_path),
+    }

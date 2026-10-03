@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import stat
 import time
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -255,6 +256,84 @@ def test_cleanup_stale_archives(tmp_path, monkeypatch):
 
 
 # ---------- 管理模块纯逻辑 ----------
+
+def test_metrics_degrades_when_io_counters_blocked(monkeypatch):
+    """Android/PRoot 屏蔽 /sys/block 时，采样必须降级而不是炸掉整个采样器。"""
+    import psutil
+
+    from app import metrics as metrics_mod
+
+    def denied(*args, **kwargs):
+        raise PermissionError(13, "Permission denied: '/sys/block'")
+
+    monkeypatch.setattr(psutil, "disk_io_counters", denied)
+    monkeypatch.setattr(psutil, "net_io_counters", denied)
+    s = metrics_mod.metrics.sample()
+    assert s["io_limited"] is True
+    assert s["disk"]["disk_read"] == 0
+    assert s["net"]["net_recv"] == 0
+    assert s["cpu"] >= 0 and "mem" in s
+
+
+def test_sessions_survive_restart(authed):
+    """会话落盘：新起的 SessionStore 实例（等价进程重启后）能恢复登录态。"""
+    from app.auth import SessionStore, sessions
+
+    token = next(iter(sessions._sessions), None)
+    assert token, "应存在至少一个活动会话"
+
+    revived = SessionStore()
+    assert revived.validate(token) is not None
+
+
+def test_sessions_file_permissions(authed):
+    import stat as stat_mod
+
+    from app.config import config as cfg
+
+    f = Path(cfg.path).parent / "sessions.json"
+    if os.name != "posix":
+        pytest.skip("POSIX 权限位")
+    assert f.exists()
+    assert stat_mod.S_IMODE(f.stat().st_mode) & 0o777 == 0o600
+
+
+def test_healthz_has_build_field(client):
+    r = client.get("/healthz")
+    assert "build" in r.json()
+
+
+def test_self_update_blocked_in_public_mode(authed, monkeypatch):
+    """公网模式拒绝自升级；内网模式只允许真正 spawn（用假 Popen 验证参数）。"""
+    from app.routes import system_routes
+
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return type("PopenStub", (), {"pid": 0})()  # 占位，端点不使用返回值
+
+    monkeypatch.setattr(system_routes.subprocess, "Popen", fake_popen)
+
+    # 内网模式
+    config_mod.config.set_mode(config_mod.MODE_INTERNAL)
+    try:
+        r = authed.post("/api/system/self-update", json={})
+        assert r.status_code == 200
+        assert "start_new_session" in captured["kwargs"]
+        assert "--update" in captured["cmd"]
+        # 自定义 ref 透传
+        authed.post("/api/system/self-update", json={"ref": "origin/dev"})
+        assert "origin/dev" in captured["cmd"]
+        # 更新进程必须以生命周期标志运行，确保 _panel_pids 不会把它误杀
+        assert any(a.startswith("--") for a in captured["cmd"])
+    finally:
+        config_mod.config.set_mode(config_mod.MODE_PUBLIC)
+    # 公网模式
+    r = authed.post("/api/system/self-update", json={})
+    assert r.status_code == 403
+
 
 def test_pid_alive():
     from app import manage

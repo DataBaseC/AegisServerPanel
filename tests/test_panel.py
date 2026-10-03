@@ -194,6 +194,20 @@ def test_exec_with_agent_token(authed, anon, internal_mode):
     assert r.status_code == 401
 
 
+def test_exec_timeout_returns_clean_error(authed, internal_mode):
+    """命令超时必须返回 code=-1 的干净结果，而不是 500（回归：超时杀进程竞态）。"""
+    import sys
+    if sys.platform == "win32":
+        hang = "python -c \"import time; time.sleep(8)\""
+    else:
+        hang = "sleep 8"
+    r = authed.post("/api/terminal/exec", json={"command": hang, "timeout": 2})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["code"] == -1
+    assert "超时" in body["stderr"]
+
+
 def test_agent_token_dead_in_public_mode(anon):
     """不进入内网模式：即使持有有效令牌也必须 403。"""
     token = config_mod.config.agent_token

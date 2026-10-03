@@ -77,8 +77,11 @@ async def run(
     try:
         out, err = await asyncio.wait_for(proc.communicate(input=stdin), timeout=timeout)
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        # 超时与进程自行退出之间存在竞态：kill 可能撞上 ProcessLookupError
+        with contextlib.suppress(ProcessLookupError, OSError):
+            proc.kill()
+        with contextlib.suppress(ProcessLookupError):
+            await proc.wait()
         return Result(-1, "", f"命令执行超时（{timeout:g}s）")
 
     return Result(

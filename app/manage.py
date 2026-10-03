@@ -478,7 +478,13 @@ def cmd_restart(target_dir: Path) -> int:
 # ---------- update ----------
 
 def _git(target_dir: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *args], cwd=target_dir, capture_output=True, text=True)
+    # 网络类操作（fetch）在路由黑洞下会长时间挂起，必须限时
+    timeout = 120 if args and args[0] == "fetch" else 60
+    try:
+        return subprocess.run(["git", *args], cwd=target_dir,
+                              capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 1, "", f"git {args[0]} 超时（{timeout}s）")
 
 
 @contextlib.contextmanager

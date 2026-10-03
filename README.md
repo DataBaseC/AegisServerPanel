@@ -124,6 +124,8 @@ AegisServerPanel/
 │   ├── style.css             # 全站样式
 │   └── vendor/               # xterm.js 与 fit 插件（本地内置，不依赖 CDN）
 ├── tests/                    # pytest：鉴权、模式门禁、日志白名单回归等
+├── scripts/
+│   └── make-offline-bundle.sh  # 制作离线安装包（代码 + 依赖 wheels）
 ├── install.sh                # 安装引导（环境检查 + venv + 依赖），其余交给 serverpanel --install
 ├── run.sh                    # 前台快速启动（调试用）
 ├── requirements.txt          # 直接依赖（~= 兼容约束）
@@ -216,6 +218,44 @@ sudo SERVERPANEL_HOST=0.0.0.0 SERVERPANEL_PORT=9000 bash install.sh
 ```bash
 ./run.sh --port 8787
 ```
+
+### 离线安装（无网络环境）
+
+适用场景：目标机无法访问 PyPI/GitHub（内网隔离、网络受限的移动设备等）。原理是在有网的机器上把**代码 + 全部依赖 wheel** 打成一个包，目标机解包后完全本地安装。
+
+**第 1 步：联网机器上制作离线包**
+
+```bash
+git clone https://github.com/DataBaseC/AegisServerPanel.git
+cd AegisServerPanel
+scripts/make-offline-bundle.sh          # 为当前机器平台打包
+```
+
+为**其他架构/Python 版本**的机器打包（wheel 与平台绑定，需透传参数），例如在 x86 电脑上为 aarch64 + Python 3.12 的设备打包：
+
+```bash
+scripts/make-offline-bundle.sh \
+  --platform manylinux2014_aarch64 --python-version 3.12 \
+  --implementation cp --abi cp312
+```
+
+得到 `AegisServerPanel-offline.tar.gz`（约 20~40MB），通过 U 盘 / scp / 局域网传输到目标机。
+
+**第 2 步：目标机安装（全程无网络）**
+
+```bash
+tar xzf AegisServerPanel-offline.tar.gz
+cd AegisServerPanel-offline
+sudo bash install.sh
+```
+
+`install.sh` 检测到包内的 `wheels/` 目录会自动切换为 `pip install --no-index` 本地安装，后续的 `serverpanel --install/--update` 也同样优先使用本地 wheels。
+
+**前提与注意**：
+
+- 目标机必须预装 `python3`（≥3.10）与 `python3-venv`——它们是系统包，离线包不含。Ubuntu 24.04 自带 3.12；若缺 venv 模块，需在系统离线安装介质里补装
+- wheel 与目标机的 **架构 + Python 版本** 双重绑定，交叉打包时两个参数都要对准
+- 无网络环境下 `serverpanel --update`（git 拉取）不可用，会安全中止且不影响运行中的服务；离线升级方式：重新制作离线包 → 解包覆盖代码目录（配置在 `/etc/serverpanel/`，不受影响）→ `serverpanel --restart`
 
 安装后打开 `http://<服务器IP>:8787`，首次访问会引导设置面板密码。
 

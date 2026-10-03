@@ -508,6 +508,9 @@ def _pip_install(target_dir: Path) -> int:
             "-r", str(target_dir / "requirements.txt")]
     if constraints.exists():
         args += ["-c", str(constraints)]
+    # 离线部署（wheels/ 随离线包携带）时完全本地安装
+    if (target_dir / "wheels").is_dir():
+        args += ["--no-index", "--find-links", str(target_dir / "wheels")]
     r = subprocess.run(args)
     return r.returncode
 

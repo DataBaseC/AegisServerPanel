@@ -6,6 +6,7 @@
 # 用法：
 #   sudo bash install.sh                          # 默认监听 0.0.0.0:8787
 #   sudo SERVERPANEL_HOST=0.0.0.0 SERVERPANEL_PORT=9000 bash install.sh
+# 离线安装：目录内存在 wheels/ 时自动使用本地依赖，不访问网络（见 README）。
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,13 +28,10 @@ python3 -c 'import venv' >/dev/null 2>&1 || {
   echo "缺少 python3-venv，请先执行：apt install -y python3-venv" >&2
   exit 1
 }
-python3 - <<'EOF' || {
+python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' || {
   echo "需要 Python >= 3.10（项目注解由 Pydantic 运行时求值，3.9 及以下导入即崩）" >&2
   exit 1
 }
-import sys
-sys.exit(0 if sys.version_info >= (3, 10) else 1)
-EOF
 
 echo "==> 创建虚拟环境并安装依赖"
 if [[ ! -x "${APP_DIR}/.venv/bin/python" ]]; then
@@ -42,9 +40,12 @@ fi
 "${APP_DIR}/.venv/bin/pip" install --quiet --upgrade pip
 PIP_ARGS=(install --quiet -r "${APP_DIR}/requirements.txt")
 [[ -f "${APP_DIR}/constraints.txt" ]] && PIP_ARGS+=(-c "${APP_DIR}/constraints.txt")
+if [[ -d "${APP_DIR}/wheels" ]]; then
+  PIP_ARGS+=(--no-index --find-links "${APP_DIR}/wheels")
+  echo "==> 检测到 wheels/ 目录，使用离线依赖安装"
+fi
 "${APP_DIR}/.venv/bin/pip" "${PIP_ARGS[@]}"
 
 echo "==> 执行安装（启动命令 / VERSION / 守护 / 启动 / 健康检查）"
 cd "${APP_DIR}"
-exec "${APP_DIR}/.venv/bin/python" -m app.main --install --app-dir "${APP_DIR}" \
-  --host "${HOST}" --port "${PORT}"
+exec "${APP_DIR}/.venv/bin/python" -m app.main --install --app-dir "${APP_DIR}" --host "${HOST}" --port "${PORT}"

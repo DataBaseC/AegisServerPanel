@@ -33,7 +33,7 @@ def default_config_path() -> Path:
     env = os.environ.get("SERVERPANEL_CONFIG")
     if env:
         return Path(env)
-    if os.geteuid() == 0:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
         return Path("/etc/serverpanel/config.json")
     return Path.home() / ".config" / "serverpanel" / "config.json"
 
@@ -62,10 +62,6 @@ class Config:
                 self.data = json.loads(self.path.read_text("utf-8"))
             except (OSError, json.JSONDecodeError):
                 self.data = {}
-        # secret 用于签名下载链接等短时凭据
-        if not self.data.get("secret"):
-            self.data["secret"] = secrets.token_hex(32)
-            self.save()
         self._mtime = self._stat_mtime()
 
     def reload_if_changed(self) -> bool:
@@ -80,16 +76,13 @@ class Config:
     def save(self) -> None:
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_name(self.path.name + ".tmp")
+            # 临时文件名带上 pid：服务进程与本机 CLI 命令（serverpanel --enable-internal 等）
+            # 可能并发写同一配置，避免互相覆盖对方的临时文件（os.replace 保证单文件原子性）。
+            tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
             tmp.write_text(json.dumps(self.data, indent=2), "utf-8")
             os.chmod(tmp, 0o600)
             os.replace(tmp, self.path)
-            os.chmod(self.path, 0o600)
             self._mtime = self._stat_mtime()
-
-    @property
-    def secret(self) -> bytes:
-        return bytes.fromhex(self.data["secret"])
 
     # ---- 运行模式 ----
     @property
@@ -138,6 +131,37 @@ class Config:
             self.data.pop("agent_token_updated_at", None)
             self.save()
 
+    # ---- 安全相关可配置项 ----
+    # 日志接口允许读取的目录白名单（realpath 解析后仍须落在白名单内）。
+    # 无论服务是否以 root 运行，白名单之外一律拒绝——不能因为 root 就放开全盘读取，
+    # 否则公网只读模式下登录用户可以读到 /etc/shadow、面板自身配置等任意文件。
+    @property
+    def log_dirs(self) -> list[str]:
+        dirs = self.data.get("log_dirs")
+        if (
+            isinstance(dirs, list)
+            and dirs
+            and all(isinstance(d, str) and os.path.isabs(d) for d in dirs)
+        ):
+            return [os.path.realpath(os.path.abspath(d)) for d in dirs]
+        return ["/var/log"]
+
+    # 仅当面板部署在可信反向代理之后时才开启。开启后 client_ip 取
+    # X-Forwarded-For 的最后一跳（由可信代理写入），否则直接取 TCP 对端地址，
+    # 避免攻击者伪造 XFF 绕过登录失败锁定。
+    @property
+    def trust_proxy(self) -> bool:
+        return bool(self.data.get("trust_proxy", False))
+
+    # 跨站 WebSocket 握手的额外放行来源（反向代理换了域名时配置）。
+    # 同源（Origin 与 Host 一致）永远放行。
+    @property
+    def allowed_origins(self) -> list[str]:
+        origins = self.data.get("allowed_origins")
+        if isinstance(origins, list):
+            return [o for o in origins if isinstance(o, str) and o]
+        return []
+
     @property
     def initialized(self) -> bool:
         return bool(self.data.get("password_hash"))
@@ -169,23 +193,6 @@ class Config:
         except (ValueError, TypeError):
             return False
         return hmac.compare_digest(digest.hex(), hash_hex)
-
-    def sign(self, payload: str) -> str:
-        return hmac.new(self.secret, payload.encode(), hashlib.sha256).hexdigest()
-
-    def make_short_token(self, ttl: int = 300) -> str:
-        expires = int(time.time()) + ttl
-        return f"{expires}.{self.sign(str(expires))}"
-
-    def check_short_token(self, token: str) -> bool:
-        try:
-            expires_s, signature = token.split(".", 1)
-            expires = int(expires_s)
-        except (ValueError, AttributeError):
-            return False
-        if expires < time.time():
-            return False
-        return hmac.compare_digest(self.sign(expires_s), signature)
 
 
 config = Config()

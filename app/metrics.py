@@ -19,6 +19,8 @@ class MetricsSampler:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._last: tuple[float, object, object] | None = None
+        self._sample_count = 0
+        self._cached_threads = 0
         self.history: deque[dict] = deque(maxlen=HISTORY_SIZE)
         # 首次调用只用于初始化基线
         psutil.cpu_percent(interval=None)
@@ -47,6 +49,15 @@ class MetricsSampler:
         memory = psutil.virtual_memory()
         swap = psutil.swap_memory()
         rates = self._rates(now)
+
+        # 线程总数需要遍历整个进程表，开销大，每 10 次采样（约 20 秒）算一次即可
+        self._sample_count += 1
+        if self._sample_count % 10 == 1:
+            self._cached_threads = sum(
+                p.info["num_threads"]
+                for p in psutil.process_iter(["num_threads"])
+                if p.info["num_threads"]
+            )
 
         try:
             load = list(psutil.getloadavg())
@@ -100,7 +111,7 @@ class MetricsSampler:
             "load": [round(v, 2) for v in load],
             "uptime": int(now - psutil.boot_time()),
             "processes": len(psutil.pids()),
-            "threads": sum(p.num_threads() for p in psutil.process_iter(["num_threads"]) if p.info["num_threads"]),
+            "threads": self._cached_threads,
             "temps": temps,
         }
         with self._lock:

@@ -1,4 +1,5 @@
-fastapi>=0.110
-uvicorn[standard]>=0.27
-psutil>=5.9
-python-multipart>=0.0.9
+# 直接依赖：兼容范围约束（~= 表示接受补丁级更新，拒绝跨小版本的破坏性更新）
+fastapi~=0.142.2
+uvicorn[standard]~=0.54.0
+psutil~=7.2.2
+python-multipart~=0.0.32

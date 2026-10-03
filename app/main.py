@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import logging
 import os
 import socket
 import sys
@@ -12,7 +13,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
@@ -31,6 +32,7 @@ from .routes import (
     terminal_routes,
 )
 
+logger = logging.getLogger("serverpanel")
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
 
@@ -47,6 +49,8 @@ async def _sampler() -> None:
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 清扫历史遗留的下载打包临时目录（进程上次被杀时的残留）
+    await asyncio.to_thread(file_routes.cleanup_stale_archives)
     task = asyncio.create_task(_sampler())
     yield
     task.cancel()
@@ -64,12 +68,16 @@ app = FastAPI(
 )
 
 
+CSP = "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'"
+
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Content-Security-Policy"] = CSP
     if request.url.path.startswith("/api/"):
         response.headers["Cache-Control"] = "no-store"
     return response
@@ -77,7 +85,10 @@ async def security_headers(request: Request, call_next):
 
 @app.exception_handler(Exception)
 async def unhandled_error(request: Request, exc: Exception):
-    return JSONResponse(status_code=500, content={"detail": f"服务器内部错误: {exc}"})
+    # 内部细节只进日志不回传给客户端；本地调试可设 SERVERPANEL_DEBUG=1
+    logger.exception("未处理异常 %s %s", request.method, request.url.path)
+    detail = f"服务器内部错误: {exc}" if os.environ.get("SERVERPANEL_DEBUG") else "服务器内部错误"
+    return JSONResponse(status_code=500, content={"detail": detail})
 
 
 for module in (
@@ -110,7 +121,7 @@ async def favicon():
     icon = STATIC_DIR / "favicon.svg"
     if icon.exists():
         return FileResponse(icon, media_type="image/svg+xml")
-    return JSONResponse(status_code=204, content=None)
+    return Response(status_code=204)
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -180,11 +191,60 @@ def main() -> int:
                         help="显示当前 Agent 接入令牌后退出")
     action.add_argument("--revoke-agent-token", action="store_true",
                         help="吊销 Agent 接入令牌后退出")
+
+    # ---- 生命周期管理：安装 / 启停 / 升级（替代手工维护 systemd unit 与守护脚本）----
+    action.add_argument("--install", action="store_true",
+                        help="安装：生成启动命令、VERSION 标记与守护（systemd 或内置 supervisor）并启动")
+    action.add_argument("--start", action="store_true", help="启动面板服务")
+    action.add_argument("--stop", action="store_true", help="停止面板服务")
+    action.add_argument("--restart", action="store_true", help="重启面板服务")
+    action.add_argument("--status", action="store_true", help="查看运行状态与健康检查")
+    action.add_argument("--update", action="store_true",
+                        help="git 升级：备份配置 → fetch → 切换目标版本 → 装依赖 → 重启 → 健康检查，失败自动回滚")
+    action.add_argument("--show-version", action="store_true", help="显示版本与部署来源后退出")
+
+    parser.add_argument("--app-dir", default=str(BASE_DIR),
+                        help="应用目录（install/update/start/stop 使用，默认为代码所在目录）")
+    parser.add_argument("--update-ref", default=os.environ.get("SERVERPANEL_UPDATE_REF", "origin/main"),
+                        help="update 目标分支/标签/commit，默认 origin/main")
+    parser.add_argument("--update-force", action="store_true",
+                        help="update 时容忍本地改动（自动 stash）")
     args = parser.parse_args()
 
     if args.config:
         config.path = Path(args.config).expanduser()
         config.load()
+
+    # ---- 生命周期命令 ----
+    if any((args.install, args.start, args.stop, args.restart, args.status, args.update)):
+        from . import manage  # 延迟导入，常规启动路径不付出额外开销
+
+        target_dir = Path(args.app_dir).expanduser().resolve()
+        if args.install:
+            return manage.cmd_install(target_dir, args.host, args.port)
+        if args.start:
+            return manage.cmd_start(target_dir)
+        if args.stop:
+            return manage.cmd_stop(target_dir)
+        if args.restart:
+            return manage.cmd_restart(target_dir)
+        if args.status:
+            return manage.cmd_status(target_dir)
+        return manage.cmd_update(target_dir, args.update_ref, args.update_force)
+
+    if args.show_version:
+        print(f"ServerPanel {__version__}")
+        version_file = Path(args.app_dir) / "VERSION"
+        if version_file.exists():
+            print(f"部署来源: {version_file.read_text().strip()}")
+        if (Path(args.app_dir) / ".git").exists():
+            import subprocess
+            r = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                               cwd=args.app_dir, capture_output=True, text=True)
+            if r.returncode == 0:
+                print(f"代码版本: {r.stdout.strip()}")
+        print(f"配置文件: {config.path}")
+        return 0
 
     if args.set_password:
         try:

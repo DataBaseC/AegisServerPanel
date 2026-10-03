@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from ..auth import require_internal
 from ..config import MODE_INTERNAL, config
 from ..metrics import basic_info
+from ..utils import is_root
 from .terminal_routes import _pick_shell, recent_execs
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
@@ -39,7 +40,7 @@ async def agent_info(request: Request, _session: dict = Depends(require_internal
         "hostname": info["hostname"],
         "shell": _pick_shell(),
         "user": os.environ.get("USER") or "root",
-        "is_root": os.geteuid() == 0,
+        "is_root": is_root(),
         "recent": recent_execs(),
     }
 

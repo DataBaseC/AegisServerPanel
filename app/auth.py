@@ -86,9 +86,16 @@ sessions = SessionStore()
 
 
 def client_ip(request: Request | WebSocket) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+    """客户端真实 IP。
+
+    仅当配置 trust_proxy=true（面板部署在可信反向代理之后）才读取
+    X-Forwarded-For，且取最后一跳——最左侧的值由客户端任意填写，
+    直连部署时信任它会绕过登录失败锁定。默认取 TCP 对端地址。
+    """
+    if config.trust_proxy:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            return forwarded.split(",")[-1].strip()
     return request.client.host if request.client else "unknown"
 
 
@@ -154,19 +161,27 @@ async def require_exec_auth(request: Request) -> dict:
     raise HTTPException(status.HTTP_401_UNAUTHORIZED, "未登录或会话已过期")
 
 
-async def require_download_auth(request: Request) -> dict:
-    """下载链接鉴权：会话 Cookie 或短时签名令牌均可。"""
-    session = sessions.validate(extract_token(request))
-    if session:
-        return session
-    short = request.query_params.get("sig")
-    if short and config.check_short_token(short):
-        return {"ip": client_ip(request), "short": True}
-    raise HTTPException(status.HTTP_401_UNAUTHORIZED, "下载凭据无效或已过期")
+def origin_allowed(request: Request | WebSocket) -> bool:
+    """跨站 WebSocket 握手防护。
+
+    浏览器发起的 WebSocket 一定携带 Origin 头：与 Host 同源，或位于配置的
+    allowed_origins 白名单内才放行。非浏览器客户端（无 Origin 头）本来就要
+    通过令牌/会话鉴权，直接放行。
+    """
+    origin = request.headers.get("origin")
+    if not origin:
+        return True
+    host = request.headers.get("host")
+    if host and origin in (f"http://{host}", f"https://{host}"):
+        return True
+    return origin in config.allowed_origins
 
 
 async def authenticate_ws(websocket: WebSocket, internal_only: bool = False) -> bool:
     """WebSocket 握手鉴权，失败时关闭连接。internal_only 要求内网模式。"""
+    if not origin_allowed(websocket):
+        await websocket.close(code=1008, reason="Origin 不被允许")
+        return False
     if sessions.validate(extract_token(websocket)) is None:
         await websocket.close(code=4401, reason="未登录")
         return False

@@ -31,6 +31,7 @@ def _issue(request: Request, response: Response) -> str:
         httponly=True,
         samesite="lax",
         path="/",
+        secure=request.url.scheme == "https",  # HTTPS 部署时禁止 Cookie 走明文
     )
     return token
 

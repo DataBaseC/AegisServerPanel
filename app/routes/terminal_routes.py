@@ -3,12 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import json
 import os
-import pty
-import struct
-import termios
 import time
 from collections import deque
 
@@ -18,11 +14,22 @@ from pydantic import BaseModel
 from .. import shell
 from ..auth import authenticate_ws, require_exec_auth, require_internal, sessions
 from ..config import MODE_INTERNAL, config
+from ..utils import is_root
 
 # 终端拥有完整 root shell，仅在内网模式开放
 router = APIRouter(tags=["terminal"])
 
-SHELL_CANDIDATES = ["/bin/bash", "/usr/bin/bash", "/bin/sh"]
+# pty/fcntl/termios 仅存在于 POSIX 平台；缺失时保持可导入（服务管理等功能不受影响），
+# 终端相关接口在运行时优雅报错，而不是整个进程起不来。
+try:
+    import fcntl
+    import pty
+    import struct
+    import termios
+
+    HAS_PTY = True
+except ImportError:  # pragma: no cover - Windows 开发环境
+    HAS_PTY = False
 
 # 命令执行审计：保留最近若干条，供「Agent 接入」页面查看。
 AUDIT_LIMIT = 40
@@ -43,10 +50,10 @@ def _pick_shell() -> str:
     override = os.environ.get("SERVERPANEL_SHELL")
     if override and os.path.exists(override):
         return override
-    for candidate in SHELL_CANDIDATES:
+    for candidate in ("/bin/bash", "/usr/bin/bash", "/bin/sh"):
         if os.path.exists(candidate):
             return candidate
-    return "/bin/sh"
+    return os.environ.get("COMSPEC", "/bin/sh")  # 非 POSIX 平台的兜底
 
 
 def _set_winsize(fd: int, rows: int, cols: int) -> None:
@@ -70,12 +77,14 @@ def _child_setup() -> None:
 
 @router.get("/api/terminal/info")
 async def terminal_info(_session: dict = Depends(require_internal)):
+    if not HAS_PTY:
+        raise HTTPException(501, "当前平台不支持 PTY 终端")
     return {
         "shell": _pick_shell(),
         "user": os.environ.get("USER") or "root",
         "cwd": os.path.expanduser("~"),
         "cwd_exists": os.path.isdir(os.path.expanduser("~")),
-        "is_root": os.geteuid() == 0,
+        "is_root": is_root(),
         "active_sessions": sessions.active_count(),
     }
 
@@ -110,6 +119,11 @@ async def exec_command(body: ExecBody, auth: dict = Depends(require_exec_auth)):
 
 @router.websocket("/api/terminal/ws")
 async def terminal_socket(websocket: WebSocket):
+    if not HAS_PTY:
+        await websocket.accept()
+        await websocket.send_text("\x1b[31m当前平台不支持 PTY 终端\x1b[0m")
+        await websocket.close(code=1011)
+        return
     if not await authenticate_ws(websocket, internal_only=True):
         return
     await websocket.accept()

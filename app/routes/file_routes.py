@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import stat
@@ -9,7 +10,7 @@ import tempfile
 import time
 from typing import List
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -26,6 +27,8 @@ PROTECTED = {
     "/srv", "/sys", "/tmp", "/usr", "/var",
 }
 EDIT_LIMIT = 2 * 1024 * 1024  # 在线编辑上限 2MB
+ARCHIVE_PREFIX = "serverpanel-"
+ARCHIVE_STALE_SECONDS = 3600  # 进程崩溃遗留的打包临时目录，超过 1 小时后清扫
 
 
 class WriteBody(BaseModel):
@@ -49,7 +52,37 @@ class DeleteBody(BaseModel):
 def _abs(path: str) -> str:
     if not path:
         raise HTTPException(400, "缺少路径参数")
-    return os.path.abspath(path)
+    try:
+        return os.path.abspath(path)
+    except ValueError:  # 路径里混入 NUL 字节等非法内容
+        raise HTTPException(400, "路径不合法")
+
+
+def cleanup_stale_archives() -> None:
+    """清扫历史遗留的下载打包临时目录（正常流程在响应后即删，
+    这里兜底进程中途被杀的情况，防止 /tmp 被慢慢塞满）。"""
+    tmp_root = tempfile.gettempdir()
+    now = time.time()
+    try:
+        names = os.listdir(tmp_root)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(ARCHIVE_PREFIX):
+            continue
+        full = os.path.join(tmp_root, name)
+        try:
+            if now - os.stat(full).st_mtime > ARCHIVE_STALE_SECONDS:
+                if os.path.isdir(full):
+                    shutil.rmtree(full, ignore_errors=True)
+                else:
+                    os.remove(full)
+        except OSError:
+            continue
+
+
+def _rmtree_quiet(path: str) -> None:
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def _guard_delete(path: str) -> None:
@@ -237,16 +270,29 @@ async def delete(body: DeleteBody):
 
 
 @router.get("/download")
-async def download(path: str = Query(...)):
+async def download(background: BackgroundTasks, path: str = Query(...)):
     full = _abs(path)
     if not os.path.lexists(full):
         raise HTTPException(404, "路径不存在")
     if os.path.isfile(full):
         return FileResponse(full, filename=os.path.basename(full))
-    # 目录打包后下载
-    tmp_dir = tempfile.mkdtemp(prefix="serverpanel-")
-    archive_base = os.path.join(tmp_dir, os.path.basename(full.rstrip("/")) or "root")
-    archive = shutil.make_archive(archive_base, "zip", root_dir=full)
+    # 系统关键目录与文件系统根（"/"、盘符根、UNC 根）体量巨大且无下载意义，
+    # 直接拒绝——否则一次请求就会尝试打包整个磁盘，写满临时分区
+    normalized = os.path.abspath(full).rstrip("/") or "/"
+    if normalized in PROTECTED or os.path.dirname(normalized) == normalized:
+        raise HTTPException(400, f"{normalized} 是系统关键目录或文件系统根，请进入子目录逐级下载")
+    # 打包可能耗时较长，放线程池执行，避免阻塞事件循环拖死整个面板
+    tmp_dir = tempfile.mkdtemp(prefix=ARCHIVE_PREFIX)
+    archive_base = os.path.join(tmp_dir, os.path.basename(normalized) or "root")
+    try:
+        archive = await asyncio.to_thread(
+            shutil.make_archive, archive_base, "zip", root_dir=full
+        )
+    except OSError as exc:
+        _rmtree_quiet(tmp_dir)
+        raise HTTPException(500, f"打包失败: {exc}")
+    # FileResponse 发送完毕后删除临时目录；进程中途被杀时由 cleanup_stale_archives 兜底
+    background.add_task(_rmtree_quiet, tmp_dir)
     return FileResponse(archive, filename=os.path.basename(archive), media_type="application/zip")
 
 

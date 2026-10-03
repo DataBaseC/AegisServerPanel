@@ -93,7 +93,7 @@ systemd 服务列表与状态、启停 / 重启 / 重载、开机自启开关、
 | 系统操作 | subprocess（异步） | 统一封装 `systemctl` / `journalctl` / `lsblk` / `du` 等 |
 | 终端 | pty + xterm.js | 服务端伪终端，前端渲染 |
 | 前端 | 原生 JS / CSS | 无构建步骤，无框架，无 npm |
-| 部署 | systemd | 以 root 运行，开机自启 |
+| 部署 | systemd / 内置守护 | root 运行；无 systemd 环境（容器/PRoot）自动降级为 supervisor 脚本 |
 
 ### 目录结构
 
@@ -102,16 +102,18 @@ AegisServerPanel/
 ├── app/
 │   ├── main.py               # 应用入口、路由挂载、安全响应头、CLI 与启动横幅
 │   ├── config.py             # 配置持久化、密码哈希、运行模式、Agent 令牌
-│   ├── auth.py               # 会话管理、各类鉴权依赖（含 WebSocket）
+│   ├── auth.py               # 会话管理、各类鉴权依赖（含 WebSocket 与 Origin 校验）
 │   ├── metrics.py            # 性能采样器（2s 一次，保留 120 点历史）
 │   ├── shell.py              # 命令执行封装：超时保护 + 输出截断
+│   ├── manage.py             # 生命周期管理：install / start / stop / status / update
+│   ├── utils.py              # 跨平台小工具
 │   └── routes/
 │       ├── auth_routes.py    # 初始化 / 登录 / 登出 / 改密
 │       ├── system_routes.py  # 系统信息、指标、历史、网络、能力探测、电源
 │       ├── storage_routes.py # 磁盘、挂载、目录体积、S.M.A.R.T.
 │       ├── process_routes.py # 进程列表、详情、信号、nice
 │       ├── service_routes.py # systemd 服务管理
-│       ├── log_routes.py     # journal / dmesg / 日志文件
+│       ├── log_routes.py     # journal / dmesg / 日志白名单文件
 │       ├── file_routes.py    # 文件浏览、读写、上传下载、搜索
 │       ├── terminal_routes.py# PTY WebSocket 终端 + 一次性命令执行
 │       ├── app_routes.py     # 应用与端口发现
@@ -121,9 +123,11 @@ AegisServerPanel/
 │   ├── app.js                # 全部前端逻辑：路由、视图、多标签、终端、模式适配
 │   ├── style.css             # 全站样式
 │   └── vendor/               # xterm.js 与 fit 插件（本地内置，不依赖 CDN）
-├── install.sh                # systemd 安装脚本
+├── tests/                    # pytest：鉴权、模式门禁、日志白名单回归等
+├── install.sh                # 安装引导（环境检查 + venv + 依赖），其余交给 serverpanel --install
 ├── run.sh                    # 前台快速启动（调试用）
-└── requirements.txt
+├── requirements.txt          # 直接依赖（~= 兼容约束）
+└── constraints.txt           # 锁定版本：经过验证的依赖组合
 ```
 
 ### 分层与请求链路
@@ -187,7 +191,11 @@ flowchart TB
 
 ---
 
-## 四、安装与运行
+## 四、安装、升级与运维
+
+### 安装
+
+要求：Linux（Ubuntu / Debian 系优先）+ Python 3.10+。有 systemd 时自动注册系统服务；无 systemd 的容器 / PRoot 环境自动改用内置守护脚本。
 
 ```bash
 git clone https://github.com/DataBaseC/AegisServerPanel.git
@@ -195,7 +203,7 @@ cd AegisServerPanel
 sudo bash install.sh
 ```
 
-安装脚本会：创建 `.venv` 并装依赖 → 生成 `/usr/local/bin/serverpanel` → 写入并启动 `serverpanel.service`（User=root，开机自启，默认监听 `0.0.0.0:8787`）→ 打印所有可访问地址。
+安装脚本只做引导（检查 Python ≥ 3.10 → 建 `.venv` → 按 `constraints.txt` 锁定版本装依赖），其余动作统一交给 `serverpanel --install`：生成 `/usr/local/bin/serverpanel` → 写入 VERSION 标记与安装元数据 → 有 systemd 注册 `serverpanel.service`（User=root，开机自启，默认 `0.0.0.0:8787`），无 systemd 生成 `panel-supervisor.sh` 守护（崩溃 3 秒拉起、flock 单实例、日志自动轮转）→ 启动并做健康检查。
 
 自定义监听：
 
@@ -211,17 +219,43 @@ sudo SERVERPANEL_HOST=0.0.0.0 SERVERPANEL_PORT=9000 bash install.sh
 
 安装后打开 `http://<服务器IP>:8787`，首次访问会引导设置面板密码。
 
-常用运维命令：
+### 日常运维（一条命令搞定）
 
 ```bash
-systemctl status serverpanel      # 查看状态
-systemctl restart serverpanel     # 重启
-journalctl -u serverpanel -f      # 查看面板日志
+serverpanel --status         # 运行状态 + 健康检查 + 版本标记
+serverpanel --start          # 启动（systemd 或守护脚本自动二选一）
+serverpanel --stop           # 停止（终止整个守护进程组）
+serverpanel --restart        # 重启
+journalctl -u serverpanel -f # systemd 环境查看日志
+tail -f panel.log            # 无 systemd 环境查看日志
 ```
 
----
+### 升级
 
-## 五、模式与令牌管理命令
+配置文件（`/etc/serverpanel/config.json`）在应用目录之外，任何升级方式都不会碰它。git 部署一条命令完成升级：
+
+```bash
+sudo serverpanel --update                # 跟随 origin/main
+sudo serverpanel --update --update-ref origin/main   # 显式指定分支/标签/commit
+```
+
+升级流程内置多重保护：自动备份配置 → `git fetch`（网络失败立即中止，服务不受影响）→ 仓库有本地改动时默认中止（`--force` 自动 stash）→ 装依赖失败自动回退代码 → 重启 → `/healthz` 健康检查并断言版本 → **检查不过自动回滚旧版本并重启**。升级全程旧服务照常运行，直到新版本健康检查通过；重启后所有浏览器会话失效，需重新登录。
+
+> zip / 快照安装（目录无 `.git`）无法增量升级，`--update` 会给出迁移指引：克隆新目录 → 复用配置 → 停旧起新。
+
+### 无 systemd 环境（容器 / PRoot / Termux）自启动
+
+面板进程由 `panel-supervisor.sh` 守护后，还需要容器层解决「开机自启」。以 Termux PRoot 为例：
+
+1. 安装 Termux:Boot APP，添加开机脚本：
+   ```bash
+   termux-wake-lock
+   proot-distro login ubuntu -- bash -c "setsid nohup /root/aegis/AegisServerPanel/panel-supervisor.sh >/dev/null 2>&1 &"
+   ```
+2. 在容器 root 的 crontab 加兜底：`@reboot /root/aegis/AegisServerPanel/panel-supervisor.sh &`（flock 保证不会重复拉起）
+3. Android 侧：给 Termux 关闭电池优化、允许后台运行
+
+### 模式与令牌管理命令
 
 全部命令都打印结果后立即退出，可安全地在服务器本机执行。
 
@@ -235,6 +269,7 @@ serverpanel --set-password 新密码    # 重置面板密码（忘记密码时�
 serverpanel --agent-token           # 生成 / 轮换 Agent 令牌
 serverpanel --show-agent-token      # 查看当前 Agent 令牌
 serverpanel --revoke-agent-token    # 吊销 Agent 令牌
+serverpanel --show-version          # 版本与部署来源
 ```
 
 ---
@@ -337,21 +372,24 @@ serverpanel --host 0.0.0.0 --port 8787 --ssl-certfile /path/cert.pem --ssl-keyfi
 
 这个面板等价于把 root shell 挂到网络上，请务必只在可信网络中使用。
 
-- **不要暴露到公网**。默认监听 `0.0.0.0:8787` 且使用 HTTP；如需外网访问，请放在反向代理 + HTTPS + 鉴权之后
+- **不要暴露到公网**。默认监听 `0.0.0.0:8787` 且使用 HTTP；如需外网访问，请放在反向代理 + HTTPS + 鉴权之后（反向代理后请在配置文件设置 `"trust_proxy": true`，同时通过 `allowed_origins` 放行代理域名，否则日志页与终端的来源判定会失真）
 - **限制来源**，例如只放行内网网段：
   ```bash
   ufw allow from 192.168.0.0/16 to any port 8787 proto tcp
   ```
 - **用完就关**：内网模式是临时授权，操作完执行 `serverpanel --disable-internal`
 - **妥善保管 Agent 令牌**，不要提交进版本库或粘贴到公开场合；怀疑泄露立即 `--agent-token` 轮换
-- 已内置的防护：无 API 文档暴露、`nosniff` / `DENY` / `no-referrer` 安全响应头、接口响应 `no-store`、系统关键目录删除保护、命令执行超时与输出截断
+- **日志白名单**：日志接口只能读取白名单目录（默认 `/var/log`，可在配置文件用 `log_dirs` 数组扩展）。无论服务是否以 root 运行，白名单外一律拒绝
+- 已内置的防护：无 API 文档暴露、`nosniff` / `DENY` / `no-referrer` / CSP 安全响应头、接口响应 `no-store`、WebSocket 跨站 Origin 校验、系统关键目录删除与下载保护、命令执行超时与输出截断、HTTPS 部署时 Cookie 自动加 `Secure`
+- 已知取舍：`?token=` 查询参数方式便于脚本调用，但令牌可能进入中间层日志，敏感环境请只用请求头传令牌；首次部署密码未设置时，局域网内先到者可完成初始化，装完请立即设置强密码
 
 ---
 
 ## 十、已知限制
 
-- 面向 Ubuntu / Debian 系，依赖 systemd；容器内（无 systemd 作为 PID 1）时服务、电源、journal 相关功能会自动置灰
+- 面向 Ubuntu / Debian 系，依赖 systemd；容器内（无 systemd 作为 PID 1）时服务、电源、journal 相关功能会自动置灰，进程守护改用内置 `panel-supervisor.sh`
 - 服务、电源、S.M.A.R.T.、`dmesg` 等功能需要 root 权限，非 root 运行时部分能力不可用
+- 网页终端依赖 PTY（POSIX），非 POSIX 平台终端接口返回 501 并优雅降级
 - 「应用与端口」只覆盖 TCP 监听端口，UDP 服务不列出
 - 端口是否为 Web 服务使用内置端口表判断，非常规端口可能误判（仍会给出链接，可自行验证）
 - 未做多用户与权限分级，所有登录者共享同一个面板密码与 root 权限

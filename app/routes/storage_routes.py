@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from .. import shell
 from ..auth import require_auth, require_internal
+from ..utils import is_root
 
 router = APIRouter(prefix="/api/storage", tags=["storage"], dependencies=[Depends(require_auth)])
 
@@ -130,7 +131,7 @@ async def mounts():
 
 @router.post("/mount", dependencies=[Depends(require_internal)])
 async def mount(body: MountBody):
-    if os.geteuid() != 0:
+    if not is_root():
         raise HTTPException(403, "挂载需要以 root 运行本服务")
     if not os.path.isabs(body.mountpoint):
         raise HTTPException(400, "挂载点必须是绝对路径")
@@ -149,7 +150,7 @@ async def mount(body: MountBody):
 
 @router.post("/unmount", dependencies=[Depends(require_internal)])
 async def unmount(body: UnmountBody):
-    if os.geteuid() != 0:
+    if not is_root():
         raise HTTPException(403, "卸载需要以 root 运行本服务")
     cmd = ["umount"] + (["-f"] if body.force else []) + [body.path]
     result = await shell.run(cmd, timeout=30)
@@ -162,7 +163,9 @@ async def unmount(body: UnmountBody):
 async def smart(device: str):
     if not shell.available("smartctl"):
         raise HTTPException(400, "未安装 smartctl（apt install smartmontools）")
-    if not device.startswith("/dev/"):
+    # realpath 归一化后再校验，拒绝 /dev/../etc/passwd 这类绕过写法
+    real = os.path.realpath(os.path.abspath(device))
+    if not real.startswith("/dev/"):
         raise HTTPException(400, "设备路径不合法")
-    result = await shell.run(["smartctl", "-H", "-A", "-i", device], timeout=30)
+    result = await shell.run(["smartctl", "-H", "-A", "-i", real], timeout=30)
     return {"device": device, "ok": result.ok, "output": result.text}

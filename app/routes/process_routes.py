@@ -12,13 +12,18 @@ from ..auth import require_auth, require_internal
 
 router = APIRouter(prefix="/api/processes", tags=["processes"], dependencies=[Depends(require_auth)])
 
+# 信号表按平台可用性构建：POSIX 全量可用，Windows 等平台缺 SIGKILL/SIGSTOP 时自动剔除
 SIGNALS = {
-    "term": signal_module.SIGTERM,
-    "kill": signal_module.SIGKILL,
-    "int": signal_module.SIGINT,
-    "hup": signal_module.SIGHUP,
-    "stop": signal_module.SIGSTOP,
-    "cont": signal_module.SIGCONT,
+    name: getattr(signal_module, attr)
+    for name, attr in (
+        ("term", "SIGTERM"),
+        ("kill", "SIGKILL"),
+        ("int", "SIGINT"),
+        ("hup", "SIGHUP"),
+        ("stop", "SIGSTOP"),
+        ("cont", "SIGCONT"),
+    )
+    if hasattr(signal_module, attr)
 }
 
 

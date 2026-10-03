@@ -1,4 +1,4 @@
-"""日志与控制台输出：journal、dmesg、/var/log 文件。"""
+"""日志与控制台输出：journal、dmesg、日志目录白名单内的文本文件。"""
 
 from __future__ import annotations
 
@@ -8,19 +8,42 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from .. import shell
 from ..auth import require_auth
+from ..config import config
 
 router = APIRouter(prefix="/api/logs", tags=["logs"], dependencies=[Depends(require_auth)])
 
 PRIORITIES = ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"]
-LOG_DIRS = ["/var/log"]
 TEXT_HINT = (".log", ".txt", ".out", ".err", ".conf", "syslog", "messages", "auth.log", "kern.log")
+
+
+def _allowed_log_path(path: str) -> bool:
+    """路径必须落在日志白名单目录内（realpath 解析，防 /var/log 符号链接指向别处）。
+
+    与运行身份无关：root 也只允许读白名单。否则公网只读模式下，
+    任何登录用户都能读取 /etc/shadow、面板配置等系统任意文件。
+    """
+    real = os.path.realpath(os.path.abspath(path))
+    for d in config.log_dirs:
+        if real == d or real.startswith(os.path.join(d, "")):  # join(d,"") 补全目录分隔符
+            return True
+    return False
+
+
+def _check_readable(path: str) -> str:
+    full = os.path.abspath(path)
+    if not _allowed_log_path(full):
+        raise HTTPException(403, "仅允许读取日志目录白名单内的文件（默认 /var/log，"
+                                 "可在配置文件中设置 log_dirs 扩展）")
+    if not os.path.isfile(full):
+        raise HTTPException(404, "日志文件不存在")
+    return full
 
 
 @router.get("/sources")
 async def sources():
     """报告本机可用的日志来源。"""
     files = []
-    for directory in LOG_DIRS:
+    for directory in config.log_dirs:
         if not os.path.isdir(directory):
             continue
         for name in sorted(os.listdir(directory)):
@@ -78,12 +101,7 @@ async def dmesg(lines: int = 200):
 @router.get("/tail")
 async def tail(path: str, lines: int = 200):
     lines = max(1, min(lines, 5000))
-    full = os.path.abspath(path)
-    allowed = any(full == d or full.startswith(d.rstrip("/") + "/") for d in LOG_DIRS)
-    if not allowed and os.geteuid() != 0:
-        raise HTTPException(403, "仅允许读取 /var/log 下的日志文件")
-    if not os.path.isfile(full):
-        raise HTTPException(404, "日志文件不存在")
+    full = _check_readable(path)
     result = await shell.run(["tail", "-n", str(lines), full], timeout=20)
     if not result.ok:
         raise HTTPException(500, result.text or "读取失败")
@@ -92,12 +110,7 @@ async def tail(path: str, lines: int = 200):
 
 @router.get("/file")
 async def read_log(path: str, max_bytes: int = 256 * 1024):
-    full = os.path.abspath(path)
-    allowed = any(full == d or full.startswith(d.rstrip("/") + "/") for d in LOG_DIRS)
-    if not allowed and os.geteuid() != 0:
-        raise HTTPException(403, "仅允许读取 /var/log 下的日志文件")
-    if not os.path.isfile(full):
-        raise HTTPException(404, "日志文件不存在")
+    full = _check_readable(path)
     size = os.path.getsize(full)
     limit = max(1024, min(max_bytes, 2 * 1024 * 1024))
     with open(full, "rb") as fh:

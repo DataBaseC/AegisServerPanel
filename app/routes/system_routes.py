@@ -11,6 +11,7 @@ from .. import shell
 from ..auth import require_auth, require_internal
 from ..config import MODE_INTERNAL, config
 from ..metrics import basic_info, metrics, top_processes
+from ..utils import is_root
 
 router = APIRouter(prefix="/api/system", tags=["system"], dependencies=[Depends(require_auth)])
 
@@ -82,7 +83,7 @@ async def capabilities():
         "du": shell.available("du"),
         "mount": shell.available("mount"),
         "smartctl": shell.available("smartctl"),
-        "is_root": os.geteuid() == 0,
+        "is_root": is_root(),
         "mode": config.mode,
         "internal": config.mode == MODE_INTERNAL,
     }

@@ -27,7 +27,9 @@ else
 fi
 
 echo "==> 2/3 下载依赖 wheels（透传参数: $*）"
-pip download -r "$APP_DIR/requirements.txt" -c "$APP_DIR/constraints.txt" \
+# --only-binary=:all:：交叉打包(--platform 等)时 pip 强制要求，且本项目全部依赖均有官方 wheel
+pip download --only-binary=:all: \
+    -r "$APP_DIR/requirements.txt" -c "$APP_DIR/constraints.txt" \
     -d "$STAGE/AegisServerPanel-offline/wheels" "$@"
 
 echo "==> 3/3 打包"

@@ -355,3 +355,9 @@ serverpanel --host 0.0.0.0 --port 8787 --ssl-certfile /path/cert.pem --ssl-keyfi
 - 「应用与端口」只覆盖 TCP 监听端口，UDP 服务不列出
 - 端口是否为 Web 服务使用内置端口表判断，非常规端口可能误判（仍会给出链接，可自行验证）
 - 未做多用户与权限分级，所有登录者共享同一个面板密码与 root 权限
+
+---
+
+## License
+
+[MIT](LICENSE) © 2026 DataBaseC

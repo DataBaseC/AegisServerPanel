@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 本地配置与凭据（面板配置默认存放在 /etc/serverpanel 或 ~/.config/serverpanel，不在此目录）
+config.json
+.env
+*.log
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/

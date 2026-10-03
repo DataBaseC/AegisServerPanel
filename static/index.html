@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>ServerPanel · 系统控制台</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/vendor/xterm.css">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- 登录 / 首次设置密码 -->
+<div id="login-screen" class="login-screen hidden">
+  <div class="login-card">
+    <div class="login-logo">
+      <div class="mark">S</div>
+      <div>
+        <h1>ServerPanel</h1>
+        <div class="sub" id="login-host">本机系统控制台</div>
+      </div>
+    </div>
+    <form id="login-form">
+      <label class="field">
+        <span id="login-label">面板密码</span>
+        <input class="input" type="password" id="login-password" autocomplete="current-password"
+               placeholder="请输入密码" required>
+      </label>
+      <label class="field hidden" id="confirm-field">
+        <span>确认密码</span>
+        <input class="input" type="password" id="login-confirm" autocomplete="new-password"
+               placeholder="请再次输入密码">
+      </label>
+      <div class="login-error" id="login-error"></div>
+      <button class="btn primary" type="submit" id="login-submit">登录</button>
+    </form>
+    <div class="login-hint" id="login-hint">
+      密码通过 PBKDF2 加盐哈希后保存在本机配置文件中，
+      登录后可获得该主机的完整控制权限。
+    </div>
+  </div>
+</div>
+
+<!-- 主界面 -->
+<div class="app hidden" id="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="mark">S</div>
+      <div>
+        <div class="name">ServerPanel</div>
+        <div class="host" id="brand-host">-</div>
+      </div>
+    </div>
+    <nav class="nav" id="nav"></nav>
+    <div class="sidebar-footer">
+      <div><span class="live-dot"></span><span id="footer-mode">已连接</span></div>
+      <div style="margin-top:6px" id="footer-uptime">-</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <h1 id="page-title">概览</h1>
+      <button class="badge mode-badge" id="mode-badge" title="点击查看模式说明">公网模式</button>
+      <div class="row" id="topbar-stats"></div>
+      <div class="spacer"></div>
+      <button class="btn sm ghost" id="btn-refresh" title="立即刷新当前页面">刷新</button>
+      <button class="btn sm ghost" id="btn-logout">退出登录</button>
+    </header>
+    <div class="tabbar" id="tabbar"></div>
+    <div class="mode-banner" id="mode-banner"></div>
+    <section class="view" id="view"></section>
+  </main>
+</div>
+
+<div id="modal-root"></div>
+<div id="toast-wrap"></div>
+
+<script src="/static/vendor/xterm.js"></script>
+<script src="/static/vendor/addon-fit.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

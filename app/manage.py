@@ -268,13 +268,56 @@ def _start_supervisor(target_dir: Path) -> None:
     )
 
 
+def _panel_pids(target_dir: Path) -> list[int]:
+    """找到面板服务进程的 PID（排除本进程与生命周期命令自身）。
+
+    服务进程的特征：本 venv 的 python -m app.main，且不带任何生命周期标志。
+    面板 Agent exec 里执行的 `serverpanel --restart` 与服务进程命令行几乎相同，
+    靠标志位区分，否则重启命令会把自己误杀。
+    """
+    marker = f"{target_dir}/.venv/bin/python"
+    self_pid = os.getpid()
+    lifecycle_flags = {
+        "install", "start", "stop", "restart", "status", "update", "show-version",
+        "set-password", "enable-internal", "disable-internal", "show-mode",
+        "agent-token", "show-agent-token", "revoke-agent-token",
+    }
+    pids = []
+    if not os.path.isdir("/proc"):
+        return pids
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == self_pid:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = fh.read().decode("utf-8", "replace").split("\0")
+        except OSError:
+            continue
+        if marker not in " ".join(argv) or "-m" not in argv or "app.main" not in argv:
+            continue
+        if any(a.startswith("--") and a[2:] in lifecycle_flags for a in argv):
+            continue
+        pids.append(pid)
+    return pids
+
+
 def _restart_service(target_dir: Path) -> None:
     if _systemd_available():
         subprocess.run(["systemctl", "restart", "serverpanel"], check=False)
     else:
-        _stop_supervisor(target_dir)
-        time.sleep(1)
-        _start_supervisor(target_dir)
+        # 只 TERM 面板服务进程本身，由 supervisor 的 while 循环 3 秒内拉起新进程。
+        # 不能 killpg 整组：经面板 exec 执行的 restart 命令也在组内，会自杀，
+        # 导致 stop 之后 start 永远执行不到、面板彻底下线。
+        pids = _panel_pids(target_dir)
+        for pid in pids:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                os.kill(pid, signal.SIGTERM)
+        if not pids:
+            print("（未发现运行中的面板进程，将由守护直接拉起）", file=sys.stderr)
+            _start_supervisor(target_dir)
 
 
 # ---------- 健康检查 ----------
@@ -380,6 +423,8 @@ def cmd_stop(target_dir: Path) -> int:
         subprocess.run(["systemctl", "stop", "serverpanel"], check=False)
         print("服务已停止")
         return 0
+    # 注意：经面板 exec 执行 --stop 时，killpg 也会终止调用链本身（响应不会返回），
+    # 但停止结果正确；残留 pidfile 由下一次 --start 自愈。
     if _stop_supervisor(target_dir):
         print("面板守护已停止")
         return 0
@@ -416,7 +461,7 @@ def cmd_status(target_dir: Path) -> int:
 
 def cmd_restart(target_dir: Path) -> int:
     _restart_service(target_dir)
-    print("已发送重启指令")
+    print("已发送重启指令，守护将在数秒内拉起新进程")
     return 0
 
 

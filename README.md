@@ -312,6 +312,12 @@ sudo bash install.sh
 
 安装后打开 `http://<服务器IP>:8787`，首次访问会引导设置面板密码。
 
+部署完成后建议跑一次常驻应用自检（不打扰现有服务，只做一个心跳应用的完整生命周期）：
+
+```bash
+bash scripts/verify-apps.sh            # 默认检查 /root/aegis/AegisServerPanel
+```
+
 ### 日常运维（一条命令搞定）
 
 ```bash

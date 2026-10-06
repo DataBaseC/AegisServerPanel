@@ -243,7 +243,13 @@ def _kill_process_group(pid: int, sig: int) -> None:
 
 
 def _stop_supervisor(target_dir: Path) -> bool:
-    """停止守护及其整个进程组。返回是否原本在运行。"""
+    """停止守护及其整个进程组。返回是否原本在运行。
+
+    托管应用的进程组与面板/守护的进程组是分开的（应用一律 ``start_new_session``），
+    但面板的业务代码可能 fork 出同组子进程，因此这里仍然整组 TERM；应用由面板
+    自身的 ``supervisor.shutdown()`` 负责收尾，CLI 侧另有 ``_stop_app_processes()``
+    作为面板被强杀（来不及优雅退出）时的兜底。
+    """
     pid = _read_pidfile(target_dir)
     if pid is None or not _pid_alive(pid):
         (target_dir / PID_NAME).unlink(missing_ok=True)
@@ -259,6 +265,22 @@ def _stop_supervisor(target_dir: Path) -> bool:
         time.sleep(1)
     (target_dir / PID_NAME).unlink(missing_ok=True)
     return True
+
+
+def _stop_all_apps(reason: str = "面板已停止") -> int:
+    """兜底收尾：把仍在运行的托管应用一并停掉。
+
+    面板的 lifespan 正常退出时会自己停应用；但 ``--stop`` 走的是进程组 TERM，
+    可能来不及走完优雅退出，所以 CLI 侧再兜一层，避免留下无人认领的孤儿进程。
+    """
+    try:
+        count = _stop_app_processes()
+    except Exception as exc:  # 兜底逻辑本身不允许影响停止流程
+        print(f"（托管应用收尾时出错，已忽略：{exc}）", file=sys.stderr)
+        return 0
+    if count:
+        print(f"（{reason}：已一并停止 {count} 个托管应用进程）")
+    return count
 
 
 def _start_supervisor(target_dir: Path) -> None:
@@ -278,19 +300,31 @@ def _start_supervisor(target_dir: Path) -> None:
     )
 
 
+def _read_cmdline(pid: int) -> list[str]:
+    """读取进程命令行（psutil，跨平台）。进程已消失时返回空列表。"""
+    try:
+        import psutil
+    except ImportError:  # pragma: no cover - 面板强依赖 psutil
+        return []
+    try:
+        return psutil.Process(pid).cmdline()
+    except Exception:
+        return []
+
+
 def _panel_pids(target_dir: Path) -> list[int]:
     """找到面板服务进程的 PID（排除本进程与生命周期命令自身）。
 
     服务进程的特征：本 venv 的 python -m app.main，且不带任何生命周期标志。
-    面板 Agent exec 里执行的 `serverpanel --restart` 与服务进程命令行几乎相同，
-    靠标志位区分，否则重启命令会把自己误杀。
+    面板 Agent exec 里执行的 `serverpanel --restart` / `--apps list` 与服务进程
+    命令行几乎相同，靠标志位区分，否则重启命令会把自己误杀。
     """
     marker = f"{target_dir}/.venv/bin/python"
     self_pid = os.getpid()
     lifecycle_flags = {
         "install", "start", "stop", "restart", "status", "update", "show-version",
         "set-password", "enable-internal", "disable-internal", "show-mode",
-        "agent-token", "show-agent-token", "revoke-agent-token",
+        "agent-token", "show-agent-token", "revoke-agent-token", "apps", "recipe",
     }
     pids = []
     if not os.path.isdir("/proc"):
@@ -301,10 +335,8 @@ def _panel_pids(target_dir: Path) -> list[int]:
         pid = int(entry)
         if pid == self_pid:
             continue
-        try:
-            with open(f"/proc/{pid}/cmdline", "rb") as fh:
-                argv = fh.read().decode("utf-8", "replace").split("\0")
-        except OSError:
+        argv = _read_cmdline(pid)
+        if not argv:
             continue
         if marker not in " ".join(argv) or "-m" not in argv or "app.main" not in argv:
             continue
@@ -432,13 +464,16 @@ def cmd_stop(target_dir: Path) -> int:
     if _systemd_available():
         subprocess.run(["systemctl", "stop", "serverpanel"], check=False)
         print("服务已停止")
+        _stop_all_apps()
         return 0
     # 注意：经面板 exec 执行 --stop 时，killpg 也会终止调用链本身（响应不会返回），
     # 但停止结果正确；残留 pidfile 由下一次 --start 自愈。
     if _stop_supervisor(target_dir):
         print("面板守护已停止")
+        _stop_all_apps()
         return 0
     print("面板未在运行")
+    _stop_all_apps("面板未运行，但发现残留的托管应用")
     return 0
 
 
@@ -473,6 +508,254 @@ def cmd_restart(target_dir: Path) -> int:
     _restart_service(target_dir)
     print("已发送重启指令，守护将在数秒内拉起新进程")
     return 0
+
+
+# ---------- 常驻应用 / 常用操作（CLI 版，面板不可用时也能救火） ----------
+
+def _running_app_processes() -> list[tuple[int, str]]:
+    """扫描进程表，找出命令行命中托管应用注册表的进程。
+
+    返回 ``(pid, 应用名)``。面板重启后 supervisor 的内存状态会丢，但应用进程仍在跑，
+    所以这里以注册表为准反查——CLI 必须能管到"上个面板实例拉起的应用"。
+    """
+    from . import apps as apps_mod
+
+    entries = apps_mod.supervisor.registry.all()
+    if not entries:
+        return []
+    found: list[tuple[int, str]] = []
+    try:
+        import psutil
+    except ImportError:  # pragma: no cover - 面板强依赖 psutil，这里只是兜底
+        return found
+    self_pid = os.getpid()
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            pid = proc.info["pid"]
+            if pid == self_pid:
+                continue
+            cmdline = " ".join(proc.info.get("cmdline") or [])
+        except psutil.Error:
+            continue
+        if not cmdline:
+            continue
+        for app in entries:
+            if app.get("command") and app["command"] in cmdline:
+                found.append((pid, apps_mod.a_name(app)))
+                break
+    return found
+
+
+def _aliases(pid: int) -> set[int]:
+    """进程的别名集合：自身 PID 与其进程组 ID（POSIX）。
+
+    托管应用用 ``start_new_session`` 启动，因此"进程组"正是它的整棵会话树；
+    Windows 没有进程组语义，退化为只处理 PID 本身。
+    """
+    aliases = {pid}
+    if hasattr(os, "getpgid"):
+        with contextlib.suppress(OSError):
+            aliases.add(os.getpgid(pid))
+    return aliases
+
+
+def _terminate_process(proc, sig) -> None:
+    """尽力而为地结束一个进程及其子进程（POSIX 优先整组，跨平台退化）。"""
+    try:
+        children = proc.children(recursive=True)
+    except Exception:  # psutil 在进程消失时会抛各类异常
+        children = []
+    for child in children:
+        with contextlib.suppress(Exception):
+            child.terminate()
+    with contextlib.suppress(Exception):
+        proc.send_signal(sig)
+    with contextlib.suppress(Exception):
+        proc.wait(timeout=8)
+    if proc.is_running():
+        for child in children:
+            with contextlib.suppress(Exception):
+                child.kill()
+        with contextlib.suppress(Exception):
+            proc.kill()
+
+
+def _stop_app_processes(timeout: float = 8.0) -> int:
+    """终止所有命中注册表的托管应用进程，返回处理的数量。"""
+    targets = _running_app_processes()
+    if not targets:
+        return 0
+    try:
+        import psutil
+    except ImportError:  # pragma: no cover
+        return 0
+
+    self_aliases = _aliases(os.getpid())
+    stopped: list[str] = []
+    for pid, name in targets:
+        if _aliases(pid) & self_aliases:
+            # 绝不动自己和自己的进程组（CLI 可能正是从面板 exec 链路里被调起来的）
+            continue
+        try:
+            proc = psutil.Process(pid)
+        except psutil.Error:
+            continue
+        _terminate_process(proc, signal.SIGTERM)
+        stopped.append(name)
+    if stopped:
+        print(f"已停止 {len(stopped)} 个托管应用进程（{', '.join(sorted(set(stopped)))}）")
+    return len(stopped)
+
+
+def _print_apps() -> int:
+    from . import apps as apps_mod
+
+    entries = apps_mod.supervisor.registry.all()
+    if not entries:
+        print("尚未注册任何常驻应用。可在面板「常驻应用」页面添加。")
+        print(f"注册表: {apps_mod.supervisor.registry.path}")
+        return 0
+    running = {name: pid for pid, name in _running_app_processes()}
+    print(f"注册表: {apps_mod.supervisor.registry.path}")
+    print(f"{'名称':<20}{'状态':<12}{'PID':<8}{'自启':<6}{'重启':<10}命令")
+    for app in entries:
+        name = apps_mod.a_name(app)
+        pid = running.get(name)
+        print(f"{name:<20}{('运行中' if pid else '未运行'):<12}{str(pid or '-'):<8}"
+              f"{('是' if app.get('autostart') else '否'):<6}{app.get('restart', '-'):<10}"
+              f"{app.get('command', '')[:60]}")
+    return 0
+
+
+def cmd_apps(target_dir: Path, argv: list[str]) -> int:
+    """``serverpanel --apps list|start|stop|restart|remove|logs <名称>``"""
+    from . import apps as apps_mod
+
+    action = (argv[0] if argv else "list").lower()
+    registry = apps_mod.supervisor.registry
+
+    if action in ("list", "ls", "status"):
+        return _print_apps()
+
+    name = argv[1].strip() if len(argv) > 1 else ""
+    if not name:
+        return fail(f"--apps {action} 需要应用名称，例如：serverpanel --apps {action} frpc")
+
+    if action == "stop" and name in ("--all", "all"):
+        return 0 if _stop_app_processes() >= 0 else 1
+
+    app = registry.by_name(name)
+    if app is None:
+        return fail(f"未找到常驻应用：{name}（serverpanel --apps list 查看全部）")
+
+    if action == "start":
+        return _cli_spawn_app(app)
+    if action in ("stop", "restart"):
+        _stop_named_app(app)
+        if action == "stop":
+            return 0
+        return _cli_spawn_app(app)
+    if action in ("remove", "rm", "delete"):
+        _stop_named_app(app)
+        try:
+            registry.remove(app["id"])
+        except apps_mod.AppError as exc:
+            return fail(str(exc))
+        print(f"已删除常驻应用：{name}")
+        return 0
+    if action in ("logs", "log"):
+        lines = apps_mod.read_log_lines(app, 120)
+        print("\n".join(lines) if lines else "（暂无日志）")
+        return 0
+    return fail(f"未知操作：{action}（可用：list / start / stop / restart / remove / logs）")
+
+
+def _stop_named_app(app: dict) -> None:
+    from . import apps as apps_mod
+
+    target = apps_mod.a_name(app)
+    pids = [pid for pid, name in _running_app_processes() if name == target]
+    if not pids:
+        print(f"{target} 未在运行")
+        return
+    import psutil
+
+    for pid in pids:
+        try:
+            proc = psutil.Process(pid)
+        except psutil.Error:
+            continue
+        _terminate_process(proc, signal.SIGTERM)
+    print(f"{target} 已停止")
+
+
+def _cli_spawn_app(app: dict) -> int:
+    """CLI 拉起应用：独立会话 + 输出重定向到面板日志目录，脱离当前终端。"""
+    from . import apps as apps_mod
+
+    log_path = apps_mod.supervisor.log_dir / f"{apps_mod.a_name(app)}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "SERVERPANEL_APP": apps_mod.a_name(app)}
+    env.update({str(k): str(v) for k, v in (app.get("env") or {}).items()})
+    with open(log_path, "ab") as fh:
+        proc = subprocess.Popen(
+            apps_mod.shell_argv(app["command"]),
+            cwd=app.get("cwd") or None,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    print(f"{apps_mod.a_name(app)} 已启动（PID {proc.pid}），日志：{log_path}")
+    if not app.get("autostart"):
+        print("提示：该应用未开启开机自启；面板启动时不会自动拉起（start 仍会拉起）。")
+    return 0
+
+
+def cmd_recipe(argv: list[str]) -> int:
+    """``serverpanel --recipe list`` / ``--recipe run <任务ID> [k=v ...]``
+
+    常用操作与面板共用同一份任务定义（``app/tasks.py``），输出直接打到终端。
+    """
+    from . import tasks as tasks_mod
+
+    action = (argv[0] if argv else "list").lower()
+    if action in ("list", "ls"):
+        group = ""
+        for task in tasks_mod.TASKS:
+            if task.group != group:
+                group = task.group
+                print(f"\n[{group}]")
+            params = " ".join(f"{p.name}={p.default or '?'}" for p in task.params)
+            print(f"  {task.id:<20}{task.title}{'  (' + params + ')' if params else ''}")
+        print("\n运行：serverpanel --recipe run <任务ID> [参数=值 ...]")
+        return 0
+    if action != "run":
+        return fail(f"未知操作：{action}（可用：list / run）")
+
+    if len(argv) < 2:
+        return fail("用法：serverpanel --recipe run <任务ID> [参数=值 ...]")
+    task = tasks_mod.task_by_id(argv[1].strip())
+    if task is None:
+        return fail(f"未找到任务：{argv[1]}（serverpanel --recipe list 查看全部）")
+
+    values: dict[str, str] = {}
+    for item in argv[2:]:
+        key, _, value = item.partition("=")
+        values[key.strip()] = value
+    try:
+        command = tasks_mod.render(task, values)
+    except ValueError as exc:
+        return fail(str(exc))
+
+    if task.danger:
+        print(f"⚠ 危险任务：{task.title}")
+    print(f"$ {command}\n")
+    from .apps import shell_argv
+
+    proc = subprocess.run(shell_argv(command), timeout=task.timeout + 10)
+    return proc.returncode
 
 
 # ---------- update ----------

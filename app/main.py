@@ -17,18 +17,22 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
+from .apps import supervisor
 from .config import MODE_INTERNAL, MODE_LABELS, MODE_PUBLIC, config
 from .metrics import metrics
 from .routes import (
     agent_routes,
     app_routes,
+    apps_routes,
     auth_routes,
     file_routes,
     log_routes,
     process_routes,
     service_routes,
+    snippets_routes,
     storage_routes,
     system_routes,
+    tasks_routes,
     terminal_routes,
 )
 
@@ -56,10 +60,15 @@ async def lifespan(app: FastAPI):
     # 清扫历史遗留的下载打包临时目录（进程上次被杀时的残留）
     await asyncio.to_thread(file_routes.cleanup_stale_archives)
     task = asyncio.create_task(_sampler())
+    # 常驻应用守护：拉起 autostart 应用，并接管崩溃重启
+    await supervisor.serve()
     yield
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
+    # 面板停止时一并结束托管应用（托管进程与面板同生命周期；升级不中断靠守护的只 TERM 面板进程）
+    with contextlib.suppress(Exception):
+        await supervisor.shutdown()
 
 
 app = FastAPI(
@@ -106,6 +115,9 @@ for module in (
     terminal_routes,
     app_routes,
     agent_routes,
+    apps_routes,
+    tasks_routes,
+    snippets_routes,
 ):
     app.include_router(module.router)
 
@@ -211,6 +223,12 @@ def main() -> int:
                         help="git 升级：备份配置 → fetch → 切换目标版本 → 装依赖 → 重启 → 健康检查，失败自动回滚")
     action.add_argument("--show-version", action="store_true", help="显示版本与部署来源后退出")
 
+    # ---- 常驻应用 / 常用操作（面板不可用时的救火入口）----
+    action.add_argument("--apps", nargs="+", metavar="ACTION", default=None,
+                        help="管理常驻应用：list / start|stop|restart|remove|logs <名称>")
+    action.add_argument("--recipe", nargs="+", metavar="ACTION", default=None,
+                        help="常用操作：list / run <任务ID> [参数=值 ...]")
+
     parser.add_argument("--app-dir", default=str(BASE_DIR),
                         help="应用目录（install/update/start/stop 使用，默认为代码所在目录）")
     parser.add_argument("--update-ref", default=os.environ.get("SERVERPANEL_UPDATE_REF", "origin/main"),
@@ -239,6 +257,15 @@ def main() -> int:
         if args.status:
             return manage.cmd_status(target_dir)
         return manage.cmd_update(target_dir, args.update_ref, args.update_force)
+
+    # ---- 常驻应用 / 常用操作 ----
+    if args.apps is not None or args.recipe is not None:
+        from . import manage
+
+        target_dir = Path(args.app_dir).expanduser().resolve()
+        if args.apps is not None:
+            return manage.cmd_apps(target_dir, list(args.apps))
+        return manage.cmd_recipe(list(args.recipe))
 
     if args.show_version:
         print(f"ServerPanel {__version__}")

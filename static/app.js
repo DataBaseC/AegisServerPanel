@@ -365,11 +365,12 @@ const NAV = [
   { id: 'overview', label: '概览', icon: '▤' },
   { id: 'performance', label: '性能监控', icon: '◉' },
   { id: 'terminal', label: '网页终端', icon: '▶', internalOnly: true },
+  { id: 'apps', label: '常驻应用', icon: '⏱', internalOnly: true },
   { id: 'logs', label: '控制台 / 日志', icon: '☰' },
   { id: 'storage', label: '存储空间', icon: '⛁' },
   { id: 'processes', label: '进程管理', icon: '⚙' },
   { id: 'services', label: '服务管理', icon: '⏻' },
-  { id: 'apps', label: '应用与端口', icon: '⧉', internalOnly: true },
+  { id: 'apps-port', label: '应用与端口', icon: '⧉', internalOnly: true },
   { id: 'files', label: '文件管理', icon: '🗀', internalOnly: true },
   { id: 'agent', label: 'Agent 接入', icon: '⌘', internalOnly: true },
   { id: 'settings', label: '设置', icon: '⚒' },
@@ -1491,7 +1492,7 @@ registerView('processes', {
 
 /* ============================ 视图：应用与端口 ============================ */
 
-registerView('apps', {
+registerView('apps-port', {
   title: '应用与端口',
   async render(root) {
     root.innerHTML = `
@@ -1927,56 +1928,44 @@ registerView('agent', {
     let info = null;
     let revealed = false;
     let timer = null;
+    let snippets = [];          // 由 /api/snippets 提供（服务端按当前地址渲染）
+    let snippetQuery = '';
 
     const mask = (t) => (t ? `${t.slice(0, 6)}••••••${t.slice(-4)}` : '');
 
-    function snippets() {
-      // 未点击「显示」时用占位符，避免掩码形同虚设
-      const token = (revealed && info.token) ? info.token : 'YOUR_TOKEN';
-      const endpoint = `${info.base_url}${info.endpoint}`;
-      return [{
-        name: 'curl —— 执行一条命令',
-        code: `curl -sS -X POST '${endpoint}' \\
-  -H 'X-Agent-Token: ${token}' \\
-  -H 'Content-Type: application/json' \\
-  -d '{"command":"uname -a && df -h","timeout":30}'`,
-      }, {
-        name: 'bash —— 让本机终端像 SSH 一样操作服务器',
-        code: `export SP_URL='${endpoint}'
-export SP_TOKEN='${token}'
-
-# 依赖 jq：sudo apt install -y jq
-sp() {
-  jq -n --arg c "$*" '{command:$c, timeout:600}' \\
-    | curl -sS -X POST "$SP_URL" -H "X-Agent-Token: $SP_TOKEN" \\
-        -H 'Content-Type: application/json' --data @- \\
-    | jq -r '.stdout, .stderr'
-}
-
-# 用法：sp systemctl restart nginx`,
-      }, {
-        name: 'python —— 供 AI Agent 工具调用',
-        code: `import subprocess, json, urllib.request
-
-def server(cmd: str, timeout: int = 600) -> str:
-    req = urllib.request.Request(
-        "${endpoint}",
-        data=json.dumps({"command": cmd, "timeout": timeout}).encode(),
-        headers={"X-Agent-Token": "${token}",
-                 "Content-Type": "application/json"})
-    res = json.load(urllib.request.urlopen(req, timeout=timeout + 10))
-    if res["code"] != 0:
-        raise RuntimeError(res["stderr"] or f"exit {res['code']}")
-    return res["stdout"]`,
-      }];
+    async function loadSnippets() {
+      // 令牌未「显示」时不带 reveal_token，服务端渲染为 YOUR_TOKEN 占位符
+      const params = new URLSearchParams();
+      if (revealed) params.set('reveal_token', '1');
+      if (snippetQuery) params.set('q', snippetQuery);
+      const query = params.toString();
+      const data = await api.get(`/api/snippets${query ? `?${query}` : ''}`);
+      snippets = data.snippets;
     }
 
     function snippetHTML() {
-      return snippets().map((s, i) => `<div class="snippet">
-        <div class="snippet-head"><span>${esc(s.name)}</span>
-          <button class="btn sm ghost" data-copy="${i}">复制</button></div>
-        <pre class="snippet-body">${esc(s.code)}</pre>
-      </div>`).join('');
+      if (!snippets.length) return '<div class="empty">没有匹配的片段</div>';
+      const groups = [];
+      snippets.forEach((s) => {
+        let group = groups.find((g) => g.name === s.category);
+        if (!group) { group = { name: s.category, items: [] }; groups.push(group); }
+        group.items.push(s);
+      });
+      return groups.map((group) => `
+        <div class="snippet-group">
+          <h3 class="section-title">${esc(group.name)}</h3>
+          <div class="snippet-list">${group.items.map((s) => `<div class="snippet">
+            <div class="snippet-head">
+              <span>${esc(s.title)}
+                ${(s.requires || []).map((r) => `<span class="badge">依赖 ${esc(r)}</span>`).join('')}</span>
+              <div class="spacer"></div>
+              ${s.exec ? `<button class="btn sm ghost" data-run-snippet="${s.id}">运行</button>` : ''}
+              <button class="btn sm ghost" data-copy-snippet="${s.id}">复制</button>
+            </div>
+            ${s.note ? `<div class="dim" style="font-size:11px;margin:2px 0 4px">${esc(s.note)}</div>` : ''}
+            <pre class="snippet-body">${esc(s.code)}</pre>
+          </div>`).join('')}</div>
+        </div>`).join('');
     }
 
     function recentRows(records) {
@@ -2060,8 +2049,11 @@ def server(cmd: str, timeout: int = 600) -> str:
           </div>
 
           <div class="card" style="grid-column:1/-1">
-            <h2>接入示例 <span class="spacer"></span><span class="dim" style="font-size:12px">复制即用</span></h2>
-            <div class="snippet-list" id="agt-snippets">${snippetHTML()}</div>
+            <h2>代码 / 命令片段库 <span class="spacer"></span>
+              <input class="input" id="snp-search" placeholder="搜索片段…" style="width:170px"
+                value="${esc(snippetQuery)}">
+              <span class="dim" style="font-size:12px">占位符已按当前面板地址渲染</span></h2>
+            <div id="agt-snippets">${snippetHTML()}</div>
           </div>
 
           <div class="card" style="grid-column:1/-1">
@@ -2074,14 +2066,26 @@ def server(cmd: str, timeout: int = 600) -> str:
 
     async function refresh() {
       info = await api.get('/api/agent/info');
+      if (!snippets.length) {
+        await loadSnippets().catch(() => { snippets = []; });
+      }
       paint();
     }
 
+    let searchTimer = null;
+
     root.onclick = async (event) => {
       if (event.target.closest('#agt-run')) { await runCommand(); return; }
-      const copyIndex = event.target.closest('[data-copy]');
-      if (copyIndex) {
-        copyText(snippets()[Number(copyIndex.dataset.copy)].code, '示例已复制');
+      const copyBtn = event.target.closest('[data-copy-snippet]');
+      if (copyBtn) {
+        const snippet = snippets.find((s) => s.id === copyBtn.dataset.copySnippet);
+        if (snippet) copyText(snippet.code, '片段已复制');
+        return;
+      }
+      const runBtn = event.target.closest('[data-run-snippet]');
+      if (runBtn) {
+        const snippet = snippets.find((s) => s.id === runBtn.dataset.runSnippet);
+        if (snippet) await runSnippet(snippet);
         return;
       }
       const button = event.target.closest('[data-act]');
@@ -2091,7 +2095,10 @@ def server(cmd: str, timeout: int = 600) -> str:
       if (action === 'reveal') {
         revealed = !revealed;
         $('#agt-token').textContent = revealed ? info.token : mask(info.token);
-        $('#agt-snippets').innerHTML = snippetHTML();  // 示例中的令牌同步显示/占位
+        try {
+          await loadSnippets();               // 示例中的令牌同步显示/占位
+          $('#agt-snippets').innerHTML = snippetHTML();
+        } catch (err) { toast(err.message, 'err'); }
         return;
       }
       if (action === 'copy') {
@@ -2130,27 +2137,532 @@ def server(cmd: str, timeout: int = 600) -> str:
       if (action === 'refresh-recent') { await loadRecent(); toast('记录已刷新'); }
     };
 
+    async function execInto(display, command, timeout = 60) {
+      const out = $('#agt-out');
+      if (out) out.textContent = `$ ${display} 执行中…`;
+      try {
+        const res = await api.post('/api/terminal/exec', { command, timeout });
+        const text = [res.stdout, res.stderr].filter((part) => part && part.trim()).join('\n');
+        if (out) out.textContent = `$ ${display}\n${text || '(无输出)'}\n[退出码 ${res.code}]`;
+        await loadRecent();
+      } catch (err) {
+        if (out) out.textContent = `执行失败：${err.message}`;
+      }
+    }
+
+    /** 一键运行片段：只对标记 exec 的非破坏性 bash 片段开放，且需二次确认。 */
+    async function runSnippet(snippet) {
+      const ok = await confirmDialog({
+        title: `运行片段 · ${snippet.title}`, confirmText: '执行',
+        message: `将在服务器上以面板身份执行该片段：<pre class="snippet-body" style="max-height:180px">${esc(snippet.code)}</pre>`,
+      });
+      if (!ok) return;
+      await execInto(snippet.title, snippet.code, 120);
+    }
+
     async function runCommand() {
       const command = $('#agt-cmd').value.trim();
       if (!command) { toast('请输入要执行的命令', 'err'); return; }
-      const out = $('#agt-out');
-      out.textContent = '执行中…';
-      try {
-        const res = await api.post('/api/terminal/exec', { command, timeout: 60 });
-        const text = [res.stdout, res.stderr].filter((part) => part && part.trim()).join('\n');
-        out.textContent = `$ ${command}\n${text || '(无输出)'}\n[退出码 ${res.code}]`;
-        await loadRecent();
-      } catch (err) {
-        out.textContent = `执行失败：${err.message}`;
-      }
+      await execInto(command, command, 60);
     }
 
     root.onkeydown = (event) => {
       if (event.target.id === 'agt-cmd' && event.key === 'Enter') runCommand();
     };
+    root.oninput = (event) => {
+      if (event.target.id !== 'snp-search') return;
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(async () => {
+        snippetQuery = event.target.value.trim();
+        try {
+          await loadSnippets();
+          $('#agt-snippets').innerHTML = snippetHTML();
+        } catch (err) { toast(err.message, 'err'); }
+      }, 220);
+    };
 
     await refresh();
     timer = setInterval(loadRecent, 8000);
+    return () => { clearInterval(timer); clearTimeout(searchTimer); };
+  },
+});
+
+/* ============================ 视图：常驻应用 / 常用操作 ============================ */
+// 「常驻应用」解决"跑起来就不该死"：命令交给面板托管，脱离浏览器会话长期运行、
+// 崩溃按策略自动拉起、输出落盘可随时回看。
+// 「常用操作」把经常要敲的一长串命令做成一张卡片，一次点击拿结果。
+// 两个能力共用同一页（tab 切换）：都是"让服务器替我把事做完"。
+
+function formDialog({ title, fields, confirmText = '确定', note = '' }) {
+  return new Promise((resolve) => {
+    const body = document.createElement('div');
+    body.innerHTML = `${fields.map((f) => `<label class="field"><span>${esc(f.label)}</span>
+      <input class="input" data-field="${esc(f.name)}" value="${esc(f.value ?? '')}"
+        placeholder="${esc(f.placeholder || '')}" autocomplete="off"></label>`).join('')}
+      ${note ? `<div class="dim" style="font-size:12px;line-height:1.7">${note}</div>` : ''}`;
+    const foot = document.createElement('div');
+    foot.className = 'row';
+    foot.innerHTML = `<button class="btn" data-cancel>取消</button>
+      <button class="btn primary" data-ok>${esc(confirmText)}</button>`;
+    const modal = openModal({ title, body, footer: foot, size: 'narrow' });
+    const inputs = $$('[data-field]', modal.body);
+    setTimeout(() => inputs[0]?.focus(), 30);
+    const finish = (value) => { modal.close(); resolve(value); };
+    const collect = () => {
+      const out = {};
+      inputs.forEach((input) => { out[input.dataset.field] = input.value.trim(); });
+      return out;
+    };
+    $('[data-cancel]', foot).onclick = () => finish(null);
+    $('[data-ok]', foot).onclick = () => finish(collect());
+    inputs.forEach((input) => input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') finish(collect());
+    }));
+  });
+}
+
+registerView('apps', {
+  title: '常驻应用',
+  async render(root) {
+    let tab = localStorage.getItem('sp-apps-tab') === 'tasks' ? 'tasks' : 'apps';
+    let data = { apps: [], self: {}, audit: [] };
+    let tasks = { tasks: [], recent: [] };
+    let timer = null;
+    let logState = null;   // { id, name, offset, follow }
+    let lastRun = null;
+
+    const STATUS = {
+      running: ['ok', '运行中'], starting: ['warn', '启动中'], restarting: ['warn', '重启中'],
+      failed: ['danger', '已失败'], stopped: ['', '未运行'],
+    };
+
+    function statusBadge(runtime) {
+      const [cls, label] = STATUS[runtime.status] || ['', runtime.status];
+      return `<span class="badge ${cls}">${esc(label)}</span>`;
+    }
+
+    function appCard(app) {
+      const r = app.runtime || {};
+      const metas = [
+        r.pid ? `PID ${r.pid}` : null,
+        r.uptime ? `已运行 ${duration(r.uptime)}` : null,
+        r.pid && r.memory_rss ? `内存 ${bytes(r.memory_rss)}` : null,
+        r.restart_count ? `重启 ${r.restart_count} 次` : null,
+        r.last_code !== null && r.last_code !== undefined && !r.pid ? `上次退出码 ${r.last_code}` : null,
+        app.autostart ? '开机自启' : null,
+      ].filter(Boolean).map((m) => `<span class="badge">${esc(m)}</span>`).join('');
+      return `<div class="card app-card" data-card="${app.id}">
+        <div class="app-head">
+          <div>
+            <div class="app-name">${esc(app.name)} ${statusBadge(r)}
+              <span class="badge">${esc(app.restart)}</span></div>
+            <div class="dim" style="font-size:12px;margin-top:4px">
+              ${esc(app.description || '无描述')}</div>
+          </div>
+          <div class="spacer"></div>
+          <div class="row" style="gap:6px">
+            <button class="btn sm ghost" data-app="logs" data-id="${app.id}">日志</button>
+            <button class="btn sm ghost" data-app="probe" data-id="${app.id}">试运行</button>
+            ${r.status === 'running' || r.status === 'starting' || r.status === 'restarting'
+              ? `<button class="btn sm" data-app="stop" data-id="${app.id}">停止</button>
+                 <button class="btn sm" data-app="restart" data-id="${app.id}">重启</button>`
+              : `<button class="btn sm primary" data-app="start" data-id="${app.id}">启动</button>`}
+            <button class="btn sm ghost" data-app="edit" data-id="${app.id}">编辑</button>
+            <button class="btn sm danger" data-app="delete" data-id="${app.id}">删除</button>
+          </div>
+        </div>
+        <div class="row" style="margin-top:10px">${metas || '<span class="dim" style="font-size:12px">尚未运行过</span>'}</div>
+        <div class="app-cmd mono" title="${esc(app.command)}">$ ${esc(app.command)}</div>
+        <div class="dim mono" style="font-size:11px">工作目录 ${esc(app.cwd || '-')}</div>
+      </div>`;
+    }
+
+    function auditRows(records) {
+      if (!records || !records.length) return '<div class="empty">暂无操作记录</div>';
+      return `<div class="table-wrap"><table class="data"><thead><tr>
+        <th>时间</th><th>操作</th><th>应用</th><th>详情</th></tr></thead>
+        <tbody>${records.slice(0, 12).map((r) => `<tr>
+          <td class="cell-sub">${datetime(r.time)}</td>
+          <td><span class="badge info">${esc(r.action)}</span></td>
+          <td class="cell-main">${esc(r.app || '-')}</td>
+          <td class="cell-sub" title="${esc(r.detail || '')}">${esc((r.detail || '').slice(0, 70))}</td>
+        </tr>`).join('')}</tbody></table></div>`;
+    }
+
+    function tasksTab() {
+      const groups = [];
+      tasks.tasks.forEach((task) => {
+        let group = groups.find((g) => g.name === task.group);
+        if (!group) { group = { name: task.group, items: [] }; groups.push(group); }
+        group.items.push(task);
+      });
+      const caps = live.capabilities || {};
+      const runFor = (task) => {
+        const finished = tasks.recent.find((r) => r.task_id === task.id);
+        if (finished) {
+          return `<div class="dim" style="font-size:11px">上次 ${datetime(finished.time)} ·
+            ${finished.duration}s · 退出码 ${finished.code}</div>`;
+        }
+        return '';
+      };
+      return `
+        <div class="card" style="margin-bottom:14px">
+          <div class="row">
+            <span class="badge info">${tasks.tasks.length} 个内置任务</span>
+            <span class="dim" style="font-size:12px">
+              常用命令已预先写好，点击即执行；带参数的会先弹出输入框。</span>
+            <div class="spacer"></div>
+            <button class="btn sm ghost" data-act="tasks-refresh">刷新</button>
+            <button class="btn sm ghost" data-act="recent-clear">清空记录</button>
+          </div>
+        </div>
+        ${groups.map((group) => `
+          <h2 class="section-title">${esc(group.name)}</h2>
+          <div class="task-grid">
+            ${group.items.map((task) => {
+              const missing = (task.requires || []).filter((dep) => caps[dep] === false);
+              const disabled = missing.length ? 'disabled' : '';
+              return `<div class="card task-card ${disabled ? 'disabled' : ''}">
+                <div class="row">
+                  <b>${esc(task.title)}</b>
+                  ${task.danger ? '<span class="badge danger">危险</span>' : ''}
+                  ${missing.length ? `<span class="badge danger">缺 ${esc(missing.join('/'))}</span>` : ''}
+                </div>
+                <div class="dim" style="font-size:12px;min-height:32px;margin:6px 0">
+                  ${esc(task.description || task.group)}</div>
+                ${runFor(task)}
+                <div class="row" style="margin-top:8px">
+                  <button class="btn sm ${task.danger ? 'danger' : 'primary'}"
+                    data-task="${task.id}" ${disabled}>${task.params.length ? '填参数并运行' : '运行'}</button>
+                </div>
+              </div>`;
+            }).join('')}
+          </div>`).join('')}
+        <div class="card" style="margin-top:14px">
+          <h2>本次会话输出</h2>
+          <pre class="log-output" id="task-out" style="max-height:320px">${lastRun
+            ? esc(`$ ${lastRun.command}\n${lastRun.text || '(无输出)'}\n[退出码 ${lastRun.code} · ${lastRun.duration}s]`)
+            : '运行任务后，输出会显示在这里…'}</pre>
+        </div>
+        <div class="card" style="margin-top:14px">
+          <h2>最近执行记录</h2>
+          ${auditRows((tasks.recent || []).map((r) => ({
+            time: r.time, action: r.code === 0 ? 'ok' : `exit ${r.code}`,
+            app: r.title, detail: r.command,
+          })))}
+        </div>`;
+    }
+
+    function appsTab() {
+      const self = data.self || {};
+      return `
+        <div class="card" style="margin-bottom:14px">
+          <div class="row">
+            <span class="badge info">${data.apps.length} 个常驻应用</span>
+            ${self.systemd ? '<span class="badge">systemd 环境</span>'
+              : '<span class="badge warn">无 systemd，由面板守护</span>'}
+            <span class="dim" style="font-size:12px">
+              托管进程独立成会话：关掉浏览器、断开终端都不会中断；进程崩溃按策略自动拉起。</span>
+            <div class="spacer"></div>
+            <button class="btn sm ghost" data-act="apps-refresh">刷新</button>
+            <button class="btn sm primary" data-act="apps-new">添加常驻应用</button>
+          </div>
+          <div class="dim mono" style="font-size:11px;margin-top:8px">
+            注册表 ${esc(self.registry || '-')} · 日志目录 ${esc(self.log_dir || '-')}</div>
+        </div>
+        ${data.apps.length ? data.apps.map(appCard).join('')
+          : `<div class="card"><div class="empty">
+              还没有常驻应用。点右上角「添加常驻应用」，把一条需要长期运行的命令交给面板托管。<br><br>
+              典型用途：内网穿透客户端、定时爬虫、个人服务、uvicorn / frpc / syncthing 等。</div></div>`}
+        <div class="card" style="margin-top:14px">
+          <h2>最近操作</h2>
+          ${auditRows(data.audit)}
+        </div>`;
+    }
+
+    function paint() {
+      root.innerHTML = `
+        <div class="tabs-head">
+          <button class="tab-btn ${tab === 'apps' ? 'active' : ''}" data-tab-btn="apps">常驻应用</button>
+          <button class="tab-btn ${tab === 'tasks' ? 'active' : ''}" data-tab-btn="tasks">常用操作</button>
+        </div>
+        <div id="apps-panel">${tab === 'apps' ? appsTab() : tasksTab()}</div>`;
+      paintLogPanel();
+    }
+
+    function paintLogPanel() {
+      const existing = $('#app-log-drawer');
+      if (existing) existing.remove();
+      if (!logState) return;
+      const drawer = document.createElement('div');
+      drawer.id = 'app-log-drawer';
+      drawer.className = 'log-drawer';
+      drawer.innerHTML = `
+        <div class="log-drawer-head">
+          <b>${esc(logState.name)} · 运行日志</b>
+          <div class="spacer"></div>
+          <label class="row" style="font-size:12px;gap:6px">
+            <input type="checkbox" id="log-follow" ${logState.follow ? 'checked' : ''}> 跟随</label>
+          <button class="btn sm ghost" data-log="refresh">刷新</button>
+          <button class="btn sm ghost" data-log="clear">清空日志</button>
+          <button class="btn sm" data-log="close">关闭</button>
+        </div>
+        <pre class="log-output" id="app-log-body">加载中…</pre>`;
+      root.appendChild(drawer);
+      $('#log-follow', drawer).onchange = (event) => { logState.follow = event.target.checked; };
+      drawer.onclick = (event) => {
+        const action = event.target.dataset?.log;
+        if (action === 'close') { logState = null; paintLogPanel(); return; }
+        if (action === 'refresh') { loadLog(true); return; }
+        if (action === 'clear') { clearLog(); }
+      };
+    }
+
+    async function loadLog(manual = false) {
+      if (!logState) return;
+      try {
+        const url = `/api/panel/apps/${logState.id}/logs?offset=${logState.offset}`;
+        const res = await api.get(url);
+        const body = $('#app-log-body');
+        if (!body) return;
+        if (logState.offset === 0 || res.offset !== logState.offset) {
+          body.textContent = res.content || '（暂无输出）';
+        } else if (res.content) {
+          body.textContent += res.content;
+        }
+        logState.offset = res.next_offset;
+        if (logState.follow && body.scrollHeight - body.scrollTop - body.clientHeight < 60) {
+          body.scrollTop = body.scrollHeight;
+        }
+        if (manual) toast('日志已刷新');
+      } catch (err) {
+        const body = $('#app-log-body');
+        if (body) body.textContent = `读取失败：${err.message}`;
+      }
+    }
+
+    async function clearLog() {
+      if (!logState) return;
+      const ok = await confirmDialog({
+        title: '清空日志', danger: true, confirmText: '清空',
+        message: `确定清空 <b class="mono">${esc(logState.name)}</b> 的运行日志吗？
+          已写入磁盘的日志文件会被截断，历史输出不可恢复。`,
+      });
+      if (!ok) return;
+      try {
+        await api.del(`/api/panel/apps/${logState.id}/logs`);
+        logState.offset = 0;
+        $('#app-log-body').textContent = '（日志已清空，新输出会继续显示在这里）';
+        toast('日志已清空');
+      } catch (err) { toast(err.message, 'err'); }
+    }
+
+    function appFields(app) {
+      const a = app || {};
+      return [
+        { name: 'name', label: '名称（字母数字._-，1~48 位）', value: a.name || '', placeholder: 'frpc' },
+        { name: 'command', label: '启动命令', value: a.command || '', placeholder: '/opt/frp/frpc -c /opt/frp/frpc.toml' },
+        { name: 'cwd', label: '工作目录（必须存在）', value: a.cwd || '', placeholder: '/opt/frp' },
+        { name: 'description', label: '描述（可选）', value: a.description || '', placeholder: '内网穿透客户端' },
+        { name: 'restart', label: '重启策略：never / on-failure / always', value: a.restart || 'on-failure' },
+        { name: 'max_restarts', label: '5 分钟内最多重启次数', value: S(a.max_restarts ?? 5) },
+        { name: 'restart_delay', label: '重启间隔（秒，0.5~300）', value: S(a.restart_delay ?? 2) },
+        { name: 'autostart', label: '开机自启：yes / no', value: a.autostart ? 'yes' : 'no' },
+      ];
+    }
+
+    function toPayload(values) {
+      const autostart = ['yes', 'y', 'true', '1', '是'].includes(S(values.autostart).toLowerCase());
+      return {
+        name: values.name, command: values.command, cwd: values.cwd || '',
+        description: values.description || '', restart: values.restart || 'on-failure',
+        max_restarts: Number(values.max_restarts || 5),
+        restart_delay: Number(values.restart_delay || 2),
+        autostart,
+      };
+    }
+
+    async function editApp(app) {
+      const values = await formDialog({
+        title: app ? `编辑 · ${app.name}` : '添加常驻应用',
+        fields: appFields(app),
+        confirmText: app ? '保存' : '注册',
+        note: app ? '运行中的改动需重启应用后生效。' : '注册后不会自动启动，建议先「试运行」确认配置。',
+      });
+      if (!values) return;
+      const payload = toPayload(values);
+      try {
+        if (app) {
+          await api.put(`/api/panel/apps/${app.id}`, payload);
+          toast('配置已保存');
+        } else {
+          const res = await api.post('/api/panel/apps', payload);
+          toast(res.message);
+        }
+        await loadApps();
+        paint();
+      } catch (err) { toast(err.message, 'err'); }
+    }
+
+    async function probeApp(app) {
+      const box = document.createElement('div');
+      box.innerHTML = '<div class="empty">试运行中…（观察 6 秒内的输出）</div>';
+      const modal = openModal({ title: `试运行 · ${app.name}`, body: box, size: 'wide' });
+      try {
+        const res = await api.post(`/api/panel/apps/${app.id}/probe`, { seconds: 6 });
+        box.innerHTML = `<div class="row" style="margin-bottom:10px">
+            <span class="badge ${res.survived ? 'ok' : 'warn'}">${esc(res.message)}</span>
+            ${res.code === null ? '' : `<span class="badge">退出码 ${res.code}</span>`}</div>
+          <pre class="log-output" style="max-height:320px">${esc(res.output || '(无输出)')}</pre>`;
+      } catch (err) {
+        box.innerHTML = `<div class="empty">试运行失败：${esc(err.message)}</div>`;
+      }
+      return modal;
+    }
+
+    function openLogs(app) {
+      logState = { id: app.id, name: app.name, offset: 0, follow: true };
+      paintLogPanel();
+      loadLog();
+    }
+
+    async function loadApps() {
+      data = await api.get('/api/panel/apps');
+    }
+
+    async function loadTasks() {
+      tasks = await api.get('/api/panel/tasks');
+    }
+
+    async function refresh() {
+      try {
+        if (tab === 'apps') await loadApps(); else await loadTasks();
+      } catch (err) {
+        $('#apps-panel').innerHTML = `<div class="card"><div class="empty">读取失败：${esc(err.message)}</div></div>`;
+        return;
+      }
+      paint();
+      if (logState) loadLog();
+    }
+
+    async function runTask(task) {
+      let values = {};
+      if (task.params.length) {
+        const input = await formDialog({
+          title: `运行 · ${task.title}`,
+          fields: task.params.map((p) => ({
+            name: p.name, label: p.label, value: p.default, placeholder: p.placeholder,
+          })),
+          confirmText: '运行',
+        });
+        if (!input) return;
+        values = input;
+      }
+      if (task.danger) {
+        const ok = await confirmDialog({
+          title: `危险操作 · ${task.title}`, danger: true, confirmText: '确认执行',
+          message: `该任务会修改系统状态，请确认：<b>${esc(task.title)}</b><br>
+            <span class="dim">${esc(task.description || '')}</span>`,
+        });
+        if (!ok) return;
+      }
+      const out = $('#task-out');
+      if (out) out.textContent = `$ ${task.title} 执行中…`;
+      try {
+        const res = await api.post(`/api/panel/tasks/${task.id}/run`, { params: values });
+        const text = [res.stdout, res.stderr].filter((p) => p && p.trim()).join('\n');
+        lastRun = { command: res.command, text, code: res.code, duration: res.duration };
+        if (out) {
+          out.textContent = `$ ${res.command}\n\n${text || '(无输出)'}\n\n[退出码 ${res.code} · 耗时 ${res.duration}s]`;
+        }
+        await loadTasks();
+        toast(res.code === 0 ? '执行完成' : `执行结束（退出码 ${res.code}）`, res.code === 0 ? 'ok' : 'err');
+      } catch (err) {
+        if (out) out.textContent = `执行失败：${err.message}`;
+        toast(err.message, 'err');
+      }
+    }
+
+    root.onclick = async (event) => {
+      const tabBtn = event.target.closest('[data-tab-btn]');
+      if (tabBtn) {
+        tab = tabBtn.dataset.tabBtn;
+        localStorage.setItem('sp-apps-tab', tab);
+        // 切 tab 时重新拉一次数据再重绘，避免展示上一次进入时的陈旧状态
+        try {
+          if (tab === 'apps') await loadApps(); else await loadTasks();
+        } catch (err) { toast(err.message, 'err'); }
+        paint();
+        return;
+      }
+      const act = event.target.dataset?.act;
+      if (act === 'apps-refresh') { await refresh(); toast('已刷新'); return; }
+      if (act === 'apps-new') { await editApp(null); return; }
+      if (act === 'tasks-refresh') { await refresh(); toast('已刷新'); return; }
+      if (act === 'recent-clear') {
+        try { await api.del('/api/panel/tasks/recent'); await refresh(); toast('记录已清空'); }
+        catch (err) { toast(err.message, 'err'); }
+        return;
+      }
+      const taskBtn = event.target.closest('[data-task]');
+      if (taskBtn) {
+        const task = tasks.tasks.find((t) => t.id === taskBtn.dataset.task);
+        if (task) await runTask(task);
+        return;
+      }
+      const appBtn = event.target.closest('[data-app]');
+      if (!appBtn) return;
+      const app = data.apps.find((a) => a.id === appBtn.dataset.id);
+      if (!app) return;
+      const action = appBtn.dataset.app;
+      try {
+        if (action === 'start' || action === 'stop' || action === 'restart') {
+          const labels = { start: '启动', stop: '停止', restart: '重启' };
+          if (action !== 'start') {
+            const ok = await confirmDialog({
+              title: `${labels[action]} · ${app.name}`, danger: action === 'stop', confirmText: labels[action],
+              message: action === 'stop'
+                ? `停止后该应用会退出，直到你再次启动（已开启自启的会在面板下次启动时拉起）。`
+                : `重启会先结束当前进程，再按同样的配置重新拉起。`,
+            });
+            if (!ok) return;
+          }
+          const res = await api.post(`/api/panel/apps/${app.id}/${action}`, {});
+          toast(res.message);
+          await refresh();
+        } else if (action === 'probe') {
+          await probeApp(app);
+        } else if (action === 'logs') {
+          openLogs(app);
+        } else if (action === 'edit') {
+          await editApp(app);
+        } else if (action === 'delete') {
+          const values = await formDialog({
+            title: `删除 · ${app.name}`,
+            fields: [{ name: 'confirm', label: `输入应用名 ${app.name} 以确认删除`, value: '' }],
+            confirmText: '删除',
+            note: '仅删除托管配置与日志，不会删除应用自身的文件。',
+          });
+          if (!values) return;
+          if (values.confirm !== app.name) { toast('名称不匹配，已取消', 'err'); return; }
+          const res = await api.del(`/api/panel/apps/${app.id}`);
+          if (logState && logState.id === app.id) { logState = null; }
+          toast(res.message);
+          await refresh();
+        }
+      } catch (err) {
+        toast(err.message, 'err');
+      }
+    };
+
+    try {
+      await Promise.all([loadApps(), loadTasks()]);
+    } catch (err) {
+      root.innerHTML = `<div class="card"><div class="empty">读取失败：${esc(err.message)}</div></div>`;
+      return null;
+    }
+    paint();
+    timer = setInterval(() => { if (!logState) refresh().catch(() => {}); else loadLog(); }, 3000);
     return () => { clearInterval(timer); };
   },
 });

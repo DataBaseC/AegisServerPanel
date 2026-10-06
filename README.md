@@ -28,6 +28,7 @@
 | 挂载 / 卸载 | ❌ | ✅ |
 | 重启 / 关机 | ❌ | ✅ |
 | 应用与端口发现 | ❌ | ✅ |
+| 常驻应用（托管进程 / 常用操作 / 代码片段） | ❌ | ✅ |
 | Agent 接入（远程执行命令） | ❌ | ✅ |
 
 设计要点：
@@ -63,13 +64,41 @@ systemd 服务列表与状态、启停 / 重启 / 重载、开机自启开关、
 
 ### 应用与端口
 扫描本机所有 TCP 监听端口，按**进程**聚合，回答「这台机器上跑了几个应用、分别监听哪个 IP 和端口」：
-
 - 列出应用名、PID、运行用户、内存占用、命令行
 - 每个监听端口给出**可直接点击的访问链接**
 - 监听 `0.0.0.0` / `::` 时自动替换为服务器的局域网 IP，避免给出点不开的地址
 - 监听 `127.0.0.1` 的标记「仅本机」，不生成无效链接
 - 数据库 / Redis / Kafka / VNC 等端口识别为「非 Web 服务」，不生成误导链接
 - `443` / `8443` 等端口自动使用 `https://`
+
+### 常驻应用（持久化运行进程）
+把一条需要长期运行的命令交给面板托管，**脱离浏览器会话活着**：
+
+- **真正的持久化**：托管进程用 `start_new_session` 独立成会话组，关掉浏览器、断开终端、网络抖动都不会中断；面板自身升级重启也不会连带杀死它
+- **崩溃自动拉起**：按策略重启（`never` / `on-failure` / `always`），可配重启间隔与「5 分钟内最多重启次数」，超过上限标记 `failed` 并停止重试，避免崩溃循环把机器拖垮
+- **输出可追溯**：`stdout`/`stderr` 合流落盘到 `logs/apps/<名称>.log`（超 4MB 自动转 `.1`），页面按字节偏移增量跟随，断线重连不丢历史；也可一键清空
+- **先试后启**：注册后默认不启动，点「试运行」跑 6 秒抓输出，确认命令与工作目录正确再正式保活
+- **开机自启**：勾选 `autostart` 的应用在面板启动 2 秒后被拉起；无 systemd 环境配合 `panel-supervisor.sh` 即实现容器重启后自动恢复
+- **面板全挂也能救火**：`serverpanel --apps list/start/stop/restart/logs/remove` 直接在服务器本机操作，不依赖服务进程
+
+注册表在 `/etc/serverpanel/apps.json`（0600，原子替换），与配置分离，升级面板不会丢。
+
+### 常用操作（一键任务）
+把"经常要敲的一长串命令"变成一张卡片：资源总览、磁盘占用排行、大文件排查、inode 检查、日志检索、端口占用查询、连通性与 HTTP 探测、面板状态与重启……
+
+- **声明式，不是命令输入框**：任务模板写死在 `app/tasks.py`，只有声明了参数的任务才接受输入，且输入必须匹配白名单正则（默认 `[\w./:@=,\- ]`），`;` `|` `$()` 反引号一律拒绝
+- **危险任务要二次确认**：清理 `/tmp`、重启面板等标记 `danger` 的任务弹出确认框
+- **能力自适应**：依赖 `systemd` / `journalctl` / `dmesg` / `ss` 的任务按实际探测结果自动置灰
+- **执行即审计**：下游仍是 `shell.run`（超时 + 512KB 截断），并记录最近 30 次执行（任务、参数、退出码、耗时）
+- **CLI 同样可用**：`serverpanel --recipe list` / `--recipe run <任务ID> [参数=值]`
+
+### 代码 / 命令片段库
+AI Agent 与本地脚本接入时反复要用的代码一次给全，并**按当前面板地址实时渲染**：
+
+- 分类：Agent 接入（curl / bash `sp()` / Python / PowerShell / 本机管理命令）、终端常用、Docker、面板运维、开发调试
+- `{{endpoint}}`、`{{base_url}}`、`{{shell}}` 等占位符由服务端用当前请求填充，复制出来直接能跑；不再出现 `192.168.1.10` 这种要手工替换的假地址
+- 令牌默认渲染为 `YOUR_TOKEN`，只有点「显示」才回填真实令牌；带依赖（`jq`/`docker`/`ss`）的片段会标注出来
+- 非破坏性的 bash 片段支持面板内一键运行，通道与审计和 `/api/terminal/exec` 完全一致
 
 ### 文件管理
 目录浏览、在线查看与编辑（2 MB 上限）、新建 / 重命名 / 复制 / 删除、下载与上传、按名称搜索、分区占用概览。`/`、`/etc`、`/usr`、`/boot` 等系统关键目录被列入保护名单，禁止删除。
@@ -83,7 +112,6 @@ systemd 服务列表与状态、启停 / 重启 / 重载、开机自启开关、
 ---
 
 ## 三、架构
-
 ### 技术栈
 
 | 层 | 选型 | 说明 |
@@ -103,9 +131,12 @@ AegisServerPanel/
 │   ├── main.py               # 应用入口、路由挂载、安全响应头、CLI 与启动横幅
 │   ├── config.py             # 配置持久化、密码哈希、运行模式、Agent 令牌
 │   ├── auth.py               # 会话管理、各类鉴权依赖（含 WebSocket 与 Origin 校验）
+│   ├── apps.py               # 常驻应用：注册表 + 进程守护（拉起/重启/日志/自启）
+│   ├── tasks.py              # 常用操作：内置任务模板 + 参数校验
+│   ├── snippets.py           # 代码/命令片段库：模板与渲染上下文
 │   ├── metrics.py            # 性能采样器（2s 一次，保留 120 点历史）
 │   ├── shell.py              # 命令执行封装：超时保护 + 输出截断
-│   ├── manage.py             # 生命周期管理：install / start / stop / status / update
+│   ├── manage.py             # 生命周期管理：install / start / stop / status / update / apps
 │   ├── utils.py              # 跨平台小工具
 │   └── routes/
 │       ├── auth_routes.py    # 初始化 / 登录 / 登出 / 改密
@@ -116,16 +147,20 @@ AegisServerPanel/
 │       ├── log_routes.py     # journal / dmesg / 日志白名单文件
 │       ├── file_routes.py    # 文件浏览、读写、上传下载、搜索
 │       ├── terminal_routes.py# PTY WebSocket 终端 + 一次性命令执行
-│       ├── app_routes.py     # 应用与端口发现
+│       ├── app_routes.py     # 应用与端口发现（只读）
+│       ├── apps_routes.py    # 常驻应用管理（/api/panel/apps）
+│       ├── tasks_routes.py   # 常用操作（/api/panel/tasks）
+│       ├── snippets_routes.py# 代码片段库（/api/snippets）
 │       └── agent_routes.py   # Agent 令牌管理、接入信息、执行审计
 ├── static/
 │   ├── index.html            # 单页骨架（登录页 + 主界面）
 │   ├── app.js                # 全部前端逻辑：路由、视图、多标签、终端、模式适配
 │   ├── style.css             # 全站样式
 │   └── vendor/               # xterm.js 与 fit 插件（本地内置，不依赖 CDN）
-├── tests/                    # pytest：鉴权、模式门禁、日志白名单回归等
+├── tests/                    # pytest：鉴权、模式门禁、日志白名单、常驻应用、任务与片段
 ├── scripts/
-│   └── make-offline-bundle.sh  # 制作离线安装包（代码 + 依赖 wheels）
+│   ├── make-offline-bundle.sh  # 制作离线安装包（代码 + 依赖 wheels）
+│   └── smoke_apps.py         # 常驻应用冒烟脚本（开发机可跑，验证守护与日志）
 ├── install.sh                # 安装引导（环境检查 + venv + 依赖），其余交给 serverpanel --install
 ├── run.sh                    # 前台快速启动（调试用）
 ├── requirements.txt          # 直接依赖（~= 兼容约束）
@@ -190,6 +225,24 @@ flowchart TB
 | 日志跟随 | HTTP 轮询 | 按 tail 行数拉取增量 |
 
 采样器由 FastAPI lifespan 启动，每 2 秒采集一次并写入 120 点的环形缓冲，新打开页面时可直接回填历史曲线。
+
+### 常驻应用进程模型
+
+面板自己就是被守护的单进程（systemd 或 `panel-supervisor.sh`），因此"托管应用"的关键是**把应用进程的生命周期与面板进程解耦**，同时又不能在面板退出后留下孤儿：
+
+```
+panel-supervisor.sh / systemd
+        └── 面板进程（FastAPI，root）
+              ├── AppSupervisor（每 1.5s 回收 + 按策略重启）
+              │     └── 托管应用…  start_new_session=True ⇒ 独立会话组
+              │                     stdout/stderr → logs/apps/<名称>.log（4MB 轮转）
+              └── /api/panel/apps/*（全部要求内网模式）
+```
+
+- **升级不断服**：升级流程只 TERM 面板服务进程本身，由守护重新拉起；托管应用处于独立会话组，不受进程组 TERM 影响
+- **停止即收尾**：`serverpanel --stop` / 面板 lifespan 退出时显式结束所有托管进程（含它们 fork 的子进程），避免无人认领的孤儿
+- **重启可对账**：面板重启后内存状态丢失，但注册表与日志都在磁盘上；CLI 会按注册表反查命令行，把"上个面板实例拉起的应用"重新纳入管理
+- **递归防护**：注册时拒绝把面板自身命令（`-m app.main`）作为托管应用，否则会出现「应用重启 → 面板重启 → 应用重启」的雪崩
 
 ---
 
@@ -264,11 +317,27 @@ sudo bash install.sh
 ```bash
 serverpanel --status         # 运行状态 + 健康检查 + 版本标记
 serverpanel --start          # 启动（systemd 或守护脚本自动二选一）
-serverpanel --stop           # 停止（终止整个守护进程组）
+serverpanel --stop           # 停止（终止整个守护进程组，并收走托管应用）
 serverpanel --restart        # 重启
 journalctl -u serverpanel -f # systemd 环境查看日志
 tail -f panel.log            # 无 systemd 环境查看日志
 ```
+
+常驻应用与常用操作的命令行入口（面板不可用时也能救火）：
+
+```bash
+serverpanel --apps list                       # 列出常驻应用 + 运行状态 + PID
+serverpanel --apps start frpc                 # 启动（独立会话，输出写入 logs/apps/）
+serverpanel --apps stop frpc                  # 停止（含它自己 fork 的子进程）
+serverpanel --apps restart frpc
+serverpanel --apps logs frpc                   # 打印最近 120 行运行日志
+serverpanel --apps remove frpc                 # 停止并删除托管配置
+serverpanel --recipe list                      # 列出所有内置常用操作
+serverpanel --recipe run net-ping target=1.1.1.1
+```
+
+> 面板停止时会把托管应用一并结束（托管进程与面板同生命周期），避免留下无人认领的孤儿；
+> 而**面板升级**只 TERM 面板服务进程本身、由守护重新拉起，所以升级期间托管应用不中断。
 
 ### 升级
 
@@ -388,7 +457,17 @@ sp systemctl status nginx
 | 终端 | `GET /api/terminal/info` 🔒 | 终端与运行环境信息 |
 | 终端 | `POST /api/terminal/exec` 🔒 | 一次性命令执行（面板会话或 Agent 令牌） |
 | 终端 | `WS /api/terminal/ws` 🔒 | 交互式 PTY 终端 |
-| 应用 | `GET /api/apps` 🔒 | 监听端口 → 应用与访问链接 |
+| 应用 | `GET /api/apps` 🔒 | 监听端口 → 应用与访问链接（只读发现） |
+| 常驻应用 | `GET/POST /api/panel/apps` 🔒 | 托管应用列表 / 注册（注册不自动启动） |
+| 常驻应用 | `GET/PUT/DELETE /api/panel/apps/{id}` 🔒 | 详情 / 改配置 / 删除（运行中需先停止） |
+| 常驻应用 | `POST /api/panel/apps/{id}/start\|stop\|restart` 🔒 | 生命周期控制 |
+| 常驻应用 | `POST /api/panel/apps/{id}/probe` 🔒 | 试运行若干秒抓输出（校验配置） |
+| 常驻应用 | `GET /api/panel/apps/{id}/logs`、`DELETE …/logs` 🔒 | 增量读日志（`offset`/`lines`）/ 清空 |
+| 常驻应用 | `GET /api/panel/apps/{id}/check-port` 🔒 | 端口占用提示（仅提示，不阻断） |
+| 常用操作 | `GET /api/panel/tasks` 🔒 | 内置任务清单 + 最近执行记录 |
+| 常用操作 | `POST /api/panel/tasks/{id}/run` 🔒 | 执行任务（参数白名单校验） |
+| 常用操作 | `GET/DELETE /api/panel/tasks/recent` 🔒 | 执行记录查询 / 清空 |
+| 代码片段 | `GET /api/snippets`、`/{id}` 🔒 | 按当前地址渲染片段；`reveal_token=1` 才回填令牌 |
 | Agent | `GET /api/agent/info` 🔒 | 令牌状态、接入信息、执行审计 |
 | Agent | `POST /api/agent/token`、`DELETE /api/agent/token` 🔒 | 生成 / 轮换、吊销令牌 |
 
@@ -399,6 +478,9 @@ sp systemctl status nginx
 - 配置文件：root 运行时为 `/etc/serverpanel/config.json`，普通用户为 `~/.config/serverpanel/config.json`，权限固定 `0600`
 - 可用 `SERVERPANEL_CONFIG` 环境变量或 `--config` 指定路径
 - 内容包含：密码哈希与盐、会话签名密钥、当前模式与切换时间、Agent 令牌
+- 常驻应用注册表：与配置文件同目录的 `apps.json`（权限 `0600`，原子替换写盘）；可用
+  `SERVERPANEL_APPS_DIR` 指定独立目录（测试与多实例部署用）
+- 常驻应用日志：`<注册表目录>/logs/apps/<应用名>.log`，单文件超 4MB 自动轮转为 `.log.1`
 
 启用 HTTPS（自行准备证书）：
 
@@ -432,6 +514,9 @@ serverpanel --host 0.0.0.0 --port 8787 --ssl-certfile /path/cert.pem --ssl-keyfi
 - 网页终端依赖 PTY（POSIX），非 POSIX 平台终端接口返回 501 并优雅降级
 - 「应用与端口」只覆盖 TCP 监听端口，UDP 服务不列出
 - 端口是否为 Web 服务使用内置端口表判断，非常规端口可能误判（仍会给出链接，可自行验证）
+- 常驻应用**不做资源隔离**（暂无 cgroup / 内存上限）：托管进程与面板同为 root，命令写错同样能搞坏系统——注册前先用「试运行」确认，并优先使用绝对路径
+- 常驻应用的重启上限按「5 分钟窗口内重启次数」计算，窗口外的历史崩溃不计入；`failed` 状态只表示已放弃自动拉起，手动启动仍可用
+- 「常用操作」内置任务以 Ubuntu / Debian 的命令集为准（`ss`、`du`、`journalctl`、`find -printf` 等），在 Alpine / BusyBox 上部分任务会失败并原样回显错误，不会静默成功
 - 未做多用户与权限分级，所有登录者共享同一个面板密码与 root 权限
 
 ---

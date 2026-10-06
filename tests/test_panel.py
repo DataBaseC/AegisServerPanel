@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
 import time
 from pathlib import Path
 
+import psutil
 import pytest
 from fastapi.testclient import TestClient
 
@@ -367,3 +369,302 @@ def test_supervisor_script_content(tmp_path):
     assert "while :" in content
     if os.name == "posix":
         assert os.stat(script).st_mode & stat.S_IXUSR
+
+
+# ---------- 常驻应用（P0） ----------
+
+def _tick_command(directory) -> str:
+    """生成一条"持续输出心跳"的跨平台命令，用于托管应用的冒烟测试。"""
+    script = Path(directory) / "tick.py"
+    script.write_text(
+        "import time\nfor i in range(600):\n    print('tick', i, flush=True)\n    time.sleep(0.5)\n",
+        encoding="utf-8",
+    )
+    return f"{Path(sys.executable).as_posix()} {script.as_posix()}"
+
+
+def test_public_mode_blocks_apps_and_tasks(authed):
+    """公网（只读）模式下，托管应用与常用操作必须整体 403——它们等价于 root shell。"""
+    assert authed.get("/api/panel/apps").status_code == 403
+    assert authed.get("/api/panel/tasks").status_code == 403
+    assert authed.post("/api/panel/apps", json={"name": "x", "command": "ls"}).status_code == 403
+    assert authed.post("/api/panel/tasks/sys-snapshot/run", json={}).status_code == 403
+    assert authed.get("/api/snippets").status_code == 403
+
+
+def test_app_definition_validation(authed, internal_mode, tmp_path):
+    """注册校验：坏名字 / 空命令 / 不存在的目录 / 递归启动面板自身都必须被拒绝。"""
+    bad = [
+        {"name": "bad name!", "command": "echo hi"},
+        {"name": "ok-name", "command": "   "},
+        {"name": "ok-name", "command": "echo hi", "cwd": str(tmp_path / "not-exists")},
+        {"name": "ok-name", "command": "echo hi", "restart": "sometimes"},
+        {"name": "ok-name", "command": "echo hi", "max_restarts": 999},
+        {"name": "ok-name", "command": "python -m app.main --host 0.0.0.0"},
+    ]
+    for payload in bad:
+        r = authed.post("/api/panel/apps", json=payload)
+        assert r.status_code == 400, f"{payload} 应被拒绝，实际 {r.status_code} {r.text}"
+    # 命令不存在 → 400（而不是注册成功后一启动就崩）
+    r = authed.post("/api/panel/apps", json={"name": "ghost-bin", "command": "no-such-binary-xyz"})
+    assert r.status_code == 400
+
+
+def test_app_lifecycle_and_logs(authed, internal_mode, tmp_path):
+    """注册 → 试运行 → 启动 → 读日志 → 停止 → 删除，全链路走 API。"""
+    payload = {
+        "name": "test-tick",
+        "command": _tick_command(tmp_path),
+        "cwd": str(tmp_path),
+        "restart": "on-failure",
+        "max_restarts": 3,
+        "restart_delay": 0.5,
+        "description": "回归测试用",
+    }
+    r = authed.post("/api/panel/apps", json=payload)
+    assert r.status_code == 200, r.text
+    app_id = r.json()["app"]["id"]
+    assert r.json()["app"]["runtime"]["status"] == "stopped"   # 注册不自动启动
+
+    # 重名 → 409（提示去编辑已有的）
+    assert authed.post("/api/panel/apps", json=payload).status_code == 409
+
+    # 试运行：能抓到输出且进程在观察期内活着
+    r = authed.post(f"/api/panel/apps/{app_id}/probe", json={"seconds": 2})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["survived"] is True, body
+    assert "tick" in body["output"]
+
+    r = authed.post(f"/api/panel/apps/{app_id}/start", json={})
+    assert r.status_code == 200, r.text
+    pid = r.json()["app"]["runtime"]["pid"]
+    assert pid, "启动后应返回 PID"
+
+    time.sleep(1.6)
+    r = authed.get(f"/api/panel/apps/{app_id}/logs", params={"lines": 50})
+    assert r.status_code == 200, r.text
+    log_data = r.json()
+    content = log_data["content"]
+    assert "tick" in content, f"托管应用的输出没有被收集：{content!r} memory={log_data.get('memory')!r}"
+    offset = log_data["next_offset"]
+    time.sleep(1.2)
+    delta = authed.get(f"/api/panel/apps/{app_id}/logs", params={"offset": offset}).json()
+    assert "tick" in delta["content"], "增量读取应拿到新输出"
+
+    # 列表里能看到运行状态与 PID
+    listed = authed.get("/api/panel/apps").json()["apps"]
+    row = next(a for a in listed if a["id"] == app_id)
+    assert row["runtime"]["status"] == "running"
+    assert row["runtime"]["pid"] == pid
+
+    # 运行中不允许直接删除
+    r = authed.delete(f"/api/panel/apps/{app_id}")
+    assert r.status_code == 400, r.text
+
+    # PID 1 之类的保护不适用于这里，但停止必须真正结束进程
+    r = authed.post(f"/api/panel/apps/{app_id}/stop", json={})
+    assert r.status_code == 200
+    assert r.json()["app"]["runtime"]["status"] == "stopped"
+    deadline = time.time() + 5
+    while time.time() < deadline and psutil.pid_exists(pid):
+        time.sleep(0.2)
+    assert not psutil.pid_exists(pid), "停止后进程必须真的退出"
+
+    # 清空日志 + 删除
+    assert authed.delete(f"/api/panel/apps/{app_id}/logs").status_code == 200
+    assert authed.get(f"/api/panel/apps/{app_id}/logs").json()["content"] == ""
+    assert authed.delete(f"/api/panel/apps/{app_id}").status_code == 200
+    assert authed.get(f"/api/panel/apps/{app_id}").status_code == 400  # 已不存在
+
+
+def test_managed_process_is_isolated_from_panel_group(authed, internal_mode, tmp_path):
+    """托管进程必须独立成组：否则面板升级 / 守护重启会连带杀死所有应用。"""
+    if os.name != "posix":
+        pytest.skip("进程组语义仅 POSIX")
+    r = authed.post("/api/panel/apps", json={
+        "name": "isolation-check",
+        "command": _tick_command(tmp_path),
+        "cwd": str(tmp_path),
+    })
+    app_id = r.json()["app"]["id"]
+    pid = authed.post(f"/api/panel/apps/{app_id}/start", json={}).json()["app"]["runtime"]["pid"]
+    try:
+        assert os.getpgid(pid) != os.getpgid(os.getpid()), "托管进程不能与面板同组"
+    finally:
+        authed.post(f"/api/panel/apps/{app_id}/stop", json={})
+        authed.delete(f"/api/panel/apps/{app_id}")
+
+
+def test_registry_file_is_atomic_and_private(authed, internal_mode, tmp_path):
+    """注册表写盘必须原子替换且权限 0600（面板与 CLI 可能并发写）。"""
+    from app.apps import supervisor
+
+    r = authed.post("/api/panel/apps", json={
+        "name": "registry-check",
+        "command": _tick_command(tmp_path),
+        "cwd": str(tmp_path),
+    })
+    app_id = r.json()["app"]["id"]
+    path = Path(supervisor.registry.path)
+    try:
+        assert path.exists()
+        if os.name == "posix":
+            assert stat.S_IMODE(path.stat().st_mode) & 0o777 == 0o600
+        # 没有残留的 .tmp 文件
+        leftovers = list(path.parent.glob(f"{path.name}.*.tmp"))
+        assert leftovers == [], f"残留临时文件：{leftovers}"
+    finally:
+        authed.delete(f"/api/panel/apps/{app_id}")
+
+
+# ---------- 常用操作（P1） ----------
+
+def test_task_params_block_shell_injection(authed, internal_mode):
+    """任务参数只允许白名单字符，注入类输入必须被拒（而不是被静默转义）。"""
+    from app import tasks as tasks_mod
+
+    task = tasks_mod.task_by_id("net-ping")
+    assert task is not None
+    for bad in ("1.1.1.1; rm -rf /", "$(id)", "`id`", "a|b", "'", "1.1.1.1 && whoami"):
+        with pytest.raises(ValueError):
+            tasks_mod.render(task, {"target": bad})
+    assert "1.1.1.1" in tasks_mod.render(task, {"target": "1.1.1.1"})
+
+    r = authed.post("/api/panel/tasks/net-ping/run", json={"params": {"target": "1.1.1.1; id"}})
+    assert r.status_code == 400
+
+
+def test_task_list_and_run(authed, internal_mode):
+    data = authed.get("/api/panel/tasks").json()
+    ids = {t["id"] for t in data["tasks"]}
+    assert {"sys-snapshot", "disk-inodes", "panel-status"} <= ids
+    assert all("title" in t and "group" in t for t in data["tasks"])
+
+    # 用一条跨平台命令验证"任务真的被执行了"（内置任务是 Linux 向的，跑不了不代表机制不通）
+    r = authed.post("/api/panel/tasks/sys-snapshot/run", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["title"] == "资源总览"
+    assert body["command"] and "uptime" in body["command"]
+    assert isinstance(body["code"], int)
+
+    # 执行记录可查、可清空
+    recent = authed.get("/api/panel/tasks/recent").json()["recent"]
+    assert any(item["task_id"] == "sys-snapshot" for item in recent)
+    assert authed.delete("/api/panel/tasks/recent").status_code == 200
+    assert authed.get("/api/panel/tasks/recent").json()["recent"] == []
+
+
+def test_unknown_task_returns_404(authed, internal_mode):
+    assert authed.post("/api/panel/tasks/no-such-task/run", json={}).status_code == 404
+
+
+# ---------- 代码片段（P2） ----------
+
+def test_snippets_render_current_endpoint(authed, internal_mode):
+    data = authed.get("/api/snippets").json()
+    assert data["total"] > 5
+    assert "Agent 接入" in data["categories"]
+    first = data["snippets"][0]
+    assert "/api/terminal/exec" in first["code"]
+    assert "{{" not in first["code"], "占位符必须全部被渲染掉"
+    # 默认不回显真实令牌
+    token = config_mod.config.agent_token
+    if token:
+        assert token not in first["code"]
+        assert "YOUR_TOKEN" in first["code"]
+    # 显式 reveal 才填入令牌
+    revealed = authed.get("/api/snippets", params={"reveal_token": 1}).json()
+    if token:
+        assert token in revealed["snippets"][0]["code"]
+        assert revealed["token_revealed"] is True
+    # 分类与关键词过滤
+    only = authed.get("/api/snippets", params={"category": "Docker"}).json()
+    assert only["snippets"] and all(s["category"] == "Docker" for s in only["snippets"])
+    assert authed.get("/api/snippets", params={"q": "docker"}).json()["total"] >= 1
+    assert authed.get("/api/snippets/no-such-snippet").status_code == 404
+
+
+def test_apps_cli_list_runs(capsys):
+    """CLI 兜底入口必须能在面板不可用时工作（只读注册表，不依赖服务进程）。"""
+    from app import manage
+
+    assert manage.cmd_apps(Path("."), ["list"]) == 0
+    out = capsys.readouterr().out
+    assert "注册表" in out
+
+    assert manage.cmd_recipe(["list"]) == 0
+    out = capsys.readouterr().out
+    assert "sys-snapshot" in out
+    assert manage.cmd_recipe(["run", "no-such-task"]) == 1
+    assert manage.cmd_apps(Path("."), ["start", "no-such-app"]) == 1
+    # 参数注入在 CLI 侧同样被拦下
+    assert manage.cmd_recipe(["run", "net-ping", "target=1.1.1.1; id"]) == 1
+
+
+def test_shutdown_stops_managed_apps(tmp_path):
+    """面板停止时必须收走自己拉起的应用：否则会留下无人认领的孤儿进程。"""
+    import asyncio
+
+    from app.apps import Registry, normalize_definition, Supervisor
+
+    registry = Registry(tmp_path / "apps.json")
+    sup = Supervisor(registry, tmp_path / "logs")
+    definition = normalize_definition({
+        "name": "shutdown-check",
+        "command": _tick_command(tmp_path),
+        "cwd": str(tmp_path),
+        "restart": "always",          # 即便策略是 always，面板退出也必须停干净
+        "restart_delay": 0.5,
+    })
+    registry.add(definition)
+
+    async def scenario() -> int:
+        await sup.serve()
+        started = await sup.start(definition["id"])
+        pid = started["runtime"]["pid"]
+        assert pid
+        await asyncio.sleep(0.6)
+        await sup.shutdown()
+        return pid
+
+    pid = asyncio.run(scenario())
+    deadline = time.time() + 5
+    while time.time() < deadline and psutil.pid_exists(pid):
+        time.sleep(0.2)
+    assert not psutil.pid_exists(pid), "面板退出后托管应用必须一并结束（不能留孤儿）"
+
+
+def test_panel_pids_excludes_lifecycle_commands(tmp_path, monkeypatch):
+    """`serverpanel --apps list` 这类运维命令不能被当成面板服务进程误杀。
+
+    面板 Agent 通道里执行的 `--restart` / `--apps` 与服务进程命令行高度相似，
+    `_panel_pids` 靠生命周期标志区分，缺了区分就会"重启命令把自己杀掉"。
+    """
+    from app import manage
+
+    if not os.path.isdir("/proc"):
+        pytest.skip("_panel_pids 依赖 /proc，仅 POSIX")
+
+    python = str(tmp_path / ".venv" / "bin" / "python")
+    argv_map = {
+        4242: [python, "-m", "app.main", "--host", "0.0.0.0"],
+        4243: [python, "-m", "app.main", "--restart"],
+        4244: [python, "-m", "app.main", "--apps", "list"],
+        4245: ["/bin/sh", "-c", "echo hi"],
+    }
+    monkeypatch.setattr(manage, "_read_cmdline", lambda pid: argv_map.get(pid, []))
+    monkeypatch.setattr(
+        manage.os, "listdir",
+        lambda path: ["1"] + [str(pid) for pid in argv_map] + ["self"],
+    )
+    pids = manage._panel_pids(tmp_path)
+    assert pids == [4242], f"只应识别真正的服务进程，实际 {pids}"
+
+    started = {}
+    monkeypatch.setattr(manage, "_systemd_available", lambda: False)
+    monkeypatch.setattr(manage, "_start_supervisor", lambda target_dir: started.setdefault("ok", True))
+    manage._restart_service(tmp_path)
+    # 已经找到服务进程时不应再拉起守护
+    assert not started

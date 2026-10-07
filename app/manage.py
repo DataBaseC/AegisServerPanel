@@ -304,7 +304,11 @@ def _supervisor_running(target_dir: Path) -> bool:
 def _start_supervisor(target_dir: Path) -> None:
     sup = target_dir / SUPERVISOR_NAME
     if not sup.exists():
-        raise RuntimeError("未找到守护脚本，请先执行 serverpanel --install")
+        # 脚本是运行时生成物，可能因 checkout/误删而缺失——按当前配置补生成，
+        # 而不是放弃启动（2026-10-07：脚本缺失导致 restart 后无人拉起面板）
+        meta = _load_metadata()
+        write_supervisor(target_dir, str(meta.get("host") or "0.0.0.0"), int(meta.get("port") or 8787))
+        print(f"守护脚本缺失，已重新生成 {sup}", file=sys.stderr)
     if _supervisor_running(target_dir):
         print(f"面板守护已在运行（PID {_read_pidfile(target_dir)}）")
         return
@@ -897,6 +901,13 @@ def _do_update(target_dir: Path, ref: str, force: bool, host: str, port: int) ->
     if _pip_install(target_dir) != 0:
         _git(target_dir, "checkout", current.stdout.strip())
         return fail("依赖安装失败，已回退代码（服务未重启，仍在运行旧版本）")
+
+    # 无 systemd 环境的守护脚本是运行时生成物（不入库）。若仓库状态异常导致它
+    # 缺失（如快照安装切分支时被 checkout 删掉），必须立即补生成，否则重启后
+    # 没人拉起面板——2026-10-07 事故即此。
+    if not _systemd_available() and not (target_dir / SUPERVISOR_NAME).exists():
+        write_supervisor(target_dir, host, port)
+        print(f"==> 守护脚本缺失，已重新生成 {target_dir / SUPERVISOR_NAME}")
 
     new_version = _installed_version(target_dir)
     print(f"==> 重启服务（新版本 {new_version or '未知'}）")

@@ -387,32 +387,104 @@ sudo serverpanel --update --update-ref origin/main   # 显式指定分支/标签
 
 > zip / 快照安装（目录无 `.git`）无法增量升级，`--update` 会给出迁移指引：克隆新目录 → 复用配置 → 停旧起新。
 
-### 无 systemd 环境（容器 / PRoot / Termux）自启动
+### 自启动与持久化（容器 / PRoot / Termux 部署必读）
 
-面板进程由 `panel-supervisor.sh` 守护后，还需要容器层解决「开机自启」。以 Termux PRoot 为例：
+PRoot 容器有一条决定一切的特性：`proot-distro` 默认带 **`--kill-on-exit`**——
+登录会话退出时，容器内**所有**进程（包括后台化的、nohup 的）都会被杀。
+持久化方案必须围绕这一点设计，任何"在会话里 `&` 后台化然后退出"的启动方式都会静默失败。
 
-1. 安装 Termux:Boot APP，添加开机脚本：
-   ```bash
-   termux-wake-lock
-   proot-distro login ubuntu -- bash -c "setsid nohup /root/aegis/AegisServerPanel/panel-supervisor.sh >/dev/null 2>&1 &"
-   ```
-2. 在容器 root 的 crontab 加兜底：`@reboot /root/aegis/AegisServerPanel/panel-supervisor.sh &`（flock 保证不会重复拉起）
-3. Android 侧：给 Termux 关闭电池优化、允许后台运行
+#### 推荐方案：登录即拉起（实测有效，最简单）
 
-> 上面第 2 步可以不敲命令：面板「设置 → 快捷设置 → 开机自启体检」会直接告诉你哪一截断了，
-> 并提供「写入容器 @reboot 兜底」（自动备份、去重、读回校验、失败回滚）与
-> 「复制 Termux:Boot 启动脚本」两个按钮。第 1、3 步在 Android 宿主侧，容器内无法代劳，
-> 体检里会如实标注为「需手工」。
+在容器 `/root/.bashrc` 末尾装一段幂等的自启动块（装好后**每次登录容器自动拉起面板**，已运行则跳过）：
 
-完整的自启链路：
+```bash
+grep -q "serverpanel autostart" /root/.bashrc || cat >> /root/.bashrc << 'EOF'
 
-| 环节 | 负责者 | 能否从面板内配置 |
+# >>> serverpanel autostart >>>
+service cron start >/dev/null 2>&1
+if ! pgrep -f panel-supervisor >/dev/null 2>&1 && ! pgrep -f "python -m app.main" >/dev/null 2>&1; then
+  ( setsid nohup /root/aegis/AegisServerPanel/panel-supervisor.sh >/dev/null 2>&1 & )
+fi
+# <<< serverpanel autostart <<<
+EOF
+```
+
+行为：登录容器 → cron 启动（看门兜底生效）→ 没在跑的面板被守护拉起；你正常使用 shell，
+互不干扰。退出容器时面板随会话停止（`--kill-on-exit`，改不了），下次登录自动恢复。
+
+#### 会话存活期间的四层兜底
+
+| 层 | 机制 | 自愈速度 |
 |---|---|---|
-| ① 设备/容器拉起守护 | Termux:Boot 脚本、容器 crontab `@reboot` | 容器 crontab 可以；Termux 宿主脚本只能给处方（复制粘贴） |
-| ② 守护拉起面板 | `panel-supervisor.sh` / systemd | ✅（重装守护按钮） |
-| ③ 面板拉起常驻应用 | 面板 startup + 应用的 autostart 开关 | ✅（全局开关 + 逐应用开关） |
-| ④ 面板自身开机自启 | systemd unit / 容器 crontab | ✅ |
-| ⑤ 设备侧保活 | Android 电池优化白名单、wake-lock | ❌ 只能给说明 |
+| 1 | `panel-supervisor.sh` while 循环：面板进程崩溃立即拉起 | ~1 秒 |
+| 2 | `--restart` 自愈：TERM 面板后若守护不在运行，自动补位启动守护 | 秒级 |
+| 3 | crontab 每分钟看门行（`serverpanel-watchdog` 标记）：守护死亡后 cron 补拉 | ≤60 秒 |
+| 4 | crontab `@reboot`（`serverpanel-supervisor` 标记）：容器重启后拉起守护 | 容器启动时 |
+
+看门与 @reboot 依赖 cron 守护在运行；两者都靠脚本内 `flock -n` 幂等，不会重复拉起。
+面板「设置 → 快捷设置 → 开机自启体检」会逐段检查这条链并给出修复按钮。
+
+#### 日常操作命令
+
+```bash
+serverpanel --status                    # 面板运行状态、守护 PID
+serverpanel --restart                   # 重启面板（保证返回后守护在岗，挂了会补位）
+serverpanel --stop                      # 停止面板（守护一并停止）
+serverpanel --update --update-ref origin/main   # 从 GitHub 升级（详见下文通道说明）
+
+serverpanel --apps list                 # 常驻应用：状态一览
+serverpanel --apps start 名称           # 启动（stop / restart / logs / remove 同理）
+```
+
+#### 面板没起来怎么排查
+
+1. 打开面板「设置 → 快捷设置 → 开机自启体检」，哪一截断了一目了然
+2. 容器内看守护与进程：`pgrep -af panel-supervisor`、`pgrep -af app.main`
+3. 看日志：`tail -40 /root/aegis/AegisServerPanel/panel.log`
+4. 手动拉起：重新登录容器即可（.bashrc 自动处理）；或 `serverpanel --start`
+5. 守护脚本本身丢失（如快照安装切分支被 checkout 删掉）：`serverpanel --install`
+   重新生成；较新版本在 `--restart` / `--update` 时会自动补生成
+
+#### 升级 / 部署代码的两条通道
+
+GitHub 可达时：面板「设置 → 面板升级」一键升级（自动备份、失败回滚），或 `serverpanel --update`。
+
+GitHub fetch 不稳时（TLS 中途断开，`ls-remote` 能通不代表 `fetch` 能通），
+走**局域网 bundle 通道**——在任一能连通服务器的机器上：
+
+```bash
+# 本机（与服务器同局域网）：
+git bundle create aegis-main.bundle main
+python -m http.server 8000          # 在 bundle 所在目录起临时服务
+
+# 服务器容器内：
+wget -O /root/aegis/aegis-main.bundle http://<本机IP>:8000/aegis-main.bundle
+cd /root/aegis/AegisServerPanel
+git fetch /root/aegis/aegis-main.bundle main:refs/remotes/origin/main
+git checkout -B main origin/main
+serverpanel --restart
+```
+
+注意事项：
+- 快照式安装（仓库只有一个本地提交）切到官方历史时，`panel-supervisor.sh`
+  等运行时生成物会被 checkout 删除，随后 `serverpanel --install` 重新生成即可
+  （新版 `--update` / `--restart` 会自动补生成）
+- 远程操作一律不要用 `pkill -f` 杀面板——命令文本会被自身匹配（用精确 PID 或
+  `serverpanel` 命令族）
+
+#### 可选：Termux:Boot（手机重启后全自动，无需人工登录）
+
+装 Termux:Boot APP（F-Droid / GitHub 源，Play 版不可用）后创建 `~/.termux/boot/start-panel.sh`：
+
+```bash
+#!/data/data/com.termux/files/usr/bin/sh
+termux-wake-lock
+proot-distro login ubuntu -- bash -c "service cron start; exec /root/aegis/AegisServerPanel/panel-supervisor.sh"
+```
+
+**关键：脚本里用 `exec` 让守护占住会话前台，绝不能加 `&` 或 nohup**——
+后台化启动会让会话立刻退出，`--kill-on-exit` 把刚拉起的一切全部带走。
+另给 Termux 关闭电池优化、允许后台运行。
 
 ### 模式与令牌管理命令
 

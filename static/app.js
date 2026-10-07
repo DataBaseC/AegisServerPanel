@@ -1712,6 +1712,11 @@ registerView('files', {
   async render(root) {
     let cwd = sessionStorage.getItem('sp_cwd') || '/';
     let entries = [];
+    let sortKey = 'name';
+    let sortDir = 1;
+    const selected = new Set();
+    const IMAGE_RE = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i;
+    const ARCHIVE_RE = /\.(zip|tar|tar\.gz|tgz|tar\.bz2|tbz2|tar\.xz|txz)$/i;
 
     const roots = (await api.get('/api/files/roots').catch(() => ({ roots: [] }))).roots;
 
@@ -1723,13 +1728,22 @@ registerView('files', {
           <button class="btn sm" data-act="mkdir">新建文件夹</button>
           <button class="btn sm" data-act="newfile">新建文件</button>
           <button class="btn sm" data-act="upload">上传文件</button>
+          <button class="btn sm" data-act="upload-dir">上传文件夹</button>
+          <button class="btn sm" data-act="fetch-url">从 URL 拉取</button>
           <input type="file" id="file-input" multiple class="hidden">
+          <input type="file" id="dir-input" webkitdirectory multiple class="hidden">
+          <label class="dim" style="font-size:12px;display:flex;align-items:center;gap:4px">
+            <input type="checkbox" id="upload-overwrite"> 覆盖同名</label>
+          <label class="dim" style="font-size:12px;display:flex;align-items:center;gap:4px">
+            <input type="checkbox" id="show-hidden" checked> 隐藏文件</label>
           <div class="spacer"></div>
           <input class="input" id="file-search" placeholder="在当前目录搜索…" style="width:190px">
           <button class="btn sm" data-act="search">搜索</button>
         </div>
+        <div class="batch-bar hidden" id="batch-bar"></div>
         <div class="crumbs" id="file-crumbs"></div>
         <div class="dim mono" id="file-meta" style="font-size:12px;margin-top:9px"></div>
+        <div id="upload-progress"></div>
       </div>
 
       <div class="card" style="margin-bottom:14px">
@@ -1738,7 +1752,7 @@ registerView('files', {
           `<button class="btn sm ghost" data-root="${esc(r.path)}">${esc(r.label)} <span class="dim">${esc(r.path)}</span></button>`).join('')}</div>
       </div>
 
-      <div class="card flush"><div class="table-wrap" id="file-table"><div class="empty">加载中…</div></div></div>`;
+      <div class="card flush drop-zone" id="drop-zone"><div class="table-wrap" id="file-table"><div class="empty">加载中…</div></div></div>`;
 
     function renderCrumbs(path) {
       const parts = path.split('/').filter(Boolean);
@@ -1751,6 +1765,31 @@ registerView('files', {
       $('#file-crumbs').innerHTML = nodes.join('');
     }
 
+    function sortEntries() {
+      entries.sort((a, b) => {
+        if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
+        let r = 0;
+        if (sortKey === 'size') r = (a.size || 0) - (b.size || 0);
+        else if (sortKey === 'mtime') r = (a.mtime || 0) - (b.mtime || 0);
+        else r = String(a.name).localeCompare(String(b.name), 'zh-Hans-CN', { numeric: true });
+        return r * sortDir;
+      });
+    }
+
+    function sortArrow(key) {
+      if (sortKey !== key) return '';
+      return sortDir === 1 ? ' ↑' : ' ↓';
+    }
+
+    function paintBatch() {
+      const bar = $('#batch-bar');
+      if (!selected.size) { bar.classList.add('hidden'); bar.innerHTML = ''; return; }
+      bar.classList.remove('hidden');
+      bar.innerHTML = `<span class="badge info">已选 ${selected.size} 项</span>
+        <button class="btn sm danger" data-act="batch-delete">批量删除</button>
+        <button class="btn sm ghost" data-act="batch-clear">取消选择</button>`;
+    }
+
     function renderTable() {
       if (!entries.length) {
         $('#file-table').innerHTML = '<div class="empty">此目录为空</div>';
@@ -1758,20 +1797,28 @@ registerView('files', {
       }
       $('#file-table').innerHTML = `
         <table class="data"><thead><tr>
-          <th style="width:44%">名称</th><th class="num">大小</th><th>权限</th><th>所有者</th>
-          <th>修改时间</th><th></th></tr></thead>
+          <th style="width:36px"><input type="checkbox" id="sel-all" ${selected.size && selected.size === entries.length ? 'checked' : ''}></th>
+          <th style="width:34%"><span class="th-sort" data-sort="name">名称${sortArrow('name')}</span></th>
+          <th class="num"><span class="th-sort" data-sort="size">大小${sortArrow('size')}</span></th>
+          <th class="file-hide-sm">权限</th><th class="file-hide-sm">所有者</th>
+          <th><span class="th-sort" data-sort="mtime">修改时间${sortArrow('mtime')}</span></th><th></th></tr></thead>
         <tbody>${entries.map((e, index) => `<tr>
+          <td><input type="checkbox" data-sel="${esc(e.path)}" ${selected.has(e.path) ? 'checked' : ''}></td>
           <td><span class="file-icon">${e.is_dir ? '🗀' : e.is_link ? '🔗' : '📄'}</span>
             <span class="cell-main">${esc(e.name)}</span>
             ${e.link_target ? `<span class="cell-sub"> → ${esc(e.link_target)}</span>` : ''}</td>
           <td class="num">${e.is_dir ? '-' : bytes(e.size)}</td>
-          <td class="cell-sub">${esc(e.mode)}</td>
-          <td class="cell-sub">${e.uid}:${e.gid}</td>
+          <td class="cell-sub file-hide-sm">${esc(e.mode)}</td>
+          <td class="cell-sub file-hide-sm">${e.uid}:${e.gid}</td>
           <td class="cell-sub">${datetime(e.mtime)}</td>
           <td class="actions">
             ${e.is_dir ? `<button class="btn sm ghost" data-act="open" data-index="${index}">打开</button>` : ''}
             ${e.is_dir ? '' : '<a class="btn sm ghost" href="#" data-act="edit" data-index="' + index + '">编辑</a>'}
+            ${!e.is_dir && IMAGE_RE.test(e.name) ? `<button class="btn sm ghost" data-act="preview" data-index="${index}">预览</button>` : ''}
+            ${ARCHIVE_RE.test(e.name) ? `<button class="btn sm ghost" data-act="extract" data-index="${index}">解压</button>` : ''}
+            ${e.is_dir ? `<button class="btn sm ghost" data-act="du" data-index="${index}">大小</button>` : ''}
             <a class="btn sm ghost" href="/api/files/download?path=${encodeURIComponent(e.path)}">下载</a>
+            <button class="btn sm ghost" data-act="chmod" data-index="${index}">权限</button>
             <button class="btn sm ghost" data-act="rename" data-index="${index}">重命名</button>
             <button class="btn sm danger" data-act="delete" data-index="${index}">删除</button>
           </td></tr>`).join('')}</tbody></table>`;
@@ -1779,10 +1826,15 @@ registerView('files', {
 
     async function load(path) {
       try {
-        const data = await api.get(`/api/files/list?path=${encodeURIComponent(path)}`);
+        const showHidden = $('#show-hidden')?.checked ?? true;
+        const data = await api.get(`/api/files/list?path=${encodeURIComponent(path)}`
+          + `&show_hidden=${showHidden}`);
         cwd = data.path;
         sessionStorage.setItem('sp_cwd', cwd);
         entries = data.entries;
+        selected.clear();
+        paintBatch();
+        sortEntries();
         renderCrumbs(cwd);
         renderTable();
         $('#file-meta').textContent = `${entries.length} 项`
@@ -1793,13 +1845,22 @@ registerView('files', {
       }
     }
 
+    function openPreview(entry) {
+      openModal({
+        title: `预览 · ${entry.name}`,
+        body: `<div style="text-align:center"><img
+          src="/api/files/download?path=${encodeURIComponent(entry.path)}"
+          alt="${esc(entry.name)}" style="max-width:100%;max-height:70vh;border-radius:6px"></div>`,
+      });
+    }
+
     async function openEditor(entry) {
       const body = document.createElement('div');
       body.innerHTML = '<div class="empty">加载中…</div>';
       const foot = document.createElement('div');
       foot.className = 'row';
       foot.innerHTML = `<span class="dim mono" id="editor-path" style="font-size:12px"></span>
-        <div class="spacer"></div><button class="btn" data-close>关闭</button>
+        <div class="spacer"></div><button class="btn" data-manual-close>关闭</button>
         <button class="btn primary" data-save>保存</button>`;
       const modal = openModal({ title: `编辑 · ${entry.name}`, body, footer: foot, size: 'wide' });
       $('#editor-path', foot).textContent = entry.path;
@@ -1810,31 +1871,103 @@ registerView('files', {
         const area = $('#editor-area', body);
         area.value = data.content;
         area.focus();
-        $('[data-save]', foot).onclick = async () => {
+        let dirty = false;
+        const markDirty = () => { dirty = true; };
+        area.addEventListener('input', markDirty);
+        const baseClose = modal.close.bind(modal);
+        modal.close = () => {
+          if (dirty) {
+            confirmDialog({
+              title: '放弃修改？', danger: true, confirmText: '放弃修改',
+              message: '内容尚未保存，关闭后将丢失修改。',
+            }).then((ok) => { if (ok) { dirty = false; baseClose(); } });
+            return;
+          }
+          baseClose();
+        };
+        $('[data-manual-close]', foot).onclick = () => modal.close();
+        async function save(expected) {
           try {
-            const res = await api.post('/api/files/write', { path: entry.path, content: area.value });
+            const payload = { path: entry.path, content: area.value };
+            if (expected !== null) payload.expected_mtime = expected;
+            const res = await api.post('/api/files/write', payload);
             toast(res.message);
+            dirty = false;
             modal.close();
             load(cwd);
-          } catch (err) { toast(err.message, 'err'); }
-        };
+          } catch (err) {
+            if (err.status !== 409) { toast(err.message, 'err'); return; }
+            const ok = await confirmDialog({
+              title: '文件已被修改', danger: true, confirmText: '覆盖保存',
+              message: `${esc(err.message)}<br><span class="dim">覆盖将丢弃磁盘上的新版本，建议先「关闭」后重新打开比对。</span>`,
+            });
+            if (ok) await save(null);
+          }
+        }
+        $('[data-save]', foot).onclick = () => save(data.mtime);
+        area.addEventListener('keydown', (event) => {
+          if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+            event.preventDefault();
+            save(data.mtime);
+          }
+        });
       } catch (err) {
         body.innerHTML = `<div class="empty">${esc(err.message)}</div>`;
       }
     }
 
+    /** 用 XHR 逐个上传：只有 XHR 能上报上传进度（fetch 目前不支持可靠的 upload onprogress）。 */
+    function xhrUpload(form, onProgress) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/files/upload');
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable && onProgress) onProgress(e.loaded, e.total);
+        };
+        xhr.onload = () => {
+          let data = null;
+          try { data = JSON.parse(xhr.responseText); } catch (err) { /* 空响应体 */ }
+          if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+          else reject(new Error((data && data.detail) || `上传失败（HTTP ${xhr.status}）`));
+        };
+        xhr.onerror = () => reject(new Error('网络错误，上传中断'));
+        xhr.send(form);
+      });
+    }
+
     async function doUpload(fileList) {
-      if (!fileList.length) return;
-      const form = new FormData();
-      form.append('path', cwd);
-      form.append('overwrite', 'true');
-      Array.from(fileList).forEach((file) => form.append('files', file, file.name));
-      toast(`正在上传 ${fileList.length} 个文件…`, 'warn', 2000);
-      try {
-        const res = await api.upload('/api/files/upload', form);
-        res.failed.length ? toast(`${res.message}：${res.failed.map((f) => f.name).join(', ')}`, 'warn') : toast(res.message);
-        load(cwd);
-      } catch (err) { toast(err.message, 'err'); }
+      const files = Array.from(fileList || []);
+      if (!files.length) return;
+      const overwrite = $('#upload-overwrite')?.checked ?? false;
+      const box = $('#upload-progress');
+      let saved = 0;
+      const failed = [];
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        box.innerHTML = `<div class="upload-bar"><div class="upload-fill" style="width:0%"></div>
+          <span class="upload-label">上传 ${i + 1}/${files.length} · ${esc(file.name)}</span></div>`;
+        const fill = $('.upload-fill', box);
+        const form = new FormData();
+        form.append('path', cwd);
+        form.append('overwrite', overwrite ? 'true' : 'false');
+        // 文件夹上传时用 webkitRelativePath 保留目录结构，服务端会逐级创建
+        form.append('files', file, file.webkitRelativePath || file.name);
+        try {
+          await xhrUpload(form, (loaded, total) => {
+            fill.style.width = `${Math.round((loaded / total) * 100)}%`;
+          });
+          saved++;
+        } catch (err) {
+          failed.push(`${file.name}：${err.message}`);
+        }
+      }
+      box.innerHTML = '';
+      if (failed.length) {
+        toast(`上传完成，${failed.length} 个失败：${failed.slice(0, 3).join('；')}${failed.length > 3 ? '…' : ''}`, 'warn', 6000);
+      } else {
+        toast(`已上传 ${saved} 个文件${overwrite ? '' : '（同名文件已跳过）'}`);
+      }
+      load(cwd);
     }
 
     async function doSearch() {
@@ -1852,11 +1985,78 @@ registerView('files', {
       } catch (err) { toast(err.message, 'err'); }
     }
 
+    async function doChmod(entry) {
+      const current = String(entry.mode || '').replace(/^0o/, '') || '644';
+      const body = document.createElement('div');
+      body.innerHTML = `<label class="field"><span>权限（八进制，如 644 / 755）</span>
+        <input class="input" id="chmod-input" value="${esc(current)}" autocomplete="off"></label>
+        ${entry.is_dir ? `<label class="switch-row"><input type="checkbox" id="chmod-rec">
+          <span><b>递归应用</b><div class="dim" style="font-size:11.5px">目录内所有文件与子目录都改成该权限</div></span></label>` : ''}`;
+      const foot = document.createElement('div');
+      foot.className = 'row';
+      foot.innerHTML = `<button class="btn" data-cancel>取消</button>
+        <button class="btn primary" data-ok>应用</button>`;
+      const modal = openModal({ title: `权限 · ${entry.name}`, body, footer: foot });
+      $('[data-cancel]', foot).onclick = () => modal.close();
+      $('[data-ok]', foot).onclick = async () => {
+        const mode = $('#chmod-input', body).value.trim();
+        if (!/^[0-7]{3,4}$/.test(mode)) { toast('权限必须是 3~4 位八进制', 'err'); return; }
+        try {
+          const res = await api.post('/api/files/chmod', {
+            path: entry.path, mode, recursive: $('#chmod-rec', body)?.checked ?? false,
+          });
+          toast(res.message, res.ok ? 'ok' : 'warn');
+          modal.close();
+          load(cwd);
+        } catch (err) { toast(err.message, 'err'); }
+      };
+    }
+
+    async function doFetchUrl() {
+      const url = await promptDialog({
+        title: '从 URL 拉取文件', label: '文件直链（http/https，下载到当前目录）',
+        confirmText: '下载',
+      });
+      if (!url) return;
+      toast('正在下载…', 'warn', 2000);
+      try {
+        const res = await api.post('/api/files/fetch', { url, dest_dir: cwd });
+        toast(res.message);
+        load(cwd);
+      } catch (err) { toast(err.message, 'err'); }
+    }
+
+    async function doBatchDelete() {
+      const paths = [...selected];
+      const preview = paths.slice(0, 4).map((p) => esc(p)).join('<br>');
+      const ok = await confirmDialog({
+        title: '批量删除', danger: true, confirmText: `删除 ${paths.length} 项`,
+        message: `将<b>永久删除</b>以下 ${paths.length} 项（含目录内容）：<br><span class="mono" style="font-size:12px">${preview}${paths.length > 4 ? '<br>…' : ''}</span>`,
+      });
+      if (!ok) return;
+      try {
+        const res = await api.post('/api/files/delete', { paths });
+        toast(res.message, res.ok ? 'ok' : 'warn');
+        selected.clear();
+        paintBatch();
+        load(cwd);
+      } catch (err) { toast(err.message, 'err'); }
+    }
+
     root.onclick = async (event) => {
       const crumb = event.target.closest('[data-crumb]');
       if (crumb) { load(crumb.dataset.crumb); return; }
       const rootPath = event.target.closest('[data-root]');
       if (rootPath) { load(rootPath.dataset.root); return; }
+      const sortHead = event.target.closest('[data-sort]');
+      if (sortHead) {
+        const key = sortHead.dataset.sort;
+        sortDir = sortKey === key ? -sortDir : 1;
+        sortKey = key;
+        sortEntries();
+        renderTable();
+        return;
+      }
       const target = event.target.closest('[data-act]');
       if (!target) return;
       const action = target.dataset.act;
@@ -1868,6 +2068,11 @@ registerView('files', {
       if (action === 'search') doSearch();
       if (action === 'open' && entry) load(entry.path);
       if (action === 'edit' && entry) openEditor(entry);
+      if (action === 'preview' && entry) openPreview(entry);
+      if (action === 'chmod' && entry) doChmod(entry);
+      if (action === 'fetch-url') doFetchUrl();
+      if (action === 'batch-delete') doBatchDelete();
+      if (action === 'batch-clear') { selected.clear(); paintBatch(); renderTable(); }
       if (action === 'mkdir') {
         const name = await promptDialog({ title: '新建文件夹', label: '文件夹名称', confirmText: '创建' });
         if (!name) return;
@@ -1885,6 +2090,27 @@ registerView('files', {
         } catch (err) { toast(err.message, 'err'); }
       }
       if (action === 'upload') $('#file-input').click();
+      if (action === 'upload-dir') $('#dir-input').click();
+      if (action === 'extract' && entry) {
+        const ok = await confirmDialog({
+          title: '解压压缩包', confirmText: '解压',
+          message: `将解压到同级同名目录（已存在则拒绝）。压缩包 <b class="mono">${esc(entry.name)}</b> 不会被删除。`,
+        });
+        if (!ok) return;
+        try {
+          const res = await api.post('/api/files/extract', { path: entry.path });
+          toast(res.message);
+          load(cwd);
+        } catch (err) { toast(err.message, 'err'); }
+      }
+      if (action === 'du' && entry) {
+        try {
+          const res = await api.get(`/api/files/usage?path=${encodeURIComponent(entry.path)}`);
+          toast(res.size === null || res.size === undefined
+            ? (res.error || '无法统计大小')
+            : `${entry.name} 共占用 ${bytes(res.size)}`);
+        } catch (err) { toast(err.message, 'err'); }
+      }
       if (action === 'rename' && entry) {
         const name = await promptDialog({ title: '重命名 / 移动', label: '新的名称或绝对路径', value: entry.name, confirmText: '确定' });
         if (!name || name === entry.name) return;
@@ -1906,11 +2132,52 @@ registerView('files', {
       }
     };
 
+    root.onchange = (event) => {
+      const box = event.target.closest('[data-sel]');
+      if (box) {
+        if (box.checked) selected.add(box.dataset.sel);
+        else selected.delete(box.dataset.sel);
+        paintBatch();
+        return;
+      }
+      if (event.target.id === 'show-hidden') { load(cwd); }
+    };
+
+    root.addEventListener('change', (event) => {
+      if (event.target.id === 'sel-all') {
+        entries.forEach((e) => {
+          if (event.target.checked) selected.add(e.path);
+          else selected.delete(e.path);
+        });
+        paintBatch();
+        renderTable();
+      }
+    });
+
     const fileInput = $('#file-input');
     fileInput.onchange = async () => {
       await doUpload(fileInput.files);
       fileInput.value = '';
     };
+    const dirInput = $('#dir-input');
+    dirInput.onchange = async () => {
+      await doUpload(dirInput.files);
+      dirInput.value = '';
+    };
+
+    const zone = $('#drop-zone');
+    ['dragover', 'dragenter'].forEach((type) => zone.addEventListener(type, (event) => {
+      event.preventDefault();
+      zone.classList.add('drag-over');
+    }));
+    ['dragleave', 'drop'].forEach((type) => zone.addEventListener(type, (event) => {
+      event.preventDefault();
+      zone.classList.remove('drag-over');
+    }));
+    zone.addEventListener('drop', (event) => {
+      if (event.dataTransfer?.files?.length) doUpload(event.dataTransfer.files);
+    });
+
     $('#file-search').addEventListener('keydown', (event) => {
       if (event.key === 'Enter') doSearch();
       if (event.key === 'Escape') { $('#file-search').value = ''; load(cwd); }

@@ -447,3 +447,33 @@ table.data th.sortable:hover { color: var(--text); }
   .tabbar { padding: 6px 8px 0; }
   .tab .tab-label { max-width: 84px; }
 }
+
+/* ---------- 文件管理 ---------- */
+.th-sort { cursor: pointer; user-select: none; }
+.th-sort:hover { color: var(--text); }
+.batch-bar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 10px; margin-top: 4px;
+  background: var(--panel-2); border: 1px solid var(--border-soft); border-radius: 8px;
+}
+.batch-bar.hidden { display: none; }
+.upload-bar {
+  position: relative; height: 26px; margin-top: 10px; overflow: hidden;
+  background: var(--panel-2); border: 1px solid var(--border-soft); border-radius: 6px;
+}
+.upload-fill {
+  height: 100%; width: 0;
+  background: linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--accent) 60%, #fff));
+  opacity: .35; transition: width .15s ease;
+}
+.upload-label {
+  position: absolute; inset: 0; display: flex; align-items: center; padding: 0 10px;
+  font-size: 12px; font-family: var(--mono); color: var(--text); white-space: nowrap;
+}
+.drop-zone.drag-over { outline: 2px dashed var(--accent); outline-offset: -6px; }
+.drop-zone.drag-over .table-wrap { opacity: .75; }
+
+@media (max-width: 720px) {
+  /* 手机上权限/所有者列让位给动作按钮 */
+  .file-hide-sm { display: none; }
+}

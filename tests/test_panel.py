@@ -1116,3 +1116,140 @@ def test_panel_audit_records_writes(authed, internal_mode):
     finally:
         prefs.update({"session.ttl_hours": original})
 
+
+# ---------- 文件管理增强：解压 / 远程拉取 / 权限 / 编辑冲突 ----------
+
+def test_write_mtime_conflict_guard(authed, internal_mode, tmp_path):
+    """编辑器保存带乐观锁：磁盘上的文件被别人改过时拒绝静默覆盖（409）。"""
+    target = tmp_path / "conflict.txt"
+    assert authed.post("/api/files/write", json={"path": str(target), "content": "v1"}).status_code == 200
+    mtime = authed.get("/api/files/read", params={"path": str(target)}).json()["mtime"]
+
+    # 模拟其他会话/进程在这期间改了文件（+10 秒保证 mtime 变化跨越精度误差）
+    target.write_text("v2", encoding="utf-8")
+    os.utime(target, (mtime + 10, mtime + 10))
+
+    r = authed.post("/api/files/write",
+                    json={"path": str(target), "content": "v3", "expected_mtime": mtime})
+    assert r.status_code == 409, "过期 mtime 必须被拒"
+    assert target.read_text(encoding="utf-8") == "v2", "拒绝时不能动磁盘内容"
+
+    r = authed.post("/api/files/write", json={"path": str(target), "content": "v3"})
+    assert r.status_code == 200 and target.read_text(encoding="utf-8") == "v3"
+
+
+def test_extract_zip_and_tar(authed, internal_mode, tmp_path):
+    """解压：zip/tar 正常解出到同级同名目录；重复解压拒绝；穿越成员不能写出目标目录。"""
+    import io
+    import tarfile
+    import zipfile
+
+    # zip 正常路径（嵌套目录）
+    zsrc = tmp_path / "bundle.zip"
+    with zipfile.ZipFile(zsrc, "w") as zf:
+        zf.writestr("sub/hello.txt", "hi")
+        zf.writestr("top.txt", "top")
+    r = authed.post("/api/files/extract", json={"path": str(zsrc)})
+    assert r.status_code == 200, r.text
+    assert (tmp_path / "bundle" / "sub" / "hello.txt").read_text(encoding="utf-8") == "hi"
+    # 重复解压 → 目标已存在
+    assert authed.post("/api/files/extract", json={"path": str(zsrc)}).status_code == 400
+    # 非压缩包
+    txt = tmp_path / "plain.txt"
+    txt.write_text("x", encoding="utf-8")
+    assert authed.post("/api/files/extract", json={"path": str(txt)}).status_code == 400
+
+    # tar 正常路径
+    tsrc = tmp_path / "safe.tar"
+    with tarfile.open(tsrc, "w") as tf:
+        data = b"ok"
+        info = tarfile.TarInfo("inner.txt")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+    assert authed.post("/api/files/extract", json={"path": str(tsrc)}).status_code == 200
+    assert (tmp_path / "safe" / "inner.txt").read_bytes() == b"ok"
+
+    # 恶意 tar：穿越目标目录的成员必须失效（3.12+ filter 直接报错，旧版逐成员跳过）
+    evil = tmp_path / "evil.tar"
+    with tarfile.open(evil, "w") as tf:
+        data = b"ok"
+        info = tarfile.TarInfo("good.txt")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+        bad = tarfile.TarInfo("../evil.txt")
+        bad.size = 3
+        tf.addfile(bad, io.BytesIO(b"bad"))
+    r = authed.post("/api/files/extract", json={"path": str(evil)})
+    assert r.status_code in (200, 500)
+    assert not (tmp_path / "evil.txt").exists(), "穿越成员不能写出目标目录"
+
+
+def test_fetch_url_from_local_server(authed, internal_mode, tmp_path):
+    """远程拉取：从本机 HTTP 服务下载成功；file:// 等协议被拒；重名被拒。"""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    payload = b"file-content-0123456789"
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        port = server.server_address[1]
+        r = authed.post("/api/files/fetch", json={
+            "url": f"http://127.0.0.1:{port}/tool.tar.gz", "dest_dir": str(tmp_path)})
+        assert r.status_code == 200, r.text
+        saved = tmp_path / "tool.tar.gz"
+        assert saved.read_bytes() == payload
+
+        # 重名拒绝
+        r = authed.post("/api/files/fetch", json={
+            "url": f"http://127.0.0.1:{port}/tool.tar.gz", "dest_dir": str(tmp_path)})
+        assert r.status_code == 400
+
+        # 非 http(s) 协议拒绝（file:// / ftp:// 都不行）
+        for bad in ("file:///etc/passwd", "ftp://example.com/x", "notaurl"):
+            r = authed.post("/api/files/fetch", json={"url": bad, "dest_dir": str(tmp_path)})
+            assert r.status_code == 400, bad
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_chmod_endpoint(authed, internal_mode, tmp_path):
+    """权限修改：单文件、递归、非法值、受保护目录。"""
+    if os.name != "posix":
+        pytest.skip("chmod 语义测试仅 POSIX")
+
+    target = tmp_path / "script.sh"
+    target.write_text("#!/bin/sh\n", encoding="utf-8")
+    r = authed.post("/api/files/chmod", json={"path": str(target), "mode": "750"})
+    assert r.status_code == 200, r.text
+    assert (stat.S_IMODE(target.stat().st_mode)) == 0o750
+
+    # 递归：目录 + 子文件一起改
+    subdir = tmp_path / "pkg"
+    subdir.mkdir()
+    subfile = subdir / "run.py"
+    subfile.write_text("print(1)\n", encoding="utf-8")
+    r = authed.post("/api/files/chmod", json={"path": str(subdir), "mode": "700", "recursive": True})
+    assert r.status_code == 200
+    assert stat.S_IMODE(subdir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(subfile.stat().st_mode) == 0o700
+
+    # 非法八进制
+    for bad in ("abc", "999", "9"):
+        assert authed.post("/api/files/chmod",
+                           json={"path": str(target), "mode": bad}).status_code == 400, bad
+    # 受保护系统目录
+    assert authed.post("/api/files/chmod", json={"path": "/etc", "mode": "777"}).status_code == 403
+

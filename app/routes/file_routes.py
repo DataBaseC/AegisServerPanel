@@ -1,13 +1,21 @@
-"""文件管理：浏览、读写、上传下载、删除、重命名、搜索。"""
+"""文件管理：浏览、读写、上传下载、删除、重命名、搜索、解压、远程拉取、权限。"""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
+import re
 import shutil
 import stat
+import sys
+import tarfile
 import tempfile
 import time
+import urllib.parse
+import urllib.request
+import zipfile
+from pathlib import Path
 from typing import List
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
@@ -29,11 +37,19 @@ PROTECTED = {
 EDIT_LIMIT = 2 * 1024 * 1024  # 在线编辑上限 2MB
 ARCHIVE_PREFIX = "serverpanel-"
 ARCHIVE_STALE_SECONDS = 3600  # 进程崩溃遗留的打包临时目录，超过 1 小时后清扫
+FETCH_CHUNK = 256 * 1024
+FETCH_MAX_BYTES = 1024 * 1024 * 1024  # 单个远程文件上限 1GB
+FETCH_TIMEOUT = 30                    # 远程拉取的连接/读超时（秒）
+OCTAL_RE = re.compile(r"^[0-7]{3,4}$")
+
+# 压缩包识别：按扩展名（前缀匹配 tar 的多级后缀）
+ARCHIVE_SUFFIXES = (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz2", ".txz", ".tar", ".zip")
 
 
 class WriteBody(BaseModel):
     path: str
     content: str
+    expected_mtime: int | None = None  # 乐观锁：与读取时的 mtime 不符则拒绝保存
 
 
 class PathBody(BaseModel):
@@ -47,6 +63,18 @@ class RenameBody(BaseModel):
 
 class DeleteBody(BaseModel):
     paths: List[str]
+
+
+class ChmodBody(BaseModel):
+    path: str
+    mode: str            # 八进制字符串，如 "644" / "0755"
+    recursive: bool = False
+
+
+class FetchBody(BaseModel):
+    url: str
+    dest_dir: str
+    filename: str | None = None
 
 
 def _abs(path: str) -> str:
@@ -189,6 +217,11 @@ async def write_file(body: WriteBody):
         raise HTTPException(400, "目标是一个目录")
     if len(body.content.encode()) > EDIT_LIMIT:
         raise HTTPException(413, "内容过大，请改用上传方式")
+    if body.expected_mtime is not None and os.path.exists(full):
+        current = int(os.path.getmtime(full))
+        if current != body.expected_mtime:
+            raise HTTPException(409, f"文件在编辑期间已被修改（磁盘上的版本更新于 {current}），"
+                                     f"直接保存会覆盖它")
     os.makedirs(os.path.dirname(full) or "/", exist_ok=True)
     with open(full, "w", encoding="utf-8") as fh:
         fh.write(body.content)
@@ -363,3 +396,146 @@ async def path_usage(path: str):
         except (ValueError, IndexError):
             size = None
     return {"path": full, "size": size, "mtime": int(time.time())}
+
+
+# ---------------------------------------------------------------- 解压
+
+def _archive_dest(source: str) -> str:
+    """解压目标目录：同级、去掉压缩后缀；已存在则拒绝（不猜用户想不想合并）。"""
+    name = os.path.basename(source)
+    for suffix in ARCHIVE_SUFFIXES:
+        if name.lower().endswith(suffix) and len(name) > len(suffix):
+            name = name[:-len(suffix)]
+            break
+    else:
+        raise HTTPException(400, "不是可识别的压缩包（支持 zip / tar / tar.gz / tgz / tar.bz2 / tar.xz）")
+    name = name.strip() or "extracted"
+    dest = os.path.join(os.path.dirname(source), name)
+    if os.path.exists(dest):
+        raise HTTPException(400, f"目标目录已存在：{dest}，请先重命名或删除")
+    return dest
+
+
+def _extract(source: str, dest: str) -> int:
+    """同步解压，返回解出的条目数。tar 的成员路径逐个校验，防止写出目标目录之外。"""
+    lower = source.lower()
+    if lower.endswith(".zip"):
+        with zipfile.ZipFile(source) as bundle:
+            # CPython 的 zipfile 自带成员路径清洗（去盘符、去绝对路径、去 ..）
+            bundle.extractall(dest)
+            return len(bundle.namelist())
+    base = os.path.realpath(dest)
+    count = 0
+    with tarfile.open(source, "r:*") as bundle:
+        if sys.version_info >= (3, 12):
+            bundle.extractall(dest, filter="data")   # 3.12+ 官方安全过滤器
+            return len(bundle.getmembers())
+        safe = []
+        for member in bundle.getmembers():
+            parts = Path(member.name).parts
+            if member.name.startswith(("/", "\\")) or ".." in parts:
+                continue  # 绝对路径 / 穿越目标目录：丢弃
+            if member.isdev():
+                continue  # 设备文件不还原
+            target = os.path.realpath(os.path.join(base, member.name))
+            if target != base and not target.startswith(base + os.sep):
+                continue
+            safe.append(member)
+        bundle.extractall(dest, members=safe)
+        count = len(safe)
+    return count
+
+
+@router.post("/extract")
+async def extract(body: PathBody):
+    source = _abs(body.path)
+    if not os.path.isfile(source):
+        raise HTTPException(404, "压缩包不存在或不是普通文件")
+    dest = _archive_dest(source)
+    os.makedirs(dest)
+    try:
+        count = await asyncio.to_thread(_extract, source, dest)
+    except (zipfile.BadZipFile, tarfile.TarError, OSError) as exc:
+        shutil.rmtree(dest, ignore_errors=True)  # 解压失败不留半个目录
+        raise HTTPException(500, f"解压失败: {exc}")
+    return {"ok": True, "dest": dest, "count": count,
+            "message": f"已解压 {count} 项到 {dest}"}
+
+
+# ---------------------------------------------------------------- 远程拉取
+
+def _fetch_sync(url: str, dest_file: str) -> int:
+    """同步流式下载，返回字节数。仅 http/https（urllib 对 file:// 等协议照单全收，必须显式拦）。"""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(400, "仅支持 http/https 直链")
+    request = urllib.request.Request(url, headers={"User-Agent": "AegisServerPanel/1.1"})
+    total = 0
+    try:
+        with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT) as resp, \
+                open(dest_file, "wb") as fh:
+            while True:
+                chunk = resp.read(FETCH_CHUNK)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > FETCH_MAX_BYTES:
+                    raise HTTPException(413, f"文件超过上限（{FETCH_MAX_BYTES // (1024 * 1024)}MB），已中止")
+                fh.write(chunk)
+    except HTTPException:
+        with contextlib.suppress(OSError):
+            os.remove(dest_file)
+        raise
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.remove(dest_file)
+        raise HTTPException(502, f"拉取失败: {exc}")
+    return total
+
+
+@router.post("/fetch")
+async def fetch_url(body: FetchBody):
+    dest_dir = _abs(body.dest_dir)
+    if not os.path.isdir(dest_dir):
+        raise HTTPException(400, "目标必须是已存在的目录")
+    name = (body.filename or os.path.basename(urllib.parse.urlparse(body.url).path) or "").strip()
+    name = name.replace("\\", "/").split("/")[-1]
+    if not name or name in (".", ".."):
+        raise HTTPException(400, "无法从 URL 判断文件名，请手动指定")
+    dest_file = os.path.join(dest_dir, name)
+    if os.path.exists(dest_file):
+        raise HTTPException(400, f"目标已存在：{dest_file}")
+    size = await asyncio.to_thread(_fetch_sync, body.url, dest_file)
+    return {"ok": True, "path": dest_file, "size": size,
+            "message": f"已下载 {name}（{size} 字节）到 {dest_dir}"}
+
+
+# ---------------------------------------------------------------- 权限
+
+@router.post("/chmod")
+async def chmod_path(body: ChmodBody):
+    full = _abs(body.path)
+    if not os.path.lexists(full):
+        raise HTTPException(404, "路径不存在")
+    if not OCTAL_RE.fullmatch(body.mode):
+        raise HTTPException(400, "权限必须是 3~4 位八进制，如 644 / 755")
+    _guard_delete(full)  # 系统关键目录本身的权限不允许在界面里改
+    value = int(body.mode, 8)
+    targets = [full]
+    if body.recursive and os.path.isdir(full) and not os.path.islink(full):
+        for root, dirs, files in os.walk(full):
+            # os.chmod 会跟随符号链接，目录树里的链接一律跳过
+            targets.extend(os.path.join(root, name) for name in dirs + files
+                           if not os.path.islink(os.path.join(root, name)))
+    changed, failed = 0, []
+    for target in targets:
+        try:
+            os.chmod(target, value)
+            changed += 1
+        except OSError as exc:
+            failed.append({"path": target, "error": str(exc)})
+    if failed and not changed:
+        raise HTTPException(500, f"权限修改失败: {failed[0]['error']}")
+    return {"ok": not failed, "changed": changed, "failed": failed,
+            "message": f"已修改 {changed} 项权限为 {body.mode}"
+                       + (f"，{len(failed)} 项失败" if failed else "")}

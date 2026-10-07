@@ -1184,6 +1184,39 @@ def test_extract_zip_and_tar(authed, internal_mode, tmp_path):
     assert not (tmp_path / "evil.txt").exists(), "穿越成员不能写出目标目录"
 
 
+def test_extract_zip_traversal_blocked(authed, internal_mode, tmp_path):
+    """zip 分支的安全性完全依赖 zipfile 的成员名清洗，必须有独立回归。
+
+    `file_routes._extract` 对 zip 走的是 `extractall(dest)`（不像 tar 分支逐成员校验），
+    安全性来自 CPython 的 `zipfile._extract_member`：它会去掉盘符与前导分隔符，
+    并剔除 `..` 段。这条行为一旦在某个 Python 版本上变化，就是目录穿越漏洞，
+    所以这里用真实的恶意 zip 把结论钉死。
+    """
+    import zipfile
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    evil = tmp_path / "evil.zip"
+    with zipfile.ZipFile(evil, "w") as zf:
+        zf.writestr("normal.txt", "safe")
+        zf.writestr("../outside/escaped.txt", "escaped!")
+        zf.writestr("../../deep-escape.txt", "deep!")
+        zf.writestr("/absolute.txt", "absolute!")
+
+    r = authed.post("/api/files/extract", json={"path": str(evil)})
+    assert r.status_code == 200, r.text
+
+    dest = tmp_path / "evil"
+    assert (dest / "normal.txt").read_text(encoding="utf-8") == "safe"
+    assert not (outside / "escaped.txt").exists(), "../ 穿越到同级目录必须被阻断"
+    assert not (tmp_path.parent / "deep-escape.txt").exists(), "多级穿越必须被阻断"
+    assert not (tmp_path / "absolute.txt").exists(), "绝对路径成员不能落在解压目录之外"
+    # 成员应被规整到解压目录内部，而不是静默丢弃（丢了也算安全，但行为要明确）
+    produced = {p.relative_to(dest).as_posix() for p in dest.rglob("*") if p.is_file()}
+    assert "normal.txt" in produced
+    assert all(".." not in name for name in produced), f"解压结果里不应出现 .. 路径：{produced}"
+
+
 def test_fetch_url_from_local_server(authed, internal_mode, tmp_path):
     """远程拉取：从本机 HTTP 服务下载成功；file:// 等协议被拒；重名被拒。"""
     import threading

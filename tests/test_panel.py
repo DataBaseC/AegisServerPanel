@@ -1047,7 +1047,7 @@ def test_config_import_merges_and_keeps_local_secrets(authed, internal_mode):
     try:
         payload = {
             "config.json": {
-                "mode": "internal",
+                "mode": "public",  # 恶意/误操作的包：试图把面板切回公网模式
                 "password_hash": "attacker-hash",
                 "agent_token": "stolen-token",
                 "prefs": {"session": {"ttl_hours": 3}},
@@ -1068,8 +1068,21 @@ def test_config_import_merges_and_keeps_local_secrets(authed, internal_mode):
         assert config_mod.config.data["password_hash"] == snapshot["password_hash"], "本机密码不能被覆盖"
         assert config_mod.config.data.get("agent_token") in (None, snapshot.get("agent_token")), \
             "不能从导入包领养外来凭据"
+        assert config_mod.config.mode == "internal", "运行模式只能由服务器本机命令决定，导入不得触碰"
         assert prefs.get("session.ttl_hours") == 3, "导入的 prefs 应生效"
         assert result["backup"], "导入前必须自动生成就地备份"
+
+        # install.json 的路径/端口字段会被守护接口使用，坏值必须整包拒绝
+        bad_install = io.BytesIO()
+        with zipfile.ZipFile(bad_install, "w") as bundle:
+            bundle.writestr("config.json", json.dumps({"mode": "internal"}))
+            bundle.writestr("install.json", json.dumps({"app_dir": "relative/path"}))
+        bad_install.seek(0)
+        before = json.dumps(config_mod.config.data, sort_keys=True)
+        r = authed.post("/api/panel/config/import",
+                        files={"file": ("export.zip", bad_install.read(), "application/zip")})
+        assert r.status_code == 400
+        assert json.dumps(config_mod.config.data, sort_keys=True) == before
 
         # 坏 zip：400 且配置不变
         before = json.dumps(config_mod.config.data, sort_keys=True)

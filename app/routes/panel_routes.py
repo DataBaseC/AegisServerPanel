@@ -28,6 +28,7 @@ from ..apps import supervisor
 from ..auth import require_internal
 from ..config import config
 from ..prefs import PrefsError, prefs
+from ..utils import is_root
 from .apps_routes import recent_audit as apps_audit
 from .tasks_routes import recent_runs
 
@@ -225,6 +226,8 @@ async def get_timezone(_session: dict = Depends(require_internal)):
 
 @router.post("/timezone")
 async def set_timezone(body: TimezoneBody, _session: dict = Depends(require_internal)):
+    if os.name == "posix" and not is_root():
+        raise HTTPException(403, "切换时区需要 root 权限（要写入 /etc/timezone 与 /etc/localtime）")
     result = _guard(boot_mod.set_timezone, body.zone, body.enable_ntp)
     record("timezone", result["message"])
     return {**result, "status": boot_mod.timezone_status()}
@@ -399,6 +402,26 @@ async def import_config(file: UploadFile = File(...),
     for key in SECRET_KEYS:
         if key not in kept:
             merged.pop(key, None)
+    # 运行模式同理：模式只能由服务器本机命令决定（README 安全模型基石），导入不得触碰
+    if "mode" in config.data:
+        merged["mode"] = config.data["mode"]
+        if "mode_updated_at" in config.data:
+            merged["mode_updated_at"] = config.data["mode_updated_at"]
+        else:
+            merged.pop("mode_updated_at", None)
+    # install.json 里的路径/端口会被守护接口直接使用，先做基本校验
+    incoming_install = payload.get("install.json")
+    if isinstance(incoming_install, dict):
+        app_dir_value = incoming_install.get("app_dir")
+        if app_dir_value is not None and (
+            not isinstance(app_dir_value, str) or not os.path.isabs(app_dir_value)
+        ):
+            raise HTTPException(400, "install.json 的 app_dir 必须是绝对路径")
+        port_value = incoming_install.get("port")
+        if port_value is not None and (
+            not isinstance(port_value, int) or not 1024 <= port_value <= 65535
+        ):
+            raise HTTPException(400, "install.json 的 port 需要在 1024 ~ 65535 之间")
     incoming_prefs = merged.get("prefs")
     if incoming_prefs is not None and not isinstance(incoming_prefs, dict):
         raise HTTPException(400, "prefs 字段格式不对")
@@ -437,7 +460,7 @@ async def import_config(file: UploadFile = File(...),
         "backup": str(backup) if backup else None,
         "pending_restart": any(key.startswith("listen.") for key in incoming_prefs.keys())
         if isinstance(incoming_prefs, dict) else False,
-        "message": "配置已导入（本机密码与 Agent 令牌保持不变）"
+        "message": "配置已导入（本机密码、Agent 令牌与运行模式保持不变）"
                    + ("，监听地址变更需重启面板" if isinstance(incoming_prefs, dict)
                       and "listen" in incoming_prefs else ""),
     }

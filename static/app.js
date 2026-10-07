@@ -2700,7 +2700,8 @@ function waitForPanelRestart({ before = '', expected = null, timeoutMs = 180000,
 registerView('settings', {
   title: '设置',
   async render(root) {
-    let tab = localStorage.getItem('sp-settings-tab') === 'quick' ? 'quick' : 'general';
+    const canQuick = isInternal();
+    let tab = localStorage.getItem('sp-settings-tab') === 'quick' && canQuick ? 'quick' : 'general';
     const caps = live.capabilities || {};
     const info = await api.get('/api/system/info').catch(() => ({}));
     const hz = await fetch('/healthz').then((r) => r.json()).catch(() => null);
@@ -3060,7 +3061,7 @@ serverpanel --show-mode          # 查看当前模式</div>
       root.innerHTML = `
         <div class="tabs-head">
           <button class="tab-btn ${tab === 'general' ? 'active' : ''}" data-settings-tab="general">常规</button>
-          <button class="tab-btn ${tab === 'quick' ? 'active' : ''}" data-settings-tab="quick">快捷设置</button>
+          ${canQuick ? `<button class="tab-btn ${tab === 'quick' ? 'active' : ''}" data-settings-tab="quick">快捷设置</button>` : ''}
         </div>
         <div id="settings-panel">${tab === 'general' ? generalTab() : quickTab()}</div>`;
       if (tab === 'general') bindGeneral();

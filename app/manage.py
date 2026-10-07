@@ -846,10 +846,12 @@ def _do_update(target_dir: Path, ref: str, force: bool, host: str, port: int) ->
     dirty = _git(target_dir, "status", "--porcelain")
     if dirty.returncode != 0:
         return fail("git status 失败，仓库状态异常")
-    if dirty.stdout.strip():
+    # update.lock 是升级流程自己的锁文件，不算用户改动（否则一次遗留会挡住以后所有升级）
+    dirty_lines = [ln for ln in dirty.stdout.splitlines() if not ln.endswith("update.lock")]
+    if dirty_lines:
         if not force:
             return fail("仓库存在本地改动，为避免丢失已中止。确认丢弃/保留后可 "
-                        "加 --force（改动会先自动 stash）。改动列表:\n" + dirty.stdout)
+                        "加 --force（改动会先自动 stash）。改动列表:\n" + "\n".join(dirty_lines))
         stash = _git(target_dir, "stash", "push", "-u", "-m", "serverpanel update autostash")
         if stash.returncode != 0:
             return fail(f"stash 失败: {stash.stderr.strip()}")

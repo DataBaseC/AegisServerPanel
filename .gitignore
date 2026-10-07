@@ -20,3 +20,6 @@ panel-supervisor.sh
 .supervisor.pid
 .supervisor.lock
 *.log.1
+
+# 升级锁文件（flock 持有期间保留，进程退出后遗留也不该挡住下次升级）
+update.lock

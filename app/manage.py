@@ -291,13 +291,22 @@ def _stop_all_apps(reason: str = "面板已停止") -> int:
     return count
 
 
+def _supervisor_running(target_dir: Path) -> bool:
+    """守护是否真的在跑。pidfile 可能陈旧（PID 已被回收给别的进程），
+    所以除存活外还要核对 cmdline 里的守护脚本名。"""
+    pid = _read_pidfile(target_dir)
+    if pid is None or not _pid_alive(pid):
+        return False
+    argv = _read_cmdline(pid)
+    return SUPERVISOR_NAME in " ".join(argv)
+
+
 def _start_supervisor(target_dir: Path) -> None:
     sup = target_dir / SUPERVISOR_NAME
     if not sup.exists():
         raise RuntimeError("未找到守护脚本，请先执行 serverpanel --install")
-    pid = _read_pidfile(target_dir)
-    if pid is not None and _pid_alive(pid):
-        print(f"面板守护已在运行（PID {pid}）")
+    if _supervisor_running(target_dir):
+        print(f"面板守护已在运行（PID {_read_pidfile(target_dir)}）")
         return
     subprocess.Popen(
         [str(sup)],
@@ -367,6 +376,10 @@ def _restart_service(target_dir: Path) -> None:
                 os.kill(pid, signal.SIGTERM)
         if not pids:
             print("（未发现运行中的面板进程，将由守护直接拉起）", file=sys.stderr)
+        # 守护可能早已死亡（面板成了孤儿进程）——TERM 之后必须有人拉起，否则
+        # restart 直接把面板和 exec 通道一起送走。守护不在就补位启动。
+        if not _supervisor_running(target_dir):
+            print("（守护未在运行，补位启动 panel-supervisor.sh）", file=sys.stderr)
             _start_supervisor(target_dir)
 
 

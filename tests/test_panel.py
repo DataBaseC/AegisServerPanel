@@ -347,6 +347,27 @@ def test_pid_alive():
     assert not manage._pid_alive(999999999)
 
 
+def test_supervisor_running_rejects_stale_pidfile(tmp_path):
+    """守护存活判定必须核对 cmdline：pidfile 指向的进程活着但不是守护 → 判不在跑。
+
+    2026-10-07 事故回归：守护死亡后面板成孤儿进程，--restart 看到面板 PID 在
+    就直接 TERM 且不补位，结果面板与 exec 通道一起下线。补位判断的可靠性
+    压在 _supervisor_running 上——它不能被陈旧 pidfile 骗过。
+    """
+    from app import manage
+
+    pidfile = tmp_path / manage.PID_NAME
+    # pidfile 指向还活着的进程（测试进程自己），但它不是守护
+    pidfile.write_text(str(os.getpid()), "utf-8")
+    assert not manage._supervisor_running(tmp_path)
+    # pidfile 指向不存在的 PID
+    pidfile.write_text("999999999", "utf-8")
+    assert not manage._supervisor_running(tmp_path)
+    # 没有 pidfile
+    pidfile.unlink()
+    assert not manage._supervisor_running(tmp_path)
+
+
 def test_metadata_roundtrip(tmp_path, monkeypatch):
     from app import manage
 
@@ -666,9 +687,11 @@ def test_panel_pids_excludes_lifecycle_commands(tmp_path, monkeypatch):
     started = {}
     monkeypatch.setattr(manage, "_systemd_available", lambda: False)
     monkeypatch.setattr(manage, "_start_supervisor", lambda target_dir: started.setdefault("ok", True))
+    monkeypatch.setattr(manage, "_supervisor_running", lambda target_dir: False)
     manage._restart_service(tmp_path)
-    # 已经找到服务进程时不应再拉起守护
-    assert not started
+    # 2026-10-07 事故契约：即使面板进程还在，守护不在就必须补位启动——
+    # 否则 TERM 面板后无人拉起，面板与 exec 通道一起下线
+    assert started.get("ok"), "守护不在运行时，restart 必须补位启动守护"
 
 
 # ---------- 快捷设置：prefs 模型 ----------

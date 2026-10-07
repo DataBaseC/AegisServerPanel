@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import json
 import os
 import re
@@ -37,6 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import config
+from .prefs import prefs
 
 # ---------------------------------------------------------------- 常量与校验
 
@@ -48,7 +50,7 @@ FAIL_WINDOW = 300.0               # 重启次数统计窗口（秒）
 FAIL_LIMIT = 5                    # 窗口内重启超过此值 → failed（可被应用自身 max_restarts 覆盖）
 TRUNCATE_LINE = 2000              # 单行日志截断长度，防一条超长行撑爆内存
 MEM_LINES = 2000                  # 内存环形缓冲保留行数
-LOG_MAX_BYTES = 4 * 1024 * 1024   # 单文件日志上限，超过转 .1
+LOG_MAX_BYTES = 4 * 1024 * 1024   # 日志上限的出厂默认值（实际以「快捷设置」里的 prefs 为准）
 READ_CHUNK = 256 * 1024           # 单次日志读取上限
 
 # 面板自身的启动特征：禁止把面板注册成"常驻应用"，
@@ -304,14 +306,23 @@ class AppLog:
 
     文件按字节偏移读取（前端轮询 ``offset`` 增量跟随）；内存缓冲用于面板重启后
     （新进程里 offset 归零也没关系）仍能立刻回看最近输出。
+
+    ``max_bytes=None`` 时每次写入都从「快捷设置」读当前上限（热加载），
+    因此在界面把上限调小后无需重启、也无需重建已有实例即可生效。
     """
 
-    def __init__(self, path: Path, max_bytes: int = LOG_MAX_BYTES) -> None:
+    def __init__(self, path: Path, max_bytes: int | None = None) -> None:
         self.path = Path(path)
-        self.max_bytes = max_bytes
+        self._fixed_max = max_bytes
         self._buffer: deque[str] = deque(maxlen=MEM_LINES)
         self._lock = threading.Lock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def max_bytes(self) -> int:
+        if self._fixed_max is not None:
+            return self._fixed_max
+        return prefs.app_log_limit()
 
     def append(self, text: str) -> None:
         if not text:
@@ -462,9 +473,13 @@ class Supervisor:
         for app_id in list(self.runtimes):
             with contextlib.suppress(Exception):
                 await self.stop(app_id, timeout=3)
+        # 回收已无引用的子进程对象，避免解释器退出时刷 "unclosed transport" 噪音
+        gc.collect()
 
     async def _boot_autostart(self) -> None:
         await asyncio.sleep(BOOT_DELAY)
+        if not prefs.apps_autostart_enabled():
+            return  # 全局开关关闭时一律不自启；显式 start 仍照常生效
         for app in self.registry.all():
             if not app.get("autostart"):
                 continue
@@ -493,6 +508,9 @@ class Supervisor:
                 self.runtimes.pop(runtime.app_id, None)
                 continue
             code = proc.returncode
+            # 先让输出泵收尾再关管道：否则管道里最后一段输出会丢，
+            # 且 asyncio 的 transport 不释放会在解释器退出时刷 "unclosed transport"
+            await self._finish_pump(runtime)
             self._close_pipe(proc)
             runtime.proc = None
             runtime.last_code = code
@@ -629,6 +647,18 @@ class Supervisor:
         if task is not None and not task.done():
             task.cancel()
 
+    async def _finish_pump(self, runtime: ManagedRuntime, timeout: float = 1.5) -> None:
+        """等待输出泵自然收尾（进程已退出时它会读到 EOF 自行结束）。"""
+        task = runtime._pump
+        if task is None:
+            return
+        if not task.done():
+            with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        self._cancel_pump(runtime)
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
     async def stop(self, app_id: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
         app = self.registry.get(app_id)
         if app is None:
@@ -656,7 +686,7 @@ class Supervisor:
         runtime.last_code = proc.returncode
         runtime.exited_at = time.time()
         runtime.status = "stopped"
-        self._cancel_pump(runtime)
+        await self._finish_pump(runtime)
         self._close_pipe(proc)
         self._note(runtime, app, "已停止")
         return self.snapshot(app)

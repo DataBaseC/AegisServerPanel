@@ -36,6 +36,7 @@ from pathlib import Path
 
 from . import __version__
 from .config import config
+from .prefs import prefs
 from .utils import is_root
 
 try:
@@ -49,7 +50,7 @@ SUPERVISOR_NAME = "panel-supervisor.sh"
 PID_NAME = ".supervisor.pid"
 LOCK_NAME = "update.lock"
 LOG_NAME = "panel.log"
-LOG_ROTATE_BYTES = 10 * 1024 * 1024
+LOG_ROTATE_BYTES = 10 * 1024 * 1024  # 出厂默认值；实际上限见 prefs.panel_log_limit()
 HEALTH_TRIES = 15
 HEALTH_DELAY = 1.0
 
@@ -147,14 +148,21 @@ WantedBy=multi-user.target
     subprocess.run(["systemctl", "daemon-reload"], check=False)
 
 
-def write_supervisor(target_dir: Path, host: str, port: int) -> Path:
-    """无 systemd 环境的守护脚本：崩溃拉起 + flock 单实例 + 日志轮转。"""
+def write_supervisor(target_dir: Path, host: str, port: int, log_limit: int | None = None) -> Path:
+    """无 systemd 环境的守护脚本：崩溃拉起 + flock 单实例 + 日志轮转。
+
+    日志上限通过环境变量 SERVERPANEL_LOG_MAX_BYTES 注入（默认读「快捷设置」里的
+    panel_max_bytes）；改上限不需要重新生成脚本，重启面板即可生效。
+    """
+    limit = int(log_limit if log_limit else prefs.panel_log_limit())
     script = f"""#!/usr/bin/env bash
 # 由 serverpanel install 生成，用于无 systemd 环境（容器 / PRoot）。请勿手改。
 set -u
 cd "{target_dir}" || exit 1
 LOG="{target_dir}/{LOG_NAME}"
 LOCK="{target_dir}/.supervisor.lock"
+# 日志轮转上限：可在面板「设置 → 快捷设置」调整，改完重启面板生效
+LOG_MAX_BYTES="${{SERVERPANEL_LOG_MAX_BYTES:-{limit}}}"
 
 # 单实例：拿不到锁说明已有守护在跑（防 cron @reboot / Termux Boot 重复拉起）
 exec 9>"$LOCK"
@@ -166,7 +174,7 @@ echo $$ > "{target_dir}/{PID_NAME}"
 rotate_log() {{
   [ -f "$LOG" ] || return 0
   size=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
-  [ "$size" -gt {LOG_ROTATE_BYTES} ] && mv -f "$LOG" "$LOG.1"
+  [ "$size" -gt "$LOG_MAX_BYTES" ] && mv -f "$LOG" "$LOG.1"
   return 0
 }}
 

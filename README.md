@@ -29,6 +29,7 @@
 | 重启 / 关机 | ❌ | ✅ |
 | 应用与端口发现 | ❌ | ✅ |
 | 常驻应用（托管进程 / 常用操作 / 代码片段） | ❌ | ✅ |
+| 快捷设置（自启体检 / 参数调整 / 备份迁移） | ❌ | ✅ |
 | Agent 接入（远程执行命令） | ❌ | ✅ |
 
 设计要点：
@@ -100,6 +101,19 @@ AI Agent 与本地脚本接入时反复要用的代码一次给全，并**按当
 - 令牌默认渲染为 `YOUR_TOKEN`，只有点「显示」才回填真实令牌；带依赖（`jq`/`docker`/`ss`）的片段会标注出来
 - 非破坏性的 bash 片段支持面板内一键运行，通道与审计和 `/api/terminal/exec` 完全一致
 
+### 快捷设置（设置页 · 快捷设置 tab）
+把过去只能 SSH 上去改的东西收敛成卡片：
+
+- **开机自启体检**：把「设备 → 守护 → 面板 → 常驻应用 → 设备保活」5 截链路逐段探测，标出通/断/需手工，并对断点给出可一键复制的处方（Termux:Boot 脚本、容器 crontab 命令）。Android 宿主侧的两截改不到，如实标注为「需手工」，不假装能改
+- **容器 crontab 一键兜底**：写入 `@reboot` 拉起守护，流程是「备份 → 去重 → 原子写 → 读回校验 → 失败回滚」，绝不留半截 crontab；也可一键移除
+- **守护状态与恢复**：显示托管方式（systemd / 守护脚本）、PID、健康检查，支持一键重启面板与按当前配置重装守护
+- **可调参数**（改完即生效，无需改源码）：常驻应用日志与面板日志上限、登录会话时长、失败锁定阈值与时长、常驻应用全局自启开关
+- **时间与时区**：切时区（systemd 走 `timedatectl`，容器直接写 `/etc/timezone` + `/etc/localtime`）；NTP 开关在无 systemd 环境自动置灰并说明原因
+- **反向代理与来源白名单**：`trust_proxy` 开关（含伪造 XFF 绕过锁定的风险提示）+ WebSocket 放行来源
+- **日志白名单目录**：保存前自检——若会让 `/etc/shadow` 进入可读范围或包含系统关键目录，直接拒绝
+- **监听地址 / 端口**：重建守护产物 + 后台重启 + 失败回滚，页面自动跳转到新地址
+- **备份与迁移**：导出配置（默认剔除密码哈希与 Agent 令牌）、就地备份（保留最近 10 份）、导入合并（凭据始终以本机为准）
+
 ### 文件管理
 目录浏览、在线查看与编辑（2 MB 上限）、新建 / 重命名 / 复制 / 删除、下载与上传、按名称搜索、分区占用概览。`/`、`/etc`、`/usr`、`/boot` 等系统关键目录被列入保护名单，禁止删除。
 
@@ -132,6 +146,8 @@ AegisServerPanel/
 │   ├── config.py             # 配置持久化、密码哈希、运行模式、Agent 令牌
 │   ├── auth.py               # 会话管理、各类鉴权依赖（含 WebSocket 与 Origin 校验）
 │   ├── apps.py               # 常驻应用：注册表 + 进程守护（拉起/重启/日志/自启）
+│   ├── prefs.py              # 快捷设置：可调参数的默认值、范围校验与热加载
+│   ├── boot.py               # 开机自启链路体检 + crontab 安全写入 + 时区/日志清理
 │   ├── tasks.py              # 常用操作：内置任务模板 + 参数校验
 │   ├── snippets.py           # 代码/命令片段库：模板与渲染上下文
 │   ├── metrics.py            # 性能采样器（2s 一次，保留 120 点历史）
@@ -150,6 +166,7 @@ AegisServerPanel/
 │       ├── app_routes.py     # 应用与端口发现（只读）
 │       ├── apps_routes.py    # 常驻应用管理（/api/panel/apps）
 │       ├── tasks_routes.py   # 常用操作（/api/panel/tasks）
+│       ├── panel_routes.py   # 快捷设置（/api/panel/*：体检、prefs、日志、时区、监听、备份）
 │       ├── snippets_routes.py# 代码片段库（/api/snippets）
 │       └── agent_routes.py   # Agent 令牌管理、接入信息、执行审计
 ├── static/
@@ -370,6 +387,21 @@ sudo serverpanel --update --update-ref origin/main   # 显式指定分支/标签
 2. 在容器 root 的 crontab 加兜底：`@reboot /root/aegis/AegisServerPanel/panel-supervisor.sh &`（flock 保证不会重复拉起）
 3. Android 侧：给 Termux 关闭电池优化、允许后台运行
 
+> 上面第 2 步可以不敲命令：面板「设置 → 快捷设置 → 开机自启体检」会直接告诉你哪一截断了，
+> 并提供「写入容器 @reboot 兜底」（自动备份、去重、读回校验、失败回滚）与
+> 「复制 Termux:Boot 启动脚本」两个按钮。第 1、3 步在 Android 宿主侧，容器内无法代劳，
+> 体检里会如实标注为「需手工」。
+
+完整的自启链路：
+
+| 环节 | 负责者 | 能否从面板内配置 |
+|---|---|---|
+| ① 设备/容器拉起守护 | Termux:Boot 脚本、容器 crontab `@reboot` | 容器 crontab 可以；Termux 宿主脚本只能给处方（复制粘贴） |
+| ② 守护拉起面板 | `panel-supervisor.sh` / systemd | ✅（重装守护按钮） |
+| ③ 面板拉起常驻应用 | 面板 startup + 应用的 autostart 开关 | ✅（全局开关 + 逐应用开关） |
+| ④ 面板自身开机自启 | systemd unit / 容器 crontab | ✅ |
+| ⑤ 设备侧保活 | Android 电池优化白名单、wake-lock | ❌ 只能给说明 |
+
 ### 模式与令牌管理命令
 
 全部命令都打印结果后立即退出，可安全地在服务器本机执行。
@@ -474,6 +506,15 @@ sp systemctl status nginx
 | 常用操作 | `POST /api/panel/tasks/{id}/run` 🔒 | 执行任务（参数白名单校验） |
 | 常用操作 | `GET/DELETE /api/panel/tasks/recent` 🔒 | 执行记录查询 / 清空 |
 | 代码片段 | `GET /api/snippets`、`/{id}` 🔒 | 按当前地址渲染片段；`reveal_token=1` 才回填令牌 |
+| 快捷设置 | `GET /api/panel/boot` 🔒 | 自启链路体检（只读，含平台/容器/Termux 判定） |
+| 快捷设置 | `POST/DELETE /api/panel/boot/cron` 🔒 | 容器 crontab `@reboot` 写入 / 移除（备份 + 去重 + 读回校验 + 回滚） |
+| 快捷设置 | `GET /api/panel/boot/guardian`、`POST …/restart`、`POST …/repair` 🔒 | 守护状态 / 重启面板 / 重装守护 |
+| 快捷设置 | `GET/PUT /api/panel/prefs` 🔒 | 可调参数的说明与读写（越界拒绝） |
+| 快捷设置 | `POST /api/panel/logs/trim` 🔒 | 面板与应用日志按上限截断 |
+| 快捷设置 | `GET/POST /api/panel/timezone` 🔒 | 时区查询与切换（含 NTP） |
+| 快捷设置 | `GET/POST /api/panel/listen` 🔒 | 监听地址查询与变更（重建守护 + 回滚） |
+| 快捷设置 | `GET /api/panel/config/export`、`POST /import`、`POST /backup`、`GET /config/backups` 🔒 | 配置导出 / 导入 / 就地备份 |
+| 快捷设置 | `GET /api/panel/audit` 🔒 | 设置类、常驻应用与常用操作的合并审计时间线 |
 | Agent | `GET /api/agent/info` 🔒 | 令牌状态、接入信息、执行审计 |
 | Agent | `POST /api/agent/token`、`DELETE /api/agent/token` 🔒 | 生成 / 轮换、吊销令牌 |
 
@@ -487,6 +528,26 @@ sp systemctl status nginx
 - 常驻应用注册表：与配置文件同目录的 `apps.json`（权限 `0600`，原子替换写盘）；可用
   `SERVERPANEL_APPS_DIR` 指定独立目录（测试与多实例部署用）
 - 常驻应用日志：`<注册表目录>/logs/apps/<应用名>.log`，单文件超 4MB 自动轮转为 `.log.1`
+- 快捷设置写在 `config.json` 的 `prefs` 命名空间（在「设置 → 快捷设置」里改即写入）：
+
+  ```jsonc
+  {
+    "prefs": {
+      "autostart": { "apps_enabled": true },              // 常驻应用全局自启开关
+      "logs": { "app_max_bytes": 4194304, "panel_max_bytes": 10485760 },
+      "session": { "ttl_hours": 12 },                     // 登录会话有效期
+      "security": {
+        "max_failures": 5, "lockout_seconds": 60,         // 防爆破
+        "trust_proxy": false, "allowed_origins": [],      // 同时写回顶层同名键
+        "log_dirs": ["/var/log"]
+      },
+      "listen": { "host": "0.0.0.0", "port": 8787 }       // 以 install.json 为准，需重启生效
+    }
+  }
+  ```
+
+  这些值全部按 mtime 热加载：改完立即生效，不需要重启面板（`listen.*` 除外）；
+  手工写坏的值会回落到默认值而不是让面板起不来。就地备份在 `<配置目录>/backups/*.zip`（保留最近 10 份）
 
 启用 HTTPS（自行准备证书）：
 

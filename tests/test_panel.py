@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import sys
@@ -668,3 +669,437 @@ def test_panel_pids_excludes_lifecycle_commands(tmp_path, monkeypatch):
     manage._restart_service(tmp_path)
     # 已经找到服务进程时不应再拉起守护
     assert not started
+
+
+# ---------- 快捷设置：prefs 模型 ----------
+
+def test_prefs_defaults_and_validation():
+    """默认值可读；越界/未知键必须被拒（而不是静默兜底）。"""
+    from app.prefs import PrefsError, prefs
+
+    values = prefs.all()
+    assert values["session.ttl_hours"] == 12
+    assert values["logs.app_max_bytes"] == 4 * 1024 * 1024
+    assert values["autostart.apps_enabled"] is True
+
+    for bad in (
+        {"session.ttl_hours": 0},
+        {"session.ttl_hours": 999},
+        {"listen.port": 80},
+        {"listen.port": 70000},
+        {"logs.panel_max_bytes": 1024},
+        {"security.max_failures": 1},
+        {"security.allowed_origins": ["ftp://x"]},
+        {"security.allowed_origins": ["http://ok", "nonsense"]},
+        {"security.log_dirs": ["relative/dir"]},
+        {"security.log_dirs": ["/"]},
+        {"security.log_dirs": ["/etc/shadow"]},
+        {"security.log_dirs": []},
+        {"unknown.key": 1},
+        {},
+    ):
+        with pytest.raises(PrefsError):
+            prefs.update(bad)
+
+    # 合法值写入后可读回，并同步到顶层 legacy 键
+    result = prefs.update({"security.trust_proxy": True, "session.ttl_hours": 6})
+    assert result["changed"]["session.ttl_hours"] == 6
+    assert prefs.session_ttl_seconds() == 6 * 3600
+    assert config_mod.config.trust_proxy is True
+    assert config_mod.config.data["trust_proxy"] is True
+    # 恢复，避免影响后续用例
+    prefs.update({"security.trust_proxy": False, "session.ttl_hours": 12})
+
+
+def test_prefs_survives_corrupted_values():
+    """手工把配置改坏时回落到默认值，不能让面板起不来。"""
+    from app.prefs import prefs
+
+    config_mod.config.data.setdefault("prefs", {})["session"] = {"ttl_hours": "oops"}
+    config_mod.config.save()
+    prefs._invalidate()
+    assert prefs.get("session.ttl_hours") == 12
+
+
+def test_log_whitelist_self_check_blocks_dangerous_dirs(tmp_path):
+    """C 组自检：写入白名单前必须确认敏感路径仍被拒。"""
+    from app.boot import set_pref_with_check
+    from app.prefs import PrefsError, prefs
+
+    for bad in ("/", "/etc", "/root", "/usr"):
+        with pytest.raises(PrefsError):
+            set_pref_with_check({"security.log_dirs": [bad]})
+
+    safe = str(tmp_path)
+    result = set_pref_with_check({"security.log_dirs": [safe]})
+    try:
+        assert result["changed"]["security.log_dirs"] == [os.path.realpath(safe)]
+        assert config_mod.config.log_dirs == [os.path.realpath(safe)]
+    finally:
+        prefs.update({"security.log_dirs": ["/var/log"] if os.path.isdir("/var/log") else [safe]})
+
+
+def test_public_mode_blocks_quick_settings(authed):
+    """快捷设置全部接口在公网只读模式下必须 403。"""
+    for path in ("/api/panel/boot", "/api/panel/prefs", "/api/panel/boot/guardian",
+                 "/api/panel/timezone", "/api/panel/listen", "/api/panel/config/backups"):
+        assert authed.get(path).status_code == 403, path
+    assert authed.put("/api/panel/prefs", json={"values": {"session.ttl_hours": 1}}).status_code == 403
+    assert authed.post("/api/panel/boot/cron", json={}).status_code == 403
+    assert authed.post("/api/panel/logs/trim", json={}).status_code == 403
+    assert authed.get("/api/panel/config/export").status_code == 403
+    assert authed.post("/api/panel/config/backup", json={}).status_code == 403
+
+
+def test_boot_probe_reports_chain(authed, internal_mode, monkeypatch, tmp_path):
+    """体检必须给出 5 截链路的结论，且结论随探测结果变化。"""
+    from app import boot as boot_mod
+
+    data = authed.get("/api/panel/boot").json()
+    assert data["verdict"] in ("ok", "warn", "broken")
+    ids = {link["id"] for link in data["links"]}
+    assert {"device-autostart", "guardian", "panel", "apps", "device-power"} <= ids
+    assert data["termux_script"].startswith("#!/data/data/com.termux/files/usr/bin/sh")
+    assert "panel-supervisor.sh" in data["termux_script"]
+
+    # 构造"容器 + 无 crontab"：应判为需手工并给出 Termux 处方
+    # （用自备的 app_dir，不依赖仓库工作区里是否恰好存在守护脚本）
+    monkeypatch.setattr(boot_mod, "detect_platform", lambda: {
+        "init": "init", "systemd": False, "kernel": "Linux PRoot", "proot": True,
+        "container": True, "cron": False, "termux": {"present": False}, "python": "python3",
+    })
+    monkeypatch.setattr(boot_mod, "cron_status",
+                        lambda: {"available": False, "configured": False, "lines": [], "total_lines": 0})
+    fake_dir = tmp_path / "deployed"
+    fake_dir.mkdir()
+    (fake_dir / boot_mod.SUPERVISOR_NAME).write_text("#!/bin/sh\necho fake\n", "utf-8")
+    broken = boot_mod.probe(app_dir=fake_dir, health={"ok": True, "version": "1.1.0"})
+    assert broken["verdict"] == "broken"
+    device = next(link for link in broken["links"] if link["id"] == "device-autostart")
+    assert device["state"] == "manual"
+    assert any(a["id"] == "copy-termux-script" for a in device["actions"])
+
+    # 构造"crontab 已配置"：这一截应变绿
+    monkeypatch.setattr(boot_mod, "cron_status", lambda: {
+        "available": True, "configured": True,
+        "lines": ["@reboot /root/aegis/AegisServerPanel/panel-supervisor.sh &"], "total_lines": 1,
+    })
+    fixed = boot_mod.probe(app_dir=fake_dir, health={"ok": True, "version": "1.1.0"})
+    device = next(link for link in fixed["links"] if link["id"] == "device-autostart")
+    # 该环境若同时存在 systemd 单元，会优先走 systemd 分支；两种都算"通"
+    assert device["state"] == "ok"
+
+    # 连守护脚本都没有：必须判 broken 并给出重装守护的处方
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    missing = boot_mod.probe(app_dir=empty_dir, health={"ok": True, "version": "1.1.0"})
+    device = next(link for link in missing["links"] if link["id"] == "device-autostart")
+    assert device["state"] == "broken"
+    assert any(a["id"] == "guardian-repair" for a in device["actions"])
+
+
+class _CrontabStub:
+    """模拟 crontab 命令：``-l`` 读，``<file>`` 写；可注入写失败与读回异常。"""
+
+    def __init__(self, initial: str = "", fail_write: bool = False,
+                 stale_readback: bool = False) -> None:
+        self.content = initial
+        self.fail_write = fail_write
+        self.stale_readback = stale_readback
+        self.writes = 0
+
+    def __call__(self, cmd, **kwargs):
+        import subprocess as sp
+
+        if len(cmd) >= 2 and cmd[1] == "-l":
+            if self.stale_readback and self.writes >= 1:
+                return sp.CompletedProcess(cmd, 0, "stale content without tag\n", "")
+            if self.content:
+                return sp.CompletedProcess(cmd, 0, self.content, "")
+            return sp.CompletedProcess(cmd, 1, "", "no crontab for root")
+        if self.fail_write:
+            return sp.CompletedProcess(cmd, 1, "", "disk on fire")
+        self.content = Path(cmd[1]).read_text("utf-8")
+        self.writes += 1
+        return sp.CompletedProcess(cmd, 0, "", "")
+
+
+def _prepare_cron(monkeypatch, app_dir: Path) -> None:
+    from app import boot as boot_mod
+
+    (app_dir / boot_mod.SUPERVISOR_NAME).write_text("#!/bin/sh\necho fake\n", "utf-8")
+    monkeypatch.setattr(boot_mod.shutil, "which",
+                        lambda name: "/usr/bin/crontab" if name == "crontab" else None)
+    monkeypatch.setattr(boot_mod.os, "access", lambda path, mode: True)
+
+
+def test_cron_install_is_idempotent_and_preserves_other_lines(monkeypatch, tmp_path):
+    """写入 @reboot：保留用户其它定时任务、重复安装不产生第二行。"""
+    from app import boot as boot_mod
+
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    _prepare_cron(monkeypatch, app_dir)
+    stub = _CrontabStub(initial="0 3 * * * /usr/bin/keep-me.sh\n")
+    monkeypatch.setattr(boot_mod.subprocess, "run", stub)
+    monkeypatch.setattr(boot_mod, "_backup_crontab", lambda content: None)
+
+    result = boot_mod.cron_install(app_dir)
+    assert result["ok"] is True
+    assert "keep-me.sh" in stub.content, "不能动用户已有的定时任务"
+    assert len([ln for ln in stub.content.splitlines() if boot_mod.CRON_TAG in ln]) == 1
+
+    boot_mod.cron_install(app_dir)  # 幂等
+    assert len([ln for ln in stub.content.splitlines() if boot_mod.CRON_TAG in ln]) == 1
+    assert stub.content.count("keep-me.sh") == 1
+
+
+def test_cron_install_rolls_back_on_failure(monkeypatch, tmp_path):
+    """写失败 / 读回校验失败都必须回滚到原内容，绝不留半截 crontab。"""
+    from app import boot as boot_mod
+
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    _prepare_cron(monkeypatch, app_dir)
+
+    original = "0 3 * * * keep-me.sh\n"
+    backups: list[str] = []
+
+    def backup(content):
+        if not content.strip():
+            return None
+        path = tmp_path / f"crontab.backup.{len(backups)}"
+        path.write_text(content, "utf-8")
+        backups.append(content)
+        return path
+
+    monkeypatch.setattr(boot_mod, "_backup_crontab", backup)
+
+    # 场景 A：写直接失败
+    failing = _CrontabStub(initial=original, fail_write=True)
+    monkeypatch.setattr(boot_mod.subprocess, "run", failing)
+    with pytest.raises(boot_mod.BootError):
+        boot_mod.cron_install(app_dir)
+    assert failing.content == original
+
+    # 场景 B：写成功但读回校验失败 → 回滚
+    stale = _CrontabStub(initial=original, stale_readback=True)
+    monkeypatch.setattr(boot_mod.subprocess, "run", stale)
+    with pytest.raises(boot_mod.BootError):
+        boot_mod.cron_install(app_dir)
+    assert stale.content == original, "读回校验失败后必须把原 crontab 写回去"
+    assert backups and backups[-1] == original
+
+
+def test_cron_install_without_crontab_binary(monkeypatch, tmp_path):
+    """没有 crontab 命令时给出明确指引，而不是静默写入一个不会执行的文件。"""
+    from app import boot as boot_mod
+
+    app_dir = tmp_path / "app"
+    app_dir.mkdir()
+    (app_dir / boot_mod.SUPERVISOR_NAME).write_text("#!/bin/sh\n", "utf-8")
+    monkeypatch.setattr(boot_mod.shutil, "which", lambda name: None)
+    with pytest.raises(boot_mod.BootError) as exc:
+        boot_mod.cron_install(app_dir)
+    assert "crontab" in str(exc.value)
+
+
+def test_global_autostart_switch(authed, internal_mode, tmp_path):
+    """全局开关关闭后，autostart 应用不会被拉起；显式 start 仍生效。"""
+    import asyncio
+
+    from app.apps import Registry, normalize_definition, Supervisor
+    from app.prefs import prefs
+
+    registry = Registry(tmp_path / "apps.json")
+    sup = Supervisor(registry, tmp_path / "logs")
+    definition = normalize_definition({
+        "name": "autostart-check",
+        "command": _tick_command(tmp_path),
+        "cwd": str(tmp_path),
+        "autostart": True,
+        "restart_delay": 0.5,
+    })
+    registry.add(definition)
+
+    async def scenario() -> tuple[int | None, int | None]:
+        prefs.update({"autostart.apps_enabled": False})
+        await sup.serve()
+        await asyncio.sleep(2.6)  # 超过 BOOT_DELAY
+        after_boot = sup.get(definition["id"])["runtime"]["pid"]
+
+        prefs.update({"autostart.apps_enabled": True})
+        explicit = await sup.start(definition["id"])
+        return after_boot, explicit["runtime"]["pid"]
+
+    try:
+        after_boot, explicit_pid = asyncio.run(scenario())
+    finally:
+        prefs.update({"autostart.apps_enabled": True})
+    assert after_boot is None, "全局开关关闭时不应自动拉起"
+    assert explicit_pid, "显式 start 不受全局开关影响"
+
+
+def test_app_log_limit_from_prefs(tmp_path):
+    """日志上限改小后立即生效：写满即轮转为 .1，无需重启。"""
+    from app.apps import AppLog
+    from app.prefs import prefs
+
+    original = prefs.get("logs.app_max_bytes")
+    try:
+        prefs.update({"logs.app_max_bytes": 256 * 1024})  # 下限
+        log = AppLog(tmp_path / "app.log")               # 不传上限 → 每次读 prefs
+        assert log.max_bytes == 256 * 1024
+        log.append("x" * 300 * 1024)
+        log.append("trigger-rotate\n")
+        assert (tmp_path / "app.log.1").exists(), "超过上限必须轮转出 .1"
+    finally:
+        prefs.update({"logs.app_max_bytes": original})
+
+
+# ---------- 快捷设置：B2/B3 会话与防爆破参数 ----------
+
+def test_session_ttl_from_prefs(authed, internal_mode):
+    """改会话时长：SessionStore 动态读取，新登录的 cookie max-age 同步；旧会话不受影响。"""
+    from app.auth import sessions
+    from app.prefs import prefs
+
+    original = prefs.get("session.ttl_hours")
+    try:
+        prefs.update({"session.ttl_hours": 2})
+        assert sessions.ttl == 2 * 3600
+
+        r = authed.post("/api/auth/login", json={"password": PASSWORD})
+        assert r.status_code == 200
+        assert "max-age=7200" in r.headers.get("set-cookie", "").lower()
+        # 会话仍有效（改 TTL 不踢已登录会话）
+        assert authed.get("/api/auth/status").status_code == 200
+    finally:
+        prefs.update({"session.ttl_hours": original})
+        authed.post("/api/auth/login", json={"password": PASSWORD})
+
+
+def test_lockout_params_from_prefs(authed, internal_mode):
+    """防爆破阈值与锁定时长走 prefs：改小阈值后更少的失败即触发锁定，到期自动解锁。"""
+    from app.auth import sessions
+    from app.prefs import prefs
+
+    original = (prefs.get("security.max_failures"), prefs.get("security.lockout_seconds"))
+    try:
+        prefs.update({"security.max_failures": 3, "security.lockout_seconds": 10})
+        probe_ip = "10.5.5.5"  # 与其它用例的失败计数隔离
+        assert sessions.locked_for(probe_ip) == 0
+        for _ in range(3):
+            sessions.record_failure(probe_ip)
+        locked = sessions.locked_for(probe_ip)
+        assert 0 < locked <= 10, "达到新阈值后必须按 prefs 的锁定时长计算"
+        time.sleep(10.5)
+        assert sessions.locked_for(probe_ip) == 0, "锁定到期应自动解锁"
+    finally:
+        prefs.update({"security.max_failures": original[0],
+                      "security.lockout_seconds": original[1]})
+
+
+def test_timezone_endpoints_are_safe(authed, internal_mode):
+    """时区状态只读可用；非法/不存在的时区在写入前被拒（跨平台安全，不真改机器）。"""
+    status = authed.get("/api/panel/timezone").json()
+    assert "current" in status
+    assert isinstance(status.get("common"), list) and status["common"]
+
+    for bad in ("not a zone!", "Nowhere/Nowhere"):
+        r = authed.post("/api/panel/timezone", json={"zone": bad})
+        assert r.status_code == 400, bad
+
+
+# ---------- 快捷设置：D 组 导出 / 导入 / 审计 ----------
+
+def test_config_export_scrubs_secrets(authed, internal_mode):
+    """默认导出不含密码哈希与 Agent 令牌；include_secrets=1 才包含。"""
+    import io
+    import zipfile
+
+    default = authed.get("/api/panel/config/export")
+    assert default.status_code == 200
+    assert default.headers["content-type"].startswith("application/zip")
+    with zipfile.ZipFile(io.BytesIO(default.content)) as bundle:
+        assert "config.json" in bundle.namelist()
+        exported = json.loads(bundle.read("config.json").decode("utf-8"))
+        assert "README.txt" in bundle.namelist()
+    assert "password_hash" not in exported
+    assert "agent_token" not in exported
+    assert exported["mode"] == config_mod.config.mode
+
+    full = authed.get("/api/panel/config/export", params={"include_secrets": "1"})
+    with zipfile.ZipFile(io.BytesIO(full.content)) as bundle:
+        exported = json.loads(bundle.read("config.json").decode("utf-8"))
+    assert "password_hash" in exported, "显式带凭据的导出必须包含密码哈希"
+
+
+def test_config_import_merges_and_keeps_local_secrets(authed, internal_mode):
+    """导入合并：prefs/应用定义生效，但密码哈希与 Agent 令牌始终以本机为准；坏包被拒且配置不变。"""
+    import io
+    import zipfile
+
+    from app.prefs import prefs
+
+    snapshot = json.loads(json.dumps(config_mod.config.data))  # 深拷贝，用于恢复
+    prefs_original = prefs.get("session.ttl_hours")
+    try:
+        payload = {
+            "config.json": {
+                "mode": "internal",
+                "password_hash": "attacker-hash",
+                "agent_token": "stolen-token",
+                "prefs": {"session": {"ttl_hours": 3}},
+            },
+            "apps.json": {"version": 1, "apps": []},
+        }
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as bundle:
+            for name, data in payload.items():
+                bundle.writestr(name, json.dumps(data))
+        buffer.seek(0)
+
+        r = authed.post("/api/panel/config/import",
+                        files={"file": ("export.zip", buffer.read(), "application/zip")})
+        assert r.status_code == 200, r.text
+        result = r.json()
+        assert "password_hash" in result["kept_secrets"], "本机已有的凭据必须保留"
+        assert config_mod.config.data["password_hash"] == snapshot["password_hash"], "本机密码不能被覆盖"
+        assert config_mod.config.data.get("agent_token") in (None, snapshot.get("agent_token")), \
+            "不能从导入包领养外来凭据"
+        assert prefs.get("session.ttl_hours") == 3, "导入的 prefs 应生效"
+        assert result["backup"], "导入前必须自动生成就地备份"
+
+        # 坏 zip：400 且配置不变
+        before = json.dumps(config_mod.config.data, sort_keys=True)
+        bad = authed.post("/api/panel/config/import",
+                          files={"file": ("bad.zip", b"not a zip", "application/zip")})
+        assert bad.status_code == 400
+        assert json.dumps(config_mod.config.data, sort_keys=True) == before
+        assert prefs.get("session.ttl_hours") == 3, "拒绝导入时不能动现有配置"
+    finally:
+        config_mod.config.data = snapshot
+        config_mod.config.save()
+        prefs._invalidate()
+        prefs.update({"session.ttl_hours": prefs_original})
+
+
+def test_panel_audit_records_writes(authed, internal_mode):
+    """写操作必须留下审计记录（时间线接口可查）。"""
+    from app.prefs import prefs
+
+    original = prefs.get("session.ttl_hours")
+    try:
+        # 走 API 而不是直接改 prefs：审计记录在路由层
+        r = authed.put("/api/panel/prefs", json={"values": {"session.ttl_hours": 5}})
+        assert r.status_code == 200
+        recent = authed.get("/api/panel/audit").json()["recent"]
+        entry = next((item for item in recent
+                      if item.get("kind") == "panel" and item.get("action") == "prefs"), None)
+        assert entry is not None, "prefs 修改必须出现在审计时间线"
+        assert "session.ttl_hours" in entry["detail"]
+        assert entry["time"] > 0
+    finally:
+        prefs.update({"session.ttl_hours": original})
+

@@ -17,9 +17,12 @@ from pathlib import Path
 from fastapi import HTTPException, Request, WebSocket, status
 
 from .config import COOKIE_NAME, MODE_INTERNAL, SESSION_TTL, config
+from .prefs import prefs
 
 INTERNAL_HINT = "该功能仅在内网模式可用，请在服务器上执行 serverpanel --enable-internal 激活"
 
+# 下面是出厂默认值；实际取值走 prefs（可在「设置 → 快捷设置」里改，立即生效）。
+# 保留常量是为了兼容既有测试与外部引用。
 MAX_FAILURES = 5
 LOCKOUT_SECONDS = 60
 SESSIONS_FILE = "sessions.json"
@@ -27,13 +30,19 @@ PERSIST_MIN_INTERVAL = 60.0  # 滑动续期的落盘节流（秒）
 
 
 class SessionStore:
-    def __init__(self, ttl: int = SESSION_TTL) -> None:
-        self.ttl = ttl
+    def __init__(self, ttl: int | None = None) -> None:
+        # ttl=None 时动态读取 prefs：改会话时长后新签发的会话立即生效，
+        # 已存在的会话保留各自的 expires（不会把正在使用的人踢下线）。
+        self._fixed_ttl = ttl
         self._sessions: dict[str, dict] = {}
         self._failures: dict[str, list[float]] = {}
         self._lock = threading.Lock()
         self._last_persist = 0.0
         self._load()
+
+    @property
+    def ttl(self) -> int:
+        return self._fixed_ttl if self._fixed_ttl is not None else prefs.session_ttl_seconds()
 
     def _file(self) -> Path:
         return Path(config.path).parent / SESSIONS_FILE
@@ -118,11 +127,13 @@ class SessionStore:
 
     # ---- 登录失败锁定 ----
     def locked_for(self, ip: str) -> int:
+        window = prefs.lockout_seconds()
+        limit = prefs.max_failures()
         with self._lock:
-            attempts = [t for t in self._failures.get(ip, []) if time.time() - t < LOCKOUT_SECONDS]
+            attempts = [t for t in self._failures.get(ip, []) if time.time() - t < window]
             self._failures[ip] = attempts
-            if len(attempts) >= MAX_FAILURES:
-                return int(LOCKOUT_SECONDS - (time.time() - attempts[0])) + 1
+            if len(attempts) >= limit:
+                return int(window - (time.time() - attempts[0])) + 1
             return 0
 
     def record_failure(self, ip: str) -> None:

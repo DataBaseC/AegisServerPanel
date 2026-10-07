@@ -14,3 +14,9 @@ config.json
 .DS_Store
 .idea/
 .vscode/
+
+# 运行时产物（部署时机与仓库同目录：守护脚本 / pid / 锁 / 轮转日志）
+panel-supervisor.sh
+.supervisor.pid
+.supervisor.lock
+*.log.1

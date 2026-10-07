@@ -27,6 +27,7 @@ from .routes import (
     auth_routes,
     file_routes,
     log_routes,
+    panel_routes,
     process_routes,
     service_routes,
     snippets_routes,
@@ -118,6 +119,7 @@ for module in (
     apps_routes,
     tasks_routes,
     snippets_routes,
+    panel_routes,
 ):
     app.include_router(module.router)
 

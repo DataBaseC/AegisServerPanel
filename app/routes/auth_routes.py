@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from ..auth import client_ip, extract_token, require_auth, sessions
-from ..config import COOKIE_NAME, SESSION_TTL, config
+from ..config import COOKIE_NAME, config
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -27,7 +27,7 @@ def _issue(request: Request, response: Response) -> str:
     response.set_cookie(
         COOKIE_NAME,
         token,
-        max_age=SESSION_TTL,
+        max_age=sessions.ttl,  # 跟随「设置 → 快捷设置」里的会话时长
         httponly=True,
         samesite="lax",
         path="/",

@@ -2669,13 +2669,284 @@ registerView('apps', {
 
 /* ============================ 视图：设置 ============================ */
 
+/** 等待面板重启完成（升级 / 改监听地址后都会用），返回是否成功恢复。 */
+function waitForPanelRestart({ before = '', expected = null, timeoutMs = 180000,
+                              onProgress = null, probeUrl = '/healthz' } = {}) {
+  return new Promise((resolve) => {
+    const deadline = Date.now() + timeoutMs;
+    const timer = setInterval(async () => {
+      try {
+        const data = await fetch(probeUrl, { cache: 'no-store' }).then((r) => r.json());
+        const stamp = data.build || data.version || '';
+        const hit = expected ? (data.version === expected || stamp === expected)
+          : (stamp && stamp !== before);
+        if (hit) {
+          clearInterval(timer);
+          resolve({ ok: true, health: data });
+          return;
+        }
+        if (onProgress) onProgress('面板已响应，等待新版本生效…');
+      } catch (err) {
+        if (onProgress) onProgress('面板重启中，等待恢复…');
+      }
+      if (Date.now() > deadline) {
+        clearInterval(timer);
+        resolve({ ok: false, health: null });
+      }
+    }, 2500);
+  });
+}
+
 registerView('settings', {
   title: '设置',
   async render(root) {
+    let tab = localStorage.getItem('sp-settings-tab') === 'quick' ? 'quick' : 'general';
     const caps = live.capabilities || {};
     const info = await api.get('/api/system/info').catch(() => ({}));
     const hz = await fetch('/healthz').then((r) => r.json()).catch(() => null);
-    root.innerHTML = `
+
+    // ---- 快捷设置状态 ----
+    let prefsFields = [];
+    let prefsValues = {};
+    let bootInfo = null;
+    let guardian = null;
+    let listen = {};
+    let tz = {};
+    let backups = [];
+    let busy = false;
+
+    async function loadQuick() {
+      const [p, b, g] = await Promise.all([
+        api.get('/api/panel/prefs'),
+        api.get('/api/panel/boot'),
+        api.get('/api/panel/boot/guardian'),
+      ]);
+      prefsFields = p.fields;
+      prefsValues = p.values;
+      listen = p.listen;
+      tz = p.timezone;
+      bootInfo = b;
+      guardian = g;
+      try { backups = (await api.get('/api/panel/config/backups')).items; }
+      catch (err) { backups = []; }
+    }
+
+    const STATE_META = {
+      ok: ['ok', '通'], broken: ['danger', '断'], manual: ['warn', '需手工'], unknown: ['', '未知'],
+    };
+
+    const EFFECT_LABEL = {
+      immediate: '<span class="badge ok">立即生效</span>',
+      'new-session': '<span class="badge info">新会话生效</span>',
+      restart: '<span class="badge warn">需重启面板</span>',
+    };
+
+    function fieldOf(key) {
+      return prefsFields.find((f) => f.key === key) || { key, value: '', note: '', effect: 'immediate' };
+    }
+
+    function numField(key, label, unit, hint) {
+      const field = fieldOf(key);
+      return `<label class="field"><span>${esc(label)} <span class="dim">（${esc(unit)}）</span></span>
+        <input class="input" type="number" data-pref="${esc(key)}" value="${esc(field.value)}"
+          data-original="${esc(field.value)}">
+        <span class="dim" style="font-size:11px">${esc(hint || field.note)}</span></label>`;
+    }
+
+    function switchField(key, label, hint, danger) {
+      const field = fieldOf(key);
+      return `<label class="switch-row">
+        <input type="checkbox" data-pref-bool="${esc(key)}" ${field.value ? 'checked' : ''}
+          data-original="${field.value ? '1' : '0'}">
+        <span><b>${esc(label)}</b>${danger ? ' <span class="badge danger">谨慎</span>' : ''}
+          <div class="dim" style="font-size:11.5px;line-height:1.6">${esc(hint || field.note)}</div></span>
+      </label>`;
+    }
+
+    function bootCard() {
+      if (!bootInfo) return '<div class="card"><div class="empty">加载中…</div></div>';
+      const verdictMap = {
+        ok: ['ok', '自启链路完整'], warn: ['warn', '可自动的部分已就绪，仍有需手工的环节'],
+        broken: ['danger', '自启链路存在断点'],
+      };
+      const [vcls, vtext] = verdictMap[bootInfo.verdict] || ['', bootInfo.verdict];
+      return `<div class="card" style="grid-column:1/-1">
+        <h2>开机自启体检 <span class="spacer"></span>
+          <span class="badge ${vcls}">${esc(vtext)}</span>
+          <button class="btn sm ghost" data-act="boot-refresh">重新检测</button></h2>
+        <div class="boot-chain">
+          ${bootInfo.links.map((link, index) => {
+            const [cls, label] = STATE_META[link.state] || ['', link.state];
+            return `<div class="boot-link ${cls}">
+              <div class="bl-head"><span class="bl-no">${index + 1}</span>
+                <b>${esc(link.title)}</b><span class="badge ${cls}">${esc(label)}</span></div>
+              <div class="bl-detail">${esc(link.detail)}</div>
+              ${link.evidence ? `<div class="dim mono bl-evidence">${esc(link.evidence)}</div>` : ''}
+              ${link.actions.length ? `<div class="row" style="margin-top:8px">${link.actions.map((a) => `
+                <button class="btn sm ${a.needs_confirm ? 'primary' : 'ghost'}"
+                  data-boot-action="${esc(a.id)}">${esc(a.label)}</button>`).join('')}</div>` : ''}
+            </div>`;
+          }).join('')}
+        </div>
+        <div class="dim" style="font-size:12px;margin-top:12px;line-height:1.7">
+          链路：设备/容器 → 守护 → 面板 → 常驻应用 → 设备保活。
+          标「需手工」的环节在 Android 宿主侧，容器内无法修改，按提示在手机上操作即可。
+          平台：<span class="mono">${esc(bootInfo.platform.init)}</span>
+          ${bootInfo.platform.proot ? '· PRoot 容器' : ''}
+          ${bootInfo.cron.available ? `· crontab ${bootInfo.cron.configured ? '已配置' : '未配置'}`
+            : '· 无 crontab'}
+        </div>
+        <details style="margin-top:10px">
+          <summary class="dim" style="cursor:pointer;font-size:12px">查看 Termux:Boot 启动脚本（手机侧使用）</summary>
+          <pre class="snippet-body" style="margin-top:8px">${esc(bootInfo.termux_script)}</pre>
+          <button class="btn sm ghost" data-act="copy-termux">复制脚本</button>
+        </details>
+      </div>`;
+    }
+
+    function guardianCard() {
+      if (!guardian) return '';
+      const health = guardian.health || {};
+      return `<div class="card">
+        <h2>守护进程</h2>
+        <dl class="kv" style="grid-template-columns:110px 1fr">
+          <dt>托管方式</dt><dd>${guardian.systemd ? 'systemd（Restart=always）' : 'panel-supervisor.sh'}</dd>
+          <dt>守护 PID</dt><dd>${guardian.alive ? guardian.pid : '未运行'}</dd>
+          <dt>健康检查</dt><dd>${health.ok ? `正常 · ${esc(health.version || '')}` : '<span class="badge danger">无响应</span>'}</dd>
+          <dt>应用目录</dt><dd class="mono">${esc(guardian.app_dir)}</dd>
+        </dl>
+        <div class="row" style="margin-top:12px">
+          <button class="btn primary" data-act="guardian-restart">重启面板</button>
+          <button class="btn" data-act="guardian-repair">重装守护</button>
+        </div>
+        <div class="dim" style="font-size:12px;margin-top:10px;line-height:1.7">
+          重启约 3~10 秒，登录态保持；重装守护会按当前配置重新生成启动脚本与开机自启项。
+        </div>
+        ${bootInfo && bootInfo.cron.available ? `
+        <div class="row" style="margin-top:12px">
+          ${bootInfo.cron.configured
+            ? '<button class="btn danger" data-act="cron-remove">移除容器 @reboot 兜底</button>'
+            : '<button class="btn" data-act="cron-install">写入容器 @reboot 兜底</button>'}
+          <span class="dim" style="font-size:12px">
+            crontab 现有 ${bootInfo.cron.total_lines} 行定时任务，写入前会自动备份、去重并读回校验</span>
+        </div>` : ''}
+      </div>`;
+    }
+
+    function prefsCards() {
+      const sessionCard = `<div class="card">
+        <h2>会话与登录防护</h2>
+        ${numField('session.ttl_hours', '登录会话有效期', '小时', '滑动续期；已签发的会话保留原到期时间')}
+        ${numField('security.max_failures', '连续失败锁定阈值', '次', '同一来源 IP 连续失败多少次后锁定')}
+        ${numField('security.lockout_seconds', '锁定时长', '秒', '锁定期间该来源的登录请求一律拒绝')}
+        <div class="dim" style="font-size:11.5px">${EFFECT_LABEL['new-session']} ${EFFECT_LABEL.immediate}</div>
+      </div>`;
+
+      const logCard = `<div class="card">
+        <h2>日志与保留</h2>
+        ${numField('logs.app_max_bytes', '单个应用日志上限', '字节', '超过后轮转为 .log.1')}
+        ${numField('logs.panel_max_bytes', '面板日志上限', '字节', '守护脚本按此上限轮转 panel.log')}
+        <div class="row" style="margin-top:4px">
+          <button class="btn primary" data-act="logs-trim">立即清理到上限</button>
+          <span class="dim" style="font-size:12px">面板与全部应用日志一次性截断</span>
+        </div>
+      </div>`;
+
+      const autostartCard = `<div class="card">
+        <h2>常驻应用自启</h2>
+        ${switchField('autostart.apps_enabled', '面板启动时自动拉起自启应用',
+          '关闭后，标记了自启的应用不会被自动拉起（手动「启动」仍然生效）')}
+        <div class="dim" style="font-size:12px;margin-top:8px;line-height:1.7">
+          单个应用的自启开关在「常驻应用」页面按应用配置。
+        </div>
+      </div>`;
+
+      const tzCard = `<div class="card">
+        <h2>时间与时区</h2>
+        <div class="row">
+          <span class="badge">当前 ${esc(tz.current || '-')}</span>
+          ${tz.supported ? '' : '<span class="badge danger">本机不支持切换</span>'}
+        </div>
+        <label class="field"><span>切换到</span>
+          <input class="input" id="tz-input" list="tz-options" value="${esc(tz.current || '')}"
+            ${tz.supported ? '' : 'disabled'} placeholder="Asia/Shanghai">
+          <datalist id="tz-options">${(tz.common || []).map((z) => `<option value="${esc(z)}"></option>`).join('')}</datalist>
+        </label>
+        <label class="switch-row">
+          <input type="checkbox" id="tz-ntp" ${tz.ntp_enabled ? 'checked' : ''}
+            ${tz.ntp_supported ? '' : 'disabled'}>
+          <span><b>开启 NTP 自动对时</b>
+            <div class="dim" style="font-size:11.5px;line-height:1.6">
+              ${tz.ntp_supported ? '由 systemd-timedated 负责对时'
+                : '本环境无 systemd：容器时钟由 Android 宿主控制，无法在容器内对时'}</div></span>
+        </label>
+        <button class="btn primary" data-act="tz-apply" ${tz.supported ? '' : 'disabled'}>应用时区</button>
+      </div>`;
+
+      const proxyCard = `<div class="card">
+        <h2>反向代理与来源白名单</h2>
+        ${switchField('security.trust_proxy', '信任反向代理的 X-Forwarded-For', 
+          '只有在面板确实位于可信反向代理之后才可开启：否则攻击者可伪造 XFF 绕过登录失败锁定', true)}
+        <label class="field"><span>额外放行来源（每行一个，用于反代换域名时的 WebSocket 握手）</span>
+          <textarea class="input" rows="3" data-pref-list="security.allowed_origins"
+            data-original="${esc((prefsValues['security.allowed_origins'] || []).join('\n'))}"
+            placeholder="https://panel.example.com">${esc((prefsValues['security.allowed_origins'] || []).join('\n'))}</textarea></label>
+      </div>`;
+
+      const logDirsCard = `<div class="card">
+        <h2>日志白名单目录</h2>
+        <label class="field"><span>日志接口允许读取的目录（每行一个绝对路径）</span>
+          <textarea class="input" rows="3" data-pref-list="security.log_dirs"
+            data-original="${esc((prefsValues['security.log_dirs'] || []).join('\n'))}">${esc((prefsValues['security.log_dirs'] || []).join('\n'))}</textarea></label>
+        <div class="dim" style="font-size:11.5px;line-height:1.7">
+          保存前会自检：若该目录会让 <span class="mono">/etc/shadow</span> 之类敏感文件进入可读范围，
+          或包含系统关键目录，会被拒绝。
+        </div>
+      </div>`;
+
+      const listenCard = `<div class="card">
+        <h2>监听地址 <span class="spacer"></span><span class="badge warn">改完需重启面板</span></h2>
+        <div class="row">
+          <label class="field" style="flex:1;min-width:140px"><span>地址</span>
+            <input class="input" id="listen-host" value="${esc(listen.host || '')}"></label>
+          <label class="field" style="width:120px"><span>端口</span>
+            <input class="input" type="number" id="listen-port" value="${esc(listen.port || '')}"></label>
+        </div>
+        <button class="btn danger" data-act="listen-apply">应用并重启面板</button>
+        <div class="dim" style="font-size:12px;margin-top:10px;line-height:1.7">
+          当前 <span class="mono">${esc(listen.host)}:${esc(listen.port)}</span>。
+          变更会重建守护脚本并重启面板，本页面会断连数十秒后自动跳转到新地址；
+          失败会回滚到原配置。
+        </div>
+      </div>`;
+
+      const backupCard = `<div class="card" style="grid-column:1/-1">
+        <h2>备份与迁移</h2>
+        <div class="row">
+          <a class="btn primary" href="/api/panel/config/export" download>导出配置（不含凭据）</a>
+          <a class="btn" href="/api/panel/config/export?include_secrets=1" download>导出（含密码与令牌）</a>
+          <button class="btn ghost" data-act="backup-now">就地备份</button>
+          <input type="file" id="import-file" accept=".zip" class="hidden">
+          <button class="btn ghost" data-act="import-pick">导入配置…</button>
+        </div>
+        <div class="dim" style="font-size:12px;margin-top:10px;line-height:1.7">
+          默认导出会剔除密码哈希与 Agent 令牌，导入时这两项<b>始终以本机为准</b>；
+          「含密码与令牌」的导出文件请妥善保管。就地备份保存在服务器
+          <span class="mono">/etc/serverpanel/backups/</span>，最多保留 10 份。
+        </div>
+        ${backups.length ? `<div class="table-wrap" style="margin-top:10px"><table class="data">
+          <thead><tr><th>备份文件</th><th class="num">大小</th><th>时间</th></tr></thead>
+          <tbody>${backups.map((b) => `<tr>
+            <td class="cell-main">${esc(b.name)}</td>
+            <td class="num">${bytes(b.size)}</td>
+            <td class="cell-sub">${datetime(b.time)}</td></tr>`).join('')}</tbody></table></div>` : ''}
+      </div>`;
+
+      return autostartCard + sessionCard + logCard + tzCard + proxyCard + logDirsCard + listenCard + backupCard;
+    }
+
+    function generalTab() {
+      return `
       <div class="grid c2">
         <div class="card">
           <h2>修改面板密码</h2>
@@ -2735,7 +3006,7 @@ registerView('settings', {
           <ul style="line-height:1.9;padding-left:18px;margin:0;font-size:13px">
             <li>密码使用 PBKDF2-HMAC-SHA256（26 万次迭代 + 随机盐）存储在本地配置文件，权限 0600。</li>
             <li>登录会话默认 12 小时，写入 HttpOnly Cookie，并落盘保存——服务重启后面板登录态保持。</li>
-            <li>连续 5 次密码错误后，该来源 IP 会被锁定 60 秒。</li>
+            <li>连续 5 次密码错误后，该来源 IP 会被锁定 60 秒（可在「快捷设置」调整）。</li>
             <li>默认处于<b>公网模式</b>：即使登录成功，也只开放只读监控，终端与写操作全部锁定。</li>
             <li>只有 <b>内网模式</b>才能获得完整控制权；它必须登录服务器本机执行命令才能激活。</li>
             <li>面板默认监听 0.0.0.0，<b>请只在可信局域网内使用</b>，不要直接暴露到公网。</li>
@@ -2773,61 +3044,335 @@ serverpanel --show-mode          # 查看当前模式</div>
           </div>
         </div>
       </div>`;
+    }
 
-    $('#pwd-form').onsubmit = async (event) => {
-      event.preventDefault();
-      const current = $('#pwd-current').value;
-      const next = $('#pwd-new').value;
-      if (next !== $('#pwd-confirm').value) { toast('两次输入的新密码不一致', 'err'); return; }
-      try {
-        const res = await api.post('/api/auth/password', { current, new: next });
-        toast(res.message);
-        $('#pwd-form').reset();
-      } catch (err) { toast(err.message, 'err'); }
-    };
+    function quickTab() {
+      if (!bootInfo) return '<div class="card"><div class="empty">加载中…</div></div>';
+      return `<div class="row" style="margin-bottom:12px">
+          <span class="dim" style="font-size:12px">开关类改动即时保存；输入框改动需点「保存设置」。</span>
+          <div class="spacer"></div>
+          <button class="btn primary" data-act="prefs-save">保存设置</button>
+        </div>
+        <div class="grid c2">${bootCard()}${guardianCard()}${prefsCards()}</div>`;
+    }
 
-    $('#btn-self-update').onclick = async () => {
-      const before = hz?.build || hz?.version || '';
-      const ok = await confirmDialog({
-        title: '面板一键升级', confirmText: '开始升级',
-        message: '将拉取远端最新代码并重启面板。失败会自动回滚到当前版本，确定继续吗？',
-      });
-      if (!ok) return;
-      const btn = $('#btn-self-update');
-      btn.disabled = true;
-      btn.textContent = '升级中…';
-      try {
-        await api.post('/api/system/self-update', {});
-      } catch (err) { toast(err.message, 'err'); btn.disabled = false; btn.textContent = '一键升级（git 拉取最新代码）'; return; }
-      toast('升级已在后台启动，等待面板重启…');
-      const deadline = Date.now() + 180000;
-      const timer = setInterval(async () => {
-        let done = false;
+    function paint() {
+      root.innerHTML = `
+        <div class="tabs-head">
+          <button class="tab-btn ${tab === 'general' ? 'active' : ''}" data-settings-tab="general">常规</button>
+          <button class="tab-btn ${tab === 'quick' ? 'active' : ''}" data-settings-tab="quick">快捷设置</button>
+        </div>
+        <div id="settings-panel">${tab === 'general' ? generalTab() : quickTab()}</div>`;
+      if (tab === 'general') bindGeneral();
+    }
+
+    // ---- 常规 tab 的绑定 ----
+    function bindGeneral() {
+      $('#pwd-form').onsubmit = async (event) => {
+        event.preventDefault();
+        const current = $('#pwd-current').value;
+        const next = $('#pwd-new').value;
+        if (next !== $('#pwd-confirm').value) { toast('两次输入的新密码不一致', 'err'); return; }
         try {
-          const v = await fetch('/healthz').then((r) => r.json());
-          if ((v.build || v.version) && (v.build || v.version) !== before) {
-            clearInterval(timer);
-            toast(`升级完成：${v.version}（${v.build || ''}）`, 'ok');
-            setTimeout(() => location.reload(), 1200);
-            done = true;
-          }
-        } catch (err) { /* 重启间隙，继续等 */ }
-        if (done) return;
-        if (Date.now() > deadline) {
-          clearInterval(timer);
+          const res = await api.post('/api/auth/password', { current, new: next });
+          toast(res.message);
+          $('#pwd-form').reset();
+        } catch (err) { toast(err.message, 'err'); }
+      };
+
+      $('#btn-self-update').onclick = async () => {
+        const before = hz?.build || hz?.version || '';
+        const ok = await confirmDialog({
+          title: '面板一键升级', confirmText: '开始升级',
+          message: '将拉取远端最新代码并重启面板。失败会自动回滚到当前版本，确定继续吗？',
+        });
+        if (!ok) return;
+        const btn = $('#btn-self-update');
+        btn.disabled = true;
+        btn.textContent = '升级中…';
+        try {
+          await api.post('/api/system/self-update', {});
+        } catch (err) {
+          toast(err.message, 'err');
+          btn.disabled = false;
+          btn.textContent = '一键升级（git 拉取最新代码）';
+          return;
+        }
+        toast('升级已在后台启动，等待面板重启…');
+        const result = await waitForPanelRestart({
+          before, onProgress: (text) => { btn.textContent = text; },
+        });
+        if (result.ok) {
+          toast(`升级完成：${result.health.version}（${result.health.build || ''}）`, 'ok');
+          setTimeout(() => location.reload(), 1200);
+        } else {
           toast('升级未在预期时间内完成，请通过终端查看 panel.log', 'err');
           btn.disabled = false;
           btn.textContent = '一键升级（git 拉取最新代码）';
         }
-      }, 3000);
-    };
+      };
+    }
+
+    // ---- 快捷设置 tab 的动作 ----
+    function collectPrefs() {
+      const patch = {};
+      $$('[data-pref]').forEach((input) => {
+        const original = input.dataset.original;
+        if (input.value.trim() !== original) patch[input.dataset.pref] = Number(input.value.trim());
+      });
+      $$('[data-pref-bool]').forEach((input) => {
+        const now = input.checked ? '1' : '0';
+        if (now !== input.dataset.original) patch[input.dataset.prefBool] = input.checked;
+      });
+      $$('[data-pref-list]').forEach((area) => {
+        if (area.value.trim() !== area.dataset.original) {
+          patch[area.dataset.prefList] = area.value.split('\n').map((s) => s.trim()).filter(Boolean);
+        }
+      });
+      return patch;
+    }
+
+    async function savePrefs(patch, confirmText = '保存') {
+      if (!patch || !Object.keys(patch).length) { toast('没有需要保存的改动'); return false; }
+      const needConfirm = 'security.trust_proxy' in patch || 'security.log_dirs' in patch;
+      if (needConfirm) {
+        const ok = await confirmDialog({
+          title: '确认修改安全相关设置', danger: 'security.log_dirs' in patch,
+          confirmText, phrase: 'security.trust_proxy' in patch ? 'PROXY' : '',
+          message: `将修改：<b class="mono">${esc(Object.keys(patch).join('、'))}</b><br>
+            <span class="dim">开启信任代理会让来源判定改为读取 X-Forwarded-For；
+            扩展日志白名单会放宽可读范围。请确认当前部署确实需要。</span>`,
+        });
+        if (!ok) return false;
+      }
+      try {
+        const res = await api.put('/api/panel/prefs', { values: patch });
+        toast(res.message || '已保存');
+        await loadQuick();
+        paint();
+        return true;
+      } catch (err) {
+        toast(err.message, 'err');
+        return false;
+      }
+    }
+
+    async function runBootAction(actionId) {
+      const actions = {};
+      (bootInfo?.links || []).forEach((link) => link.actions.forEach((a) => { actions[a.id] = a; }));
+      const action = actions[actionId] || {};
+      if (actionId === 'copy-termux-script') {
+        copyText(bootInfo.termux_script, 'Termux:Boot 脚本已复制');
+        return;
+      }
+      if (actionId === 'cron-install') {
+        const ok = await confirmDialog({
+          title: '写入容器 @reboot 兜底', confirmText: '写入',
+          message: `将在容器 crontab 追加一行，让守护在开机时自动拉起。<br>
+            <span class="dim">写入前会备份现有 crontab（共 ${bootInfo.cron.total_lines} 行），
+            自动去重并读回校验；失败会回滚。</span>`,
+        });
+        if (!ok) return;
+        try {
+          const res = await api.post('/api/panel/boot/cron', {});
+          toast(res.message);
+          await loadQuick();
+          paint();
+        } catch (err) { toast(err.message, 'err'); }
+        return;
+      }
+      if (actionId === 'cron-remove') {
+        const ok = await confirmDialog({
+          title: '移除 crontab 兜底', danger: true, confirmText: '移除',
+          message: '移除后容器重启将不再自动拉起守护（systemd 单元不受影响）。',
+        });
+        if (!ok) return;
+        try {
+          const res = await api.del('/api/panel/boot/cron');
+          toast(res.message);
+          await loadQuick();
+          paint();
+        } catch (err) { toast(err.message, 'err'); }
+        return;
+      }
+      if (actionId === 'guardian-repair') {
+        const ok = await confirmDialog({
+          title: '重装面板守护', confirmText: '重装',
+          message: `将按 <span class="mono">${esc(listen.host)}:${esc(listen.port)}</span>
+            重新生成启动脚本与开机自启项，并重启面板。`,
+        });
+        if (!ok) return;
+        try {
+          const res = await api.post('/api/panel/boot/guardian/repair', {});
+          toast(res.message);
+        } catch (err) { toast(err.message, 'err'); }
+        return;
+      }
+      await runPanelAction(actionId);
+    }
+
+    /** 守护 / 备份 / 日志 / 时区 / 监听 等面板级动作（体检卡片与卡片按钮共用）。 */
+    async function runPanelAction(action) {
+      if (busy) return;
+      if (action === 'boot-refresh') {
+        await loadQuick();
+        paint();
+        toast('已重新检测');
+        return;
+      }
+      if (action === 'guardian-restart') {
+        const ok = await confirmDialog({
+          title: '重启面板服务', confirmText: '重启',
+          message: '面板将在数秒内重启，登录态保持。当前页面会自动重连。',
+        });
+        if (!ok) return;
+        const before = hz?.build || hz?.version || '';
+        try {
+          await api.post('/api/panel/boot/guardian/restart', {});
+        } catch (err) { toast(err.message, 'err'); return; }
+        toast('重启指令已下发，等待恢复…');
+        const result = await waitForPanelRestart({ before });
+        if (result.ok) { toast('面板已恢复', 'ok'); location.reload(); }
+        else toast('面板未在预期时间内恢复，请查看 panel.log', 'err');
+        return;
+      }
+      if (action === 'cron-install' || action === 'cron-remove' || action === 'guardian-repair'
+          || action === 'copy-termux-script') {
+        await runBootAction(action);
+        return;
+      }
+      if (action === 'logs-trim') {
+        const ok = await confirmDialog({
+          title: '清理日志到上限', confirmText: '清理',
+          message: '面板日志与全部应用日志会被截断到各自上限的一半，历史输出不可恢复。',
+        });
+        if (!ok) return;
+        try {
+          const res = await api.post('/api/panel/logs/trim', {});
+          toast(res.message);
+          await loadQuick();
+          paint();
+        } catch (err) { toast(err.message, 'err'); }
+        return;
+      }
+      if (action === 'tz-apply') {
+        const zone = $('#tz-input').value.trim();
+        if (!zone) { toast('请填写时区', 'err'); return; }
+        const ntp = tz.ntp_supported ? $('#tz-ntp').checked : undefined;
+        const ok = await confirmDialog({
+          title: '切换时区', confirmText: '应用',
+          message: `将把服务器时区切换为 <b class="mono">${esc(zone)}</b>。
+            <span class="dim">日志时间戳口径会随之改变。</span>`,
+        });
+        if (!ok) return;
+        try {
+          const res = await api.post('/api/panel/timezone', { zone, enable_ntp: ntp });
+          toast(res.message);
+          tz = res.status;
+          await loadQuick();
+          paint();
+        } catch (err) { toast(err.message, 'err'); }
+        return;
+      }
+      if (action === 'listen-apply') {
+        const host = $('#listen-host').value.trim();
+        const port = Number($('#listen-port').value.trim());
+        if (!host || !port) { toast('地址与端口都不能为空', 'err'); return; }
+        const ok = await confirmDialog({
+          title: '变更监听地址并重启', danger: true, confirmText: '应用并重启',
+          phrase: 'RESTART',
+          message: `面板将改为监听 <b class="mono">${esc(host)}:${esc(port)}</b> 并立即重启。<br>
+            <span class="dim">本页面会断连数十秒，然后自动跳转到新地址；失败会自动回滚。</span>`,
+        });
+        if (!ok) return;
+        const ok2 = await applyListen(host, port, false);
+        if (!ok2) return;
+        return;
+      }
+      if (action === 'backup-now') {
+        try {
+          const res = await api.post('/api/panel/config/backup', {});
+          toast(res.message);
+          await loadQuick();
+          paint();
+        } catch (err) { toast(err.message, 'err'); }
+        return;
+      }
+      if (action === 'prefs-save') {
+        await savePrefs(collectPrefs(), '保存');
+        return;
+      }
+      if (action === 'import-pick') { $('#import-file').click(); }
+    }
+
+    async function applyListen(host, port, force) {
+      const before = hz?.build || hz?.version || '';
+      let res;
+      try {
+        res = await api.post('/api/panel/listen', { host, port, force });
+      } catch (err) {
+        if (err.status === 409) {
+          const ok = await confirmDialog({
+            title: '确认强制切换', danger: true, confirmText: '仍然切换',
+            message: `${esc(err.message)}<br><span class="dim">切换后请确保新地址可访问，否则将无法再进入面板。</span>`,
+          });
+          if (!ok) return false;
+          return applyListen(host, port, true);
+        }
+        toast(err.message, 'err');
+        return false;
+      }
+      if (!res.changed) { toast(res.message); return true; }
+      toast(`正在切换到 ${res.host}:${res.port}，等待面板恢复…`, 'warn');
+      const target = `http://${location.hostname}:${res.port}/healthz`;
+      const result = await waitForPanelRestart({ before, probeUrl: target, timeoutMs: 120000 });
+      if (result.ok) {
+        toast('新地址已就绪，正在跳转…', 'ok');
+        const scheme = location.protocol;
+        setTimeout(() => { location.href = `${scheme}//${location.hostname}:${res.port}/`; }, 1200);
+        return true;
+      }
+      toast(`面板未在新地址就绪，请手动访问 http://<服务器IP>:${res.port}/ 或按备份回滚`, 'err', 12000);
+      return false;
+    }
+
+    async function importConfig(file) {
+      const ok = await confirmDialog({
+        title: '导入配置', danger: true, confirmText: '导入',
+        message: `将用 <b class="mono">${esc(file.name)}</b> 覆盖当前配置（<b>密码与 Agent 令牌保持本机不变</b>）。
+          <span class="dim">导入前会自动生成一份就地备份。</span>`,
+      });
+      if (!ok) return;
+      const form = new FormData();
+      form.append('file', file);
+      try {
+        const res = await api.upload('/api/panel/config/import', form);
+        toast(res.message, 'ok', 8000);
+        await loadQuick();
+        paint();
+      } catch (err) { toast(err.message, 'err'); }
+    }
 
     root.onclick = async (event) => {
+      const tabBtn = event.target.closest('[data-settings-tab]');
+      if (tabBtn) {
+        tab = tabBtn.dataset.settingsTab;
+        localStorage.setItem('sp-settings-tab', tab);
+        if (tab === 'quick') {
+          try { await loadQuick(); } catch (err) { toast(err.message, 'err'); }
+        }
+        paint();
+        return;
+      }
+      const bootBtn = event.target.closest('[data-boot-action]');
+      if (bootBtn) { await runBootAction(bootBtn.dataset.bootAction); return; }
+
       const action = event.target.dataset?.act || event.target.closest('[data-act]')?.dataset.act;
       if (!action) return;
       if (action === 'mode-help') { showModeHelp(); return; }
-      if (action === 'terminal') navigate('terminal');
-      if (action === 'logout') { await api.post('/api/auth/logout', {}); location.reload(); }
+      if (action === 'terminal') { navigate('terminal'); return; }
+      if (action === 'logout') { await api.post('/api/auth/logout', {}); location.reload(); return; }
+      if (action === 'copy-termux') { copyText(bootInfo.termux_script, '已复制'); return; }
       if (action === 'reboot' || action === 'shutdown') {
         const label = action === 'reboot' ? '重启' : '关机';
         const ok = await confirmDialog({
@@ -2840,8 +3385,48 @@ serverpanel --show-mode          # 查看当前模式</div>
           const res = await api.post('/api/system/power', { action, confirm: 'CONFIRM' });
           toast(res.message, 'warn');
         } catch (err) { toast(err.message, 'err'); }
+        return;
+      }
+      // 下面的动作会整页重绘，先收集未保存的表单改动
+      const patch = collectPrefs();
+      if (['boot-refresh', 'guardian-restart', 'guardian-repair', 'cron-install', 'cron-remove',
+           'logs-trim', 'backup-now', 'import-pick', 'tz-apply', 'listen-apply'].includes(action)
+          && Object.keys(patch).length) {
+        const ok = await confirmDialog({
+          title: '有未保存的改动', confirmText: '先保存再继续',
+          message: `检测到 <b class="mono">${esc(Object.keys(patch).join('、'))}</b> 有改动尚未保存，
+            是否先保存？（选「取消」则放弃这些改动并继续当前操作）`,
+        });
+        if (ok) {
+          const saved = await savePrefs(patch);
+          if (!saved) return;
+        }
+      }
+      await runPanelAction(action);
+    };
+
+    root.onchange = async (event) => {
+      if (event.target.id === 'import-file' && event.target.files?.[0]) {
+        const file = event.target.files[0];
+        event.target.value = '';
+        await importConfig(file);
+      }
+      // 开关类即时保存：勾选后立刻落盘，避免"以为改了其实没提交"
+      if (event.target.dataset?.prefBool) {
+        const key = event.target.dataset.prefBool;
+        await savePrefs({ [key]: event.target.checked }, '保存');
       }
     };
+
+    if (tab === 'quick') {
+      try {
+        await loadQuick();
+      } catch (err) {
+        root.innerHTML = `<div class="card"><div class="empty">读取设置失败：${esc(err.message)}</div></div>`;
+        return null;
+      }
+    }
+    paint();
   },
 });
 

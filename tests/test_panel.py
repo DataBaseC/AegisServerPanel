@@ -1285,7 +1285,6 @@ def test_chmod_endpoint(authed, internal_mode, tmp_path):
     """权限修改：单文件、递归、非法值、受保护目录。"""
     if os.name != "posix":
         pytest.skip("chmod 语义测试仅 POSIX")
-
     target = tmp_path / "script.sh"
     target.write_text("#!/bin/sh\n", encoding="utf-8")
     r = authed.post("/api/files/chmod", json={"path": str(target), "mode": "750"})
@@ -1308,4 +1307,40 @@ def test_chmod_endpoint(authed, internal_mode, tmp_path):
                            json={"path": str(target), "mode": bad}).status_code == 400, bad
     # 受保护系统目录
     assert authed.post("/api/files/chmod", json={"path": "/etc", "mode": "777"}).status_code == 403
+
+
+def test_file_search_returns_metadata(authed, internal_mode, tmp_path):
+    """搜索：返回真实类型/大小/时间；带通配符按用户写法匹配；目录可搜到；无结果为空列表。"""
+    if os.name != "posix":
+        pytest.skip("GNU find 语义测试仅 POSIX")
+
+    d = tmp_path / "srch"
+    d.mkdir()
+    (d / "report_2024.txt").write_text("x" * 1234, encoding="utf-8")
+    sub = d / "logs"
+    sub.mkdir()
+    (sub / "app.log").write_text("line\n", encoding="utf-8")
+    (sub / "readme.md").write_text("hi", encoding="utf-8")
+
+    # 子串匹配 + 真实元数据
+    r = authed.get("/api/files/search", params={"path": str(d), "q": "report"})
+    assert r.status_code == 200, r.text
+    matches = r.json()["matches"]
+    assert len(matches) == 1
+    hit = matches[0]
+    assert hit["name"] == "report_2024.txt"
+    assert hit["is_dir"] is False and hit["size"] == 1234 and hit["mtime"] > 0, hit
+
+    # 通配符按用户写法（*.log 不应再被包成 **.log* 而误伤 readme.md）
+    names = [m["name"] for m in
+             authed.get("/api/files/search", params={"path": str(d), "q": "*.log"}).json()["matches"]]
+    assert names == ["app.log"]
+
+    # 目录能搜到且标记 is_dir
+    hits = authed.get("/api/files/search", params={"path": str(d), "q": "logs"}).json()["matches"]
+    assert any(m["is_dir"] and m["name"] == "logs" for m in hits)
+
+    # 无结果：空列表而不是报错
+    r = authed.get("/api/files/search", params={"path": str(d), "q": "no-such-keyword"})
+    assert r.status_code == 200 and r.json()["matches"] == []
 

@@ -370,14 +370,46 @@ async def search(path: str = "/", q: str = "", limit: int = 200):
     if not shell.available("find"):
         raise HTTPException(400, "本机缺少 find 命令")
     limit = max(1, min(limit, 1000))
-    result = await shell.run(
-        ["find", full, "-xdev", "-iname", f"*{q}*", "-not", "-path", "*/proc/*"],
-        timeout=40,
-    )
-    matches = [line for line in result.out.splitlines() if line][:limit]
-    return {"query": q, "root": full, "matches": [
-        {"path": m, "name": os.path.basename(m), "is_dir": os.path.isdir(m)} for m in matches
-    ], "truncated": len(matches) >= limit}
+    # 关键词里带通配符就按用户写的匹配（如 *.log），否则按"文件名包含关键词"匹配
+    pattern = q if any(ch in q for ch in "*?[") else f"*{q}*"
+    # timeout 保证超时时已搜到的部分结果还能拿到（shell.run 超时会丢掉全部输出）
+    cmd: list[str] = []
+    if os.name == "posix" and shutil.which("timeout"):
+        cmd += ["timeout", "25"]
+    cmd += [
+        "find", full, "-xdev",
+        "-path", "/proc", "-prune", "-o",
+        "-path", "/sys", "-prune", "-o",
+        "-path", "/dev", "-prune", "-o",
+        "-iname", pattern,
+        "-printf", "%y\t%T@\t%s\t%p\n",
+    ]
+    result = await shell.run(cmd, timeout=35)
+
+    note = ""
+    if result.code == 124:
+        note = "搜索超时，结果可能不完整（换更具体的目录或关键词会更快）"
+    elif result.code == -1 and result.err:
+        note = result.err
+    elif not result.out and result.err and result.code not in (0, 1):
+        note = result.err
+
+    matches: list[dict] = []
+    for line in (result.out or "").splitlines():
+        parts = line.split("\t", 3)
+        if len(parts) != 4 or not parts[3]:
+            continue
+        ftype, mtime, size, p = parts
+        try:
+            mtime, size = int(float(mtime)), int(float(size))
+        except ValueError:
+            mtime, size = 0, 0
+        matches.append({"path": p, "name": os.path.basename(p),
+                        "is_dir": ftype == "d", "size": size, "mtime": mtime})
+        if len(matches) >= limit:
+            break
+    return {"query": q, "root": full, "matches": matches,
+            "truncated": len(matches) >= limit, "note": note}
 
 
 @router.get("/usage")

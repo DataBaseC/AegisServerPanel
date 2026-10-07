@@ -1970,19 +1970,33 @@ registerView('files', {
       load(cwd);
     }
 
-    async function doSearch() {
+    async function doSearch(rootOverride) {
       const keyword = $('#file-search').value.trim();
       if (!keyword) { load(cwd); return; }
+      const target = rootOverride || cwd;
+      const btn = $('[data-act="search"]');
+      if (btn) btn.disabled = true;
+      $('#file-meta').textContent = `正在搜索「${keyword}」…（大目录可能要几十秒）`;
       try {
-        const data = await api.get(`/api/files/search?path=${encodeURIComponent(cwd)}&q=${encodeURIComponent(keyword)}&limit=300`);
+        const data = await api.get(`/api/files/search?path=${encodeURIComponent(target)}&q=${encodeURIComponent(keyword)}&limit=300`);
         $('#file-crumbs').innerHTML = `<span class="dim">搜索结果</span>`;
-        $('#file-meta').textContent = `在 ${data.root} 下找到 ${data.matches.length} 项${data.truncated ? '（已截断）' : ''}`;
-        entries = data.matches.map((m) => ({
-          name: m.name, path: m.path, is_dir: m.is_dir, is_link: false,
-          size: 0, mode: '', uid: '', gid: '', mtime: 0,
-        }));
+        $('#file-meta').textContent = `在 ${data.root} 下找到 ${data.matches.length} 项`
+          + (data.truncated ? '（已截断）' : '')
+          + (data.note ? ` · ${data.note}` : '');
+        entries = data.matches;
+        selected.clear();
+        paintBatch();
         renderTable();
-      } catch (err) { toast(err.message, 'err'); }
+        if (!entries.length && target !== '/') {
+          $('#file-table').innerHTML = `<div class="empty">当前目录下没有匹配项
+            <div style="margin-top:10px"><button class="btn sm" data-act="search-root">改在全盘 / 下搜索</button></div></div>`;
+        }
+      } catch (err) {
+        toast(err.message, 'err');
+        $('#file-meta').textContent = '';
+      } finally {
+        if (btn) btn.disabled = false;
+      }
     }
 
     async function doChmod(entry) {
@@ -2066,6 +2080,7 @@ registerView('files', {
       if (action === 'up') load(cwd.replace(/\/[^/]+\/?$/, '') || '/');
       if (action === 'refresh') load(cwd);
       if (action === 'search') doSearch();
+      if (action === 'search-root') doSearch('/');
       if (action === 'open' && entry) load(entry.path);
       if (action === 'edit' && entry) openEditor(entry);
       if (action === 'preview' && entry) openPreview(entry);

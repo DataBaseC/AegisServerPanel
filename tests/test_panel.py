@@ -1150,7 +1150,7 @@ def test_write_mtime_conflict_guard(authed, internal_mode, tmp_path):
 
     # 模拟其他会话/进程在这期间改了文件（+10 秒保证 mtime 变化跨越精度误差）
     target.write_text("v2", encoding="utf-8")
-    os.utime(target, (mtime + 10, mtime + 10))
+    os.utime(target, ns=(mtime + 10_000_000_000, mtime + 10_000_000_000))
 
     r = authed.post("/api/files/write",
                     json={"path": str(target), "content": "v3", "expected_mtime": mtime})
@@ -1345,4 +1345,120 @@ def test_file_search_returns_metadata(authed, internal_mode, tmp_path):
     # 无结果：空列表而不是报错
     r = authed.get("/api/files/search", params={"path": str(d), "q": "no-such-keyword"})
     assert r.status_code == 200 and r.json()["matches"] == []
+
+
+# ---------- 乐观锁双精度 + 日志白名单覆盖面（外包补丁验收回归） ----------
+
+def test_write_expected_mtime_accepts_ns_and_seconds(authed, internal_mode, tmp_path):
+    """乐观锁纳秒化后仍要接受秒级时间戳，否则旧前端/外部脚本保存永远 409。"""
+    target = tmp_path / "dual.txt"
+    assert authed.post("/api/files/write", json={"path": str(target), "content": "v1"}).status_code == 200
+    mtime_ns = authed.get("/api/files/read", params={"path": str(target)}).json()["mtime"]
+    assert mtime_ns > 10 ** 15, "read 应返回纳秒"
+
+    # 纳秒精度：原值放行
+    r = authed.post("/api/files/write", json={"path": str(target), "content": "v2",
+                                             "expected_mtime": mtime_ns})
+    assert r.status_code == 200, r.text
+
+    # 秒级精度：同秒内应视作"没变"而放行（老客户端）
+    mtime_s = mtime_ns // 1_000_000_000
+    r = authed.post("/api/files/write", json={"path": str(target), "content": "v3",
+                                             "expected_mtime": mtime_s})
+    assert r.status_code == 200, f"秒级 expected_mtime 应被接受，实际 {r.status_code} {r.text}"
+
+    # 秒级但已经过期：仍必须拒绝
+    r = authed.post("/api/files/write", json={"path": str(target), "content": "v4",
+                                             "expected_mtime": mtime_s - 120})
+    assert r.status_code == 409, r.text
+
+
+def test_write_mtime_out_of_range_still_409(authed, internal_mode, tmp_path):
+    """磁盘 mtime 越界（异常文件系统/写坏的时间戳）时必须仍是 409，不能 500。"""
+    target = tmp_path / "weird.txt"
+    assert authed.post("/api/files/write", json={"path": str(target), "content": "v1"}).status_code == 200
+    stale = authed.get("/api/files/read", params={"path": str(target)}).json()["mtime"] - 10 ** 9
+    max_ns = 2 ** 63 - 1
+    try:
+        os.utime(target, ns=(max_ns, max_ns))
+    except (OSError, OverflowError, ValueError):  # pragma: no cover - 平台不支持
+        pytest.skip("本平台不支持把 mtime 设到 int64 上限")
+
+    r = authed.post("/api/files/write", json={"path": str(target), "content": "v2",
+                                             "expected_mtime": stale})
+    assert r.status_code == 409, f"越界 mtime 必须是 409（不是 500），实际 {r.status_code}"
+    assert target.read_text(encoding="utf-8") == "v1", "拒绝时不能动磁盘内容"
+
+
+def test_prefs_reject_sensitive_log_dirs(authed, internal_mode, tmp_path):
+    """写 prefs 时敏感/隐藏目录必须被拒（原有防线，防止被后续改动绕过）。"""
+    hidden = tmp_path / ".ssh"
+    hidden.mkdir()
+    for bad in ([str(hidden)], ["/etc/ssh"], ["/root"], ["/"]):
+        r = authed.put("/api/panel/prefs", json={"values": {"security.log_dirs": bad}})
+        assert r.status_code == 400, f"{bad} 应被拒，实际 {r.status_code}"
+        assert "日志白名单" in r.text
+
+    good = tmp_path / "logs"
+    good.mkdir()
+    r = authed.put("/api/panel/prefs", json={"values": {"security.log_dirs": [str(good)]}})
+    assert r.status_code == 200, r.text
+
+
+def test_import_config_cannot_inject_sensitive_log_dirs(authed, internal_mode, tmp_path):
+    """配置导入是整体替换 config.data，会绕过 prefs 层 —— 同一道白名单自检必须在这也生效。"""
+    import io
+    import zipfile
+
+    hidden = tmp_path / ".ssh"
+    hidden.mkdir()
+    (hidden / "id_rsa").write_text("SECRET", encoding="utf-8")
+
+    def import_with(log_dirs):
+        payload = dict(config_mod.config.data)
+        payload["log_dirs"] = log_dirs
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("config.json", json.dumps(payload, ensure_ascii=False))
+        return authed.post("/api/panel/config/import",
+                           files={"file": ("cfg.zip", buf.getvalue(), "application/zip")})
+
+    before = list(config_mod.config.log_dirs)
+    try:
+        r = import_with([str(hidden)])
+        assert r.status_code == 400, f"导入隐藏目录应被拒，实际 {r.status_code} {r.text}"
+        assert "日志白名单" in r.text
+        assert list(config_mod.config.log_dirs) == before, "被拒的导入不能改动配置"
+
+        # 兜底：即使绕过上面两道，读取时也必须拒绝 —— 直接改内存态模拟"白名单已被污染"
+        config_mod.config.data["log_dirs"] = [str(hidden)]
+        r = authed.get("/api/logs/file", params={"path": str(hidden / "id_rsa")})
+        assert r.status_code == 403, f"白名单被污染时读取必须 403，实际 {r.status_code}"
+
+        # 正常日志目录仍要能读（别把功能一起堵死）
+        good = tmp_path / "logs"
+        good.mkdir()
+        (good / "app.log").write_text("hello\n", encoding="utf-8")
+        r = import_with([str(good)])
+        assert r.status_code == 200, r.text
+        r = authed.get("/api/logs/file", params={"path": str(good / "app.log")})
+        assert r.status_code == 200 and "hello" in r.json()["content"]
+    finally:
+        config_mod.config.data["log_dirs"] = before
+
+
+def test_registry_keeps_previous_on_wrong_shape_json(tmp_path):
+    """注册表被写成合法 JSON 但结构不对时，也要保留上一份，别把托管应用变孤儿。"""
+    from app.apps import Registry
+
+    path = tmp_path / "apps.json"
+    path.write_text(json.dumps({"apps": [{"id": "a1", "name": "a1", "command": "sleep 1"}]}),
+                    encoding="utf-8")
+    reg = Registry(path)
+    assert [a["id"] for a in reg.all()] == ["a1"]
+
+    for broken in ('"just-a-string"', '{"other": 1}', "[1, 2, 3]"):
+        path.write_text(broken, encoding="utf-8")
+        reg.load()
+        assert [a["id"] for a in reg.all()] == ["a1"], f"{broken} 不应清空注册表"
 

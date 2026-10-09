@@ -428,6 +428,19 @@ async def import_config(file: UploadFile = File(...),
     incoming_prefs = merged.get("prefs")
     if incoming_prefs is not None and not isinstance(incoming_prefs, dict):
         raise HTTPException(400, "prefs 字段格式不对")
+    # 日志白名单（顶层 legacy 键与 prefs 命名空间都要过）：导入是整体替换 config.data，
+    # 绕过了 prefs 层，若不在这里校验，一份带 log_dirs=/etc/ssh 的配置就能把公网
+    # 只读用户的读取边界推开 —— 正是 PUT /api/panel/prefs 那道自检要防的事
+    log_dir_candidates = []
+    if "log_dirs" in merged:
+        log_dir_candidates.append(merged["log_dirs"])
+    if isinstance(incoming_prefs, dict) and "security.log_dirs" in incoming_prefs:
+        log_dir_candidates.append(incoming_prefs["security.log_dirs"])
+    for candidate in log_dir_candidates:
+        try:
+            boot_mod.assert_log_dirs_ok(candidate)
+        except PrefsError as exc:
+            raise HTTPException(400, f"配置里的 log_dirs 不合法：{exc}")
 
     backup = _write_backup("import")
     applied: list[str] = []

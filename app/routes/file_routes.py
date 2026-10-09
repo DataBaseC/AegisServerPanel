@@ -41,6 +41,9 @@ FETCH_CHUNK = 256 * 1024
 FETCH_MAX_BYTES = 1024 * 1024 * 1024  # 单个远程文件上限 1GB
 FETCH_TIMEOUT = 30                    # 远程拉取的连接/读超时（秒）
 OCTAL_RE = re.compile(r"^[0-7]{3,4}$")
+# 乐观锁时间戳的精度分界：小于该值视作秒级（1e12 秒 = 公元 33658 年，
+# 1e12 纳秒 = 1970-01-01 之后 1000 秒），两种情况都不会误判
+NS_THRESHOLD = 10 ** 12
 
 # 压缩包识别：按扩展名（前缀匹配 tar 的多级后缀）
 ARCHIVE_SUFFIXES = (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz2", ".txz", ".tar", ".zip")
@@ -226,10 +229,21 @@ async def write_file(body: WriteBody):
     if len(body.content.encode()) > EDIT_LIMIT:
         raise HTTPException(413, "内容过大，请改用上传方式")
     if body.expected_mtime is not None and os.path.exists(full):
-        # 纳秒精度乐观锁：秒级精度下同秒内外部修改检测不到（st_mtime 只有秒级时更糟）
+        # 乐观锁取纳秒（秒级精度下同秒内外部修改检测不到），但**双精度接受**：
+        # 外部脚本 / Agent / 浏览器缓存的旧前端仍可能传秒级时间戳，
+        # 只按纳秒比对会让它们的保存永远 409。
         current = os.stat(full).st_mtime_ns
-        if current != body.expected_mtime:
-            when = time.strftime("%H:%M:%S", time.localtime(current / 1e9))
+        expected = body.expected_mtime
+        if expected < NS_THRESHOLD:  # < 1e12 视作秒级时间戳
+            stale = current // 1_000_000_000 != expected
+        else:
+            stale = current != expected
+        if stale:
+            try:
+                when = time.strftime("%H:%M:%S", time.localtime(current / 1e9))
+            except (OSError, OverflowError, ValueError):
+                # 磁盘 mtime 越界（异常文件系统 / 被写坏的时间戳）不能让 409 变 500
+                when = "未知时间"
             raise HTTPException(409, f"文件在编辑期间已被修改（磁盘版本更新于 {when}），"
                                      f"直接保存会覆盖它")
 

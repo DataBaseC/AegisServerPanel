@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from .. import shell
 from ..auth import require_auth
 from ..config import config
+from ..utils import log_dir_reason
 
 router = APIRouter(prefix="/api/logs", tags=["logs"], dependencies=[Depends(require_auth)])
 
@@ -26,7 +27,10 @@ def _allowed_log_path(path: str) -> bool:
     real = os.path.realpath(os.path.abspath(path))
     for d in config.log_dirs:
         if real == d or real.startswith(os.path.join(d, "")):  # join(d,"") 补全目录分隔符
-            return True
+            # 兜底再判一次白名单目录本身是否安全：白名单未必经面板写入
+            # （配置导入会整体替换 config.data，也可能有人手工改了 config.json），
+            # 只靠写入时校验会漏。敏感/隐藏目录一律不认。
+            return log_dir_reason(d) is None
     return False
 
 

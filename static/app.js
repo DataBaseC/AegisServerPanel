@@ -2603,7 +2603,12 @@ function formDialog({ title, fields, confirmText = '确定', note = '' }) {
     foot.className = 'row';
     foot.innerHTML = `<button class="btn" data-cancel>取消</button>
       <button class="btn primary" data-ok>${esc(confirmText)}</button>`;
-    const modal = openModal({ title, body, footer: foot, size: 'narrow' });
+    // ESC 必须走「取消」把 Promise resolve 掉，否则 await formDialog(...) 永久悬挂，
+    // 调用方（编辑常驻应用 / 填参数运行 / 删除确认）的后续刷新永远不会执行
+    const modal = openModal({
+      title, body, footer: foot, size: 'narrow',
+      onEscape: () => { modal.close(); resolve(null); },
+    });
     const inputs = $$('[data-field]', modal.body);
     setTimeout(() => inputs[0]?.focus(), 30);
     const finish = (value) => { modal.close(); resolve(value); };

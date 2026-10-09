@@ -26,6 +26,7 @@ from pathlib import Path
 
 from .config import config
 from .prefs import PrefsError, prefs
+from .utils import log_dir_reason
 
 SUPERVISOR_NAME = "panel-supervisor.sh"
 TERMUX_PREFIX = Path("/data/data/com.termux/files/usr")
@@ -633,34 +634,27 @@ def apply_listen(host: str | None = None, port: int | None = None) -> dict:
     }
 
 
+def assert_log_dirs_ok(candidate) -> list[str]:
+    """校验一组日志白名单目录，返回规范化后的路径；不安全时抛 PrefsError。
+
+    写 prefs（``set_pref_with_check``）与配置导入（``/api/panel/config/import``）
+    都必须走这里 —— 导入是整体替换 config.data，绕过 prefs 层，
+    只把校验挂在 prefs 上会留下一条把 /etc/ssh 写进白名单的路。
+    """
+    try:
+        dirs = [os.path.realpath(os.path.abspath(str(d))) for d in
+                (candidate if isinstance(candidate, list) else [candidate])]
+    except OSError as exc:
+        raise PrefsError(f"日志目录解析失败：{exc}")
+    for d in dirs:
+        reason = log_dir_reason(d)
+        if reason:
+            raise PrefsError(reason)
+    return dirs
+
+
 def set_pref_with_check(patch: dict) -> dict:
     """带自检的 prefs 写入（供路由复用）：写日志白名单前先确认仍拒绝敏感路径。"""
     if "security.log_dirs" in patch:
-        candidate = patch["security.log_dirs"]
-        try:
-            dirs = [os.path.realpath(os.path.abspath(str(d))) for d in
-                    (candidate if isinstance(candidate, list) else [candidate])]
-        except OSError as exc:
-            raise PrefsError(f"日志目录解析失败：{exc}")
-        # 敏感目录：白名单目录与它们存在任意包含关系（等于、在其内部、或把它包进来）
-        # 都拒绝。否则把 /etc/ssh、/root/.ssh、面板配置目录放进白名单后，
-        # 公网只读模式的登录用户就能经日志接口读到私钥和面板密码哈希/令牌。
-        sensitive = (
-            "/etc", "/root", "/proc", "/sys", "/dev", "/run", "/boot",
-            "/var/lib", "/var/backups",
-        )
-        for d in dirs:
-            # 隐藏目录（.ssh / .aws / .config / .gnupg …）一律拒绝
-            if any(part.startswith(".") for part in d.split(os.sep) if part):
-                raise PrefsError(f"不能把隐藏目录加入日志白名单：{d}")
-            for probe in sensitive:
-                real = os.path.realpath(probe)
-                if (d == real or d.startswith(real + os.sep)
-                        or real.startswith(d + os.sep)):
-                    raise PrefsError(
-                        f"不能把 {d} 加入日志白名单：它与敏感目录 {probe} 存在包含关系")
-        for probe in ("/", "/usr"):
-            real = os.path.realpath(probe)
-            if any(d == real for d in dirs):
-                raise PrefsError(f"不能把系统关键目录加入日志白名单：{probe}")
+        assert_log_dirs_ok(patch["security.log_dirs"])
     return prefs.update(patch)

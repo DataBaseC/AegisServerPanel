@@ -118,8 +118,16 @@ class Registry:
                 if isinstance(raw, dict):
                     raw = raw.get("apps")
                 if isinstance(raw, list):
-                    apps = [a for a in raw if isinstance(a, dict) and a.get("id")]
-            except (OSError, json.JSONDecodeError):
+                    cleaned = [a for a in raw if isinstance(a, dict) and a.get("id")]
+                    if raw and not cleaned:
+                        # 非空但一条都认不出来：结构已被写坏，按读取失败处理
+                        raise ValueError("注册表条目结构异常")
+                    apps = cleaned
+                else:
+                    # 合法 JSON 但结构不对（"str" / {"other":1} / 被截断成 dict）：
+                    # 一样当作读取失败处理，否则同样会把守护中的进程全变成孤儿
+                    raise ValueError(f"注册表结构异常：{type(raw).__name__}")
+            except (OSError, json.JSONDecodeError, ValueError):
                 # 读失败/文件损坏时保留上一份注册表：置空会让正在运行的托管应用
                 # 瞬间失去管理（Supervisor.list 会把不在注册表的 runtime 丢弃），
                 # 一次瞬时 IO 失败就不该把守护中的进程全变成孤儿
@@ -140,6 +148,11 @@ class Registry:
                 return False
             self._load_unlocked()
         return True
+
+    def load(self) -> None:
+        """无条件重读注册表（测试与显式刷新用）。"""
+        with self._lock:
+            self._load_unlocked()
 
     def all(self) -> list[dict]:
         self.reload_if_changed()

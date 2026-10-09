@@ -240,10 +240,15 @@ async def terminal_socket(websocket: WebSocket):
         if process.returncode is None:
             try:
                 # shell 已 setsid 成会话首进程：收尾要 TERM 整个进程组，
-                # 否则用户在终端里跑的前台/后台程序会脱离管理继续存活
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                # 否则用户在终端里跑的前台/后台程序会脱离管理继续存活。
+                # killpg/getpgid 只在 POSIX 存在（同 apps.py / manage.py 的写法），
+                # 缺了就退回单进程终止，别让 AttributeError 跳过下面的 websocket.close()
+                if hasattr(os, "killpg") and hasattr(os, "getpgid"):
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                else:  # pragma: no cover - 非 POSIX 平台（PTY 门禁之外的双保险）
+                    process.terminate()
                 await asyncio.wait_for(process.wait(), timeout=3)
-            except (ProcessLookupError, PermissionError, asyncio.TimeoutError):
+            except (ProcessLookupError, PermissionError, asyncio.TimeoutError, OSError):
                 try:
                     process.kill()
                 except ProcessLookupError:

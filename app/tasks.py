@@ -175,12 +175,20 @@ TASKS: tuple[Task, ...] = (
     Task(
         id="panel-status", group="面板", title="面板运行状态",
         description="版本、模式、健康检查、守护进程",
-        # 端口不写死（面板可能改过监听端口）：从监听套接字现探测面板进程的端口
+        # 端口不写死（面板可能改过监听端口）：先按 ingest 时记录的 install.json
+        # 取权威端口，取不到再退回 ss 现探测（最小镜像无 ss / 无 -p 权限 / PRoot 下都会失败，
+        # 且 `ss | grep python` 可能命中无关进程，所以只作兜底）
         command="serverpanel --status 2>&1 | head -40; "
                 "echo; echo '== healthz =='; "
+                "C=${SERVERPANEL_CONFIG:-/etc/serverpanel/config.json}; "
+                "[ -f \"$C\" ] || C=\"$HOME/.config/serverpanel/config.json\"; "
+                "M=$(dirname \"$C\")/install.json; "
+                "P=$(sed -n 's/.*\"port\"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p' \"$M\" 2>/dev/null | head -1); "
+                "if [ -z \"$P\" ]; then "
                 "P=$(ss -lntpH 2>/dev/null | grep -iE 'python|uvicorn' | grep -oE ':[0-9]+ ' | head -1 | tr -d ': '); "
+                "fi; "
                 "[ -n \"$P\" ] && curl -sS --max-time 5 \"http://127.0.0.1:$P/healthz\" "
-                "|| echo '（未能探测到面板监听端口）'; echo",
+                "|| echo '（未能确定面板监听端口：install.json 未记录，ss 探测也失败）'; echo",
         timeout=60,
     ),
     Task(

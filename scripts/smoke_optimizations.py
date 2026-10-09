@@ -185,10 +185,16 @@ def main():
         check("11. read 返回纳秒 mtime", st == 200 and mtime_ns > 10**15, f"mtime={mtime_ns}")
         st, d = call("POST", "/api/files/write", {"path": f"{WORK}/edit.txt", "content": "v2", "expected_mtime": mtime_ns})
         check("12. 乐观锁正确放行（未改过）", st == 200, f"status={st}")
+        # 秒级兼容：必须拿**写完之后**的 mtime 再折算成秒，否则跨秒就会变成"真的改了"
+        st, d = call("GET", f"/api/files/read?path={WORK}/edit.txt")
+        fresh_s = d.get("mtime", 0) // 10**9
         st, d = call("POST", "/api/files/write",
-                     {"path": f"{WORK}/edit.txt", "content": "v2b",
-                      "expected_mtime": mtime_ns // 10**9})
+                     {"path": f"{WORK}/edit.txt", "content": "v2b", "expected_mtime": fresh_s})
         check("12b. 秒级 expected_mtime 仍被接受（旧客户端兼容）", st == 200,
+              f"status={st} expected_s={fresh_s} {d.get('detail','')[:60]}")
+        st, d = call("POST", "/api/files/write",
+                     {"path": f"{WORK}/edit.txt", "content": "v2c", "expected_mtime": fresh_s - 120})
+        check("12c. 过期的秒级 expected_mtime 仍被拒（409）", st == 409,
               f"status={st} {d.get('detail','')[:60]}")
         with open(f"{WORK}/edit.txt", "w") as fh:
             fh.write("v3-external")

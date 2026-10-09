@@ -677,7 +677,8 @@ serverpanel --host 0.0.0.0 --port 8787 --ssl-certfile /path/cert.pem --ssl-keyfi
   - 进程详情在公网模式不再返回 `environ`；`/setup` 抢注原子化；登录失败锁定覆盖改密码；`trust_proxy` 时 Cookie 加 `Secure`；`mount`/`umount` 加 `--` 防参数注入；`exec` 超时校验链式化 + 命令限长 64KB
 - **前端**：补齐缺失的 `api.put`（此前「保存快捷设置 / 编辑常驻应用」必然报错）；视图代际 token + slot 隔离消除切换竞态；11 处轮询改可见性感知（后台标签页不再打接口）；`fetch` 超时兜底与断网横幅；终端 WebSocket 指数退避；日志过滤防抖 + 渲染上限；对话框 ESC 会正确 resolve；保存按钮防连点
 - **破坏性变更**：`/api/files/read` 返回的 `mtime` 由秒改为**纳秒**；`POST /api/files/write` 的 `expected_mtime` **同时接受纳秒与秒级**（小于 10¹² 视作秒），旧前端与外部脚本无需改动
-- **验证**：`python -m pytest`（59 用例全绿）+ `python3 scripts/smoke_optimizations.py`（起真服务走 HTTP，18 项）+ `node --check static/app.js`
+- **验证**：`python -m pytest`（64 用例；开发机 57 passed / 7 skipped）+ `python3 scripts/smoke_optimizations.py`（起真服务走 HTTP，21 项，**部署机 aarch64/PRoot 实测 21/21**）+ `bash scripts/verify-apps.sh`（常驻应用生命周期，**部署机 6/6**）+ `node --check static/app.js`
+  > 注意：完整 pytest 请放在开发机或 Linux CI 上跑。在 Android + PRoot 这类设备上跑容易卡在任务执行路径并把面板拖慢（详见 `SERVER_ACCESS.md`）。
 
 ### 1.2.0
 

@@ -2,7 +2,7 @@
 
 import sys
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 # Pydantic 在运行时求值 `X | None` 形式的注解，Python 3.10 以下在导入阶段即崩溃。
 # 门禁必须放在任何第三方 import 之前（本文件是包的入口）。

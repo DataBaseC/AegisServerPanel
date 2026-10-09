@@ -23,3 +23,7 @@ panel-supervisor.sh
 
 # 升级锁文件（flock 持有期间保留，进程退出后遗留也不该挡住下次升级）
 update.lock
+
+# 部署版本标记（/healthz 的 build 字段读它；每次部署本机重写，
+# 不进版本库，否则 `serverpanel --update` 会因为"仓库有本地改动"被挡住）
+VERSION

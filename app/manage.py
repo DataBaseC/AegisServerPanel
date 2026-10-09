@@ -642,12 +642,12 @@ def _print_apps() -> int:
         return 0
     running = {name: pid for pid, name in _running_app_processes()}
     print(f"注册表: {apps_mod.supervisor.registry.path}")
-    print(f"{'名称':<20}{'状态':<12}{'PID':<8}{'自启':<6}{'重启':<10}命令")
+    print(f"{'名称':<20}{'状态':<12}{'PID':<8}{'自启':<6}{'重启':<12}命令")
     for app in entries:
         name = apps_mod.a_name(app)
         pid = running.get(name)
         print(f"{name:<20}{('运行中' if pid else '未运行'):<12}{str(pid or '-'):<8}"
-              f"{('是' if app.get('autostart') else '否'):<6}{app.get('restart', '-'):<10}"
+              f"{('是' if app.get('autostart') else '否'):<6}{app.get('restart', '-'):<12}"
               f"{app.get('command', '')[:60]}")
     return 0
 

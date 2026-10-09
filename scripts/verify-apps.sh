@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 常驻应用验收脚本：在目标服务器（192.168.3.43 / 任意部署机）本机执行。
+# 常驻应用验收脚本：在目标服务器（部署机）本机执行。
 #
 #   bash scripts/verify-apps.sh [应用目录，默认 /root/aegis/AegisServerPanel]
 #
@@ -55,7 +55,8 @@ pass "注册写入完成（失败会直接退出）"
 echo "==> 2/4 启动并确认进程独立运行"
 serverpanel --apps start "$NAME" >/dev/null 2>&1 && pass "启动命令已执行" || fail "启动失败"
 sleep 2
-PID="$(serverpanel --apps list | awk -v n="$NAME" '$1==n {print $2}')"
+# 列表列序：名称 / 状态 / PID / 自启 / 重启 / 命令 —— PID 在第 3 列
+PID="$(serverpanel --apps list | awk -v n="$NAME" '$1==n {print $3}')"
 if [ -n "${PID:-}" ] && [ "$PID" != "-" ] && [ -d "/proc/$PID" ]; then
   pass "应用正在运行（PID $PID）"
   PGID="$(ps -o pgid= -p "$PID" | tr -d ' ')"

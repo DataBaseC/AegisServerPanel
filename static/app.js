@@ -821,7 +821,12 @@ registerView('overview', {
       try {
         const data = await api.get('/api/system/network');
         const rows = data.interfaces.filter((i) => i.name !== 'lo');
-        $('#ov-nets').innerHTML = rows.length ? `
+        // 容器 / Android（PRoot）会屏蔽 /proc/net/dev，计数读不到时后端只报 0 并给出原因，
+        // 这里把原因显示出来，免得用户以为是"真的没流量"
+        const note = (data.degraded || []).length
+          ? `<div class="dim" style="font-size:12px;margin-top:6px">本机限制了部分网络计数：${esc(data.degraded.join('；'))}</div>`
+          : '';
+        $('#ov-nets').innerHTML = (rows.length ? `
           <table class="data"><thead><tr><th>接口</th><th>地址</th><th>状态</th><th class="num">接收</th><th class="num">发送</th></tr></thead>
           <tbody>${rows.map((i) => {
             const v4 = i.addresses.find((a) => a.family === '2' && !a.address.startsWith('127.'));
@@ -829,7 +834,7 @@ registerView('overview', {
               <td class="cell-main">${esc(v4 ? v4.address : '-')}</td>
               <td><span class="badge ${i.up ? 'ok' : 'danger'}">${i.up ? '已启用' : '已关闭'}</span></td>
               <td class="num">${bytes(i.bytes_recv)}</td><td class="num">${bytes(i.bytes_sent)}</td></tr>`;
-          }).join('')}</tbody></table>` : '<div class="empty">无网络接口</div>';
+          }).join('')}</tbody></table>` : '<div class="empty">无网络接口</div>') + note;
       } catch (err) { /* 忽略 */ }
     }
 
@@ -1317,14 +1322,18 @@ registerView('storage', {
     async function loadOverview() {
       try {
         const data = await api.get('/api/storage/overview');
-        $('#st-parts').innerHTML = data.partitions.length ? data.partitions.map((p) => `
+        // 容器 / Android 可能读不到分区表与块设备计数，后端降级为 0 并给原因
+        const pnote = (data.degraded || []).length
+          ? `<div class="dim" style="font-size:12px;margin-top:6px">本机限制了部分存储信息：${esc(data.degraded.join('；'))}</div>`
+          : '';
+        $('#st-parts').innerHTML = (data.partitions.length ? data.partitions.map((p) => `
           <div class="card" style="background:var(--panel-2)">
             <div class="metric-label">${esc(p.mountpoint)}</div>
             <div class="metric-value" style="font-size:22px">${p.percent !== null ? `${p.percent.toFixed(0)}%` : '-'}</div>
             ${p.percent !== null ? bar(p.percent) : ''}
             <div class="metric-sub">${esc(p.device)}<br>${esc(p.fstype)}</div>
             <div class="metric-sub">已用 ${bytes(p.used)} / ${bytes(p.total)} · 可用 ${bytes(p.free)}</div>
-          </div>`).join('') : '<div class="empty">未检测到可用的磁盘分区（容器环境常见）</div>';
+          </div>`).join('') : '<div class="empty">未检测到可用的磁盘分区（容器环境常见）</div>') + pnote;
 
         const io = data.disks.filter((d) => !d.name.startsWith('loop') && !d.name.startsWith('ram'));
         $('#st-block').innerHTML = `

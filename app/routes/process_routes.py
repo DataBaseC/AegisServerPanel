@@ -49,7 +49,7 @@ def _process_row(proc: psutil.Process) -> dict:
         mem = proc.memory_info()
         try:
             create_time = int(proc.create_time())
-        except psutil.Error:
+        except (psutil.Error, OSError):
             create_time = 0
         return {
             "pid": proc.pid,
@@ -75,7 +75,7 @@ async def list_processes(sort: str = "cpu", limit: int = 60, q: str = "", user: 
         for proc in psutil.process_iter():
             try:
                 proc.cpu_percent(interval=None)
-            except psutil.Error:
+            except (psutil.Error, OSError):
                 continue
 
         rows = []
@@ -106,15 +106,15 @@ async def process_detail(pid: int):
             detail = _process_row(proc)
             try:
                 detail["cwd"] = proc.cwd()
-            except psutil.Error:
+            except (psutil.Error, OSError):
                 detail["cwd"] = None
             try:
                 detail["exe"] = proc.exe()
-            except psutil.Error:
+            except (psutil.Error, OSError):
                 detail["exe"] = None
             try:
                 detail["open_files"] = [f.path for f in proc.open_files()][:50]
-            except psutil.Error:
+            except (psutil.Error, OSError):
                 detail["open_files"] = []
             try:
                 detail["connections"] = [
@@ -124,14 +124,14 @@ async def process_detail(pid: int):
                      "status": c.status}
                     for c in proc.net_connections()
                 ][:50]
-            except psutil.Error:
+            except (psutil.Error, OSError):
                 detail["connections"] = []
             # 进程环境变量里常见 DATABASE_URL、API key 之类密钥：
             # 只在内网模式返回，公网只读模式登录用户看不到（防信息泄露）
             if config.mode == MODE_INTERNAL:
                 try:
                     detail["environ"] = dict(list(proc.environ().items())[:40])
-                except psutil.Error:
+                except (psutil.Error, OSError):
                     detail["environ"] = {}
             return detail
         except psutil.NoSuchProcess:

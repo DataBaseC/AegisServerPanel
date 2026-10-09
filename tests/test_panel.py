@@ -1462,3 +1462,40 @@ def test_registry_keeps_previous_on_wrong_shape_json(tmp_path):
         reg.load()
         assert [a["id"] for a in reg.all()] == ["a1"], f"{broken} 不应清空注册表"
 
+
+def test_views_survive_psutil_permission_errors(authed, internal_mode, monkeypatch):
+    """Android / PRoot 会把内核 PermissionError 原样抛出（不是 psutil.Error）。
+
+    实测设备：/proc/net/dev、/proc/net/tcp、/sys/block、/proc/filesystems、/sys/class/power_supply
+    都会这样报错。这类平台限制不能变成 500，视图必须降级可用。
+    """
+    import psutil
+
+    def deny(*_args, **_kwargs):
+        raise PermissionError(13, "Permission denied", "/proc/net/dev")
+
+    monkeypatch.setattr(psutil, "net_io_counters", deny)
+    monkeypatch.setattr(psutil, "net_if_stats", deny)
+    monkeypatch.setattr(psutil, "net_connections", deny)
+    monkeypatch.setattr(psutil, "disk_io_counters", deny)
+    monkeypatch.setattr(psutil, "disk_partitions", deny)
+
+    r = authed.get("/api/system/network")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["degraded"], "应说明降级原因"
+    assert body["interfaces"], "网卡地址仍应列出（net_if_addrs 在这些平台上可用）"
+    assert all(i["bytes_recv"] == 0 for i in body["interfaces"])
+
+    r = authed.get("/api/storage/overview")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["partitions"] == [] and body["disks"] == [] and body["degraded"]
+
+    r = authed.get("/api/apps")
+    assert r.status_code == 200, r.text
+    assert r.json()["apps"] == [] and r.json()["degraded"]
+
+    r = authed.get("/api/system/info")
+    assert r.status_code == 200, r.text
+

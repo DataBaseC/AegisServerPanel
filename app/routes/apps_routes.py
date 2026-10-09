@@ -213,7 +213,9 @@ async def check_port(app_id: str, port: int, _session: dict = Depends(require_in
                     row["user"] = proc.username()
             if row not in occupied:
                 occupied.append(row)
-    except psutil.Error:
+    except (psutil.Error, OSError):
+        # Android / PRoot 会屏蔽 /proc/net/tcp 并抛出裸 PermissionError（不是 psutil.Error）：
+        # 枚举不到就当作"没有占用者"，只提示不阻断启动
         pass
     return {
         "port": port,

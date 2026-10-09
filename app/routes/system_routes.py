@@ -59,10 +59,24 @@ async def processes(limit: int = 15, sort: str = "cpu"):
 async def network():
     import psutil
 
+    # Android / PRoot 会把内核的 PermissionError 直接抛出来（不是 psutil.Error）：
+    # /proc/net/dev 读不到时，原来整个「网络」视图 500。这里逐项降级：
+    # 计数/速率读不到就报 0，页面上仍能看到网卡与地址，并在 degraded 里说明原因。
+    degraded: list[str] = []
+
+    def safe(label, fn, default):
+        try:
+            return fn()
+        except (psutil.Error, OSError) as exc:
+            degraded.append(f"{label}: {exc}")
+            return default
+
+    counters = safe("net_io_counters", lambda: psutil.net_io_counters(pernic=True), {}) or {}
+    stats = safe("net_if_stats", psutil.net_if_stats, {}) or {}
+    addrs = safe("net_if_addrs", psutil.net_if_addrs, {}) or {}
+
     interfaces = []
-    counters = psutil.net_io_counters(pernic=True)
-    stats = psutil.net_if_stats()
-    for name, addrs in psutil.net_if_addrs().items():
+    for name, addr_list in addrs.items():
         nic = counters.get(name)
         st = stats.get(name)
         interfaces.append({
@@ -72,14 +86,14 @@ async def network():
             "mtu": st.mtu if st else 0,
             "addresses": [
                 {"family": str(a.family), "address": a.address, "netmask": a.netmask}
-                for a in addrs
+                for a in addr_list
             ],
             "bytes_sent": nic.bytes_sent if nic else 0,
             "bytes_recv": nic.bytes_recv if nic else 0,
             "packets_sent": nic.packets_sent if nic else 0,
             "packets_recv": nic.packets_recv if nic else 0,
         })
-    return {"interfaces": interfaces}
+    return {"interfaces": interfaces, "degraded": degraded}
 
 
 @router.get("/capabilities")

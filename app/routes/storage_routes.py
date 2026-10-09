@@ -33,7 +33,15 @@ async def overview():
     import psutil
 
     partitions = []
-    for part in psutil.disk_partitions(all=False):
+    degraded: list[str] = []
+    # Android / PRoot 屏蔽 /proc/filesystems 并抛裸 PermissionError（不是 psutil.Error）：
+    # 原来会让整个「存储」视图 500。拿不到分区表就退化成"只报盘使用率"。
+    try:
+        parts = psutil.disk_partitions(all=False)
+    except (psutil.Error, OSError) as exc:
+        parts = []
+        degraded.append(f"disk_partitions: {exc}")
+    for part in parts:
         try:
             usage = psutil.disk_usage(part.mountpoint)
         except (PermissionError, OSError):
@@ -50,7 +58,12 @@ async def overview():
         })
     partitions.sort(key=lambda p: p["mountpoint"])
 
-    io = psutil.disk_io_counters(perdisk=True) or {}
+    try:
+        io = psutil.disk_io_counters(perdisk=True) or {}
+    except (psutil.Error, OSError):
+        # Android / PRoot 屏蔽 /sys/block 并抛裸 PermissionError（不是 psutil.Error）：
+        # 拿不到块设备计数就给空列表，别让整个「存储」视图 500
+        io = {}
     disks = [
         {
             "name": name,
@@ -71,7 +84,8 @@ async def overview():
                 block = json.loads(result.out).get("blockdevices", [])
             except json.JSONDecodeError:
                 block = []
-    return {"partitions": partitions, "disks": disks, "blockdevices": block}
+    return {"partitions": partitions, "disks": disks, "blockdevices": block,
+            "degraded": degraded}
 
 
 @router.get("/dirsize")

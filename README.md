@@ -10,7 +10,7 @@
 - **快捷设置**：开机自启体检、运行参数调整、配置备份迁移，全部在面板里完成
 - **重度优化**：慢操作全部下线程池（单个慢请求不再冻结面板）、后台标签页停止轮询、断网有提示、大目录不卡界面
 
-当前版本 `1.3.0`。
+当前版本 `1.3.1`。
 
 ---
 
@@ -664,6 +664,13 @@ serverpanel --host 0.0.0.0 --port 8787 --ssl-certfile /path/cert.pem --ssl-keyfi
 ---
 
 ## 十、更新记录
+
+### 1.3.1
+
+- **修 Android / PRoot 平台成片的 500**：这类环境会屏蔽 `/proc/net/dev`、`/proc/net/tcp`、`/sys/block`、`/proc/filesystems`、`/sys/class/power_supply`，而 psutil 对它们是**直接抛裸 `PermissionError`（不是 `psutil.Error`）**，原来只会捕获 `psutil.Error` 的写法一律漏掉 → 「概览-网络」「存储」「应用与端口」「进程详情」整片 500。现在统一按 `(psutil.Error, OSError)` 兜底：能读的照读，读不到的给 0 并把原因带回来，视图继续可用
+- 「网络」「存储」视图会把降级原因显示出来，避免把"读不到"误读成"真的没流量/没分区"
+- `metrics.basic_info()`（首屏依赖）逐项加固，任何一项读不到都不再让首页崩
+- 回归测试 `test_views_survive_psutil_permission_errors`：monkeypatch psutil 抛 `PermissionError`，断言四个接口仍 200 且 `degraded` 有内容
 
 ### 1.3.0
 

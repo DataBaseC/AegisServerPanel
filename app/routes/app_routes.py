@@ -64,8 +64,11 @@ async def list_apps(_session: dict = Depends(require_internal)):
         conns = psutil.net_connections(kind="inet")
     except psutil.AccessDenied:
         raise HTTPException(403, "需要 root 权限才能枚举监听端口")
-    except Exception as exc:  # psutil 在不同平台可能抛不同异常
-        raise HTTPException(500, f"读取网络连接失败: {exc}")
+    except (psutil.Error, OSError) as exc:
+        # Android / PRoot 屏蔽 /proc/net/tcp（裸 PermissionError，不是 psutil.Error）：
+        # 枚举不了不是错误，给空列表 + 说明，页面显示"暂时读不到"而不是报错
+        return {"total_apps": 0, "total_ports": 0, "hosts": [],
+                "apps": [], "degraded": f"无法枚举网络连接：{exc}"}
 
     lan = [a["address"] for a in basic_info()["addresses"]]
     grouped: dict[int, list[dict]] = {}

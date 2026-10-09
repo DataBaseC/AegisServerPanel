@@ -199,10 +199,18 @@ def basic_info() -> dict:
             for addr in addrs:
                 if addr.family == socket.AF_INET and not addr.address.startswith("127."):
                     addresses.append({"interface": name, "address": addr.address})
-    except OSError:
+    except (psutil.Error, OSError):
         pass
 
-    boot = psutil.boot_time()
+    def _safe(fn, default):
+        # Android / PRoot 会把内核 PermissionError 直接抛出来（不是 psutil.Error）：
+        # basic_info 是首屏依赖，任何一项读不到都不该让整页崩掉
+        try:
+            return fn()
+        except (psutil.Error, OSError):
+            return default
+
+    boot = _safe(psutil.boot_time, time.time())
     return {
         "hostname": socket.gethostname(),
         "fqdn": _fqdn(),
@@ -211,13 +219,13 @@ def basic_info() -> dict:
         "kernel": uname.release,
         "arch": uname.machine,
         "cpu_model": cpu_model or "未知",
-        "cpu_cores_physical": psutil.cpu_count(logical=False),
-        "cpu_cores_logical": psutil.cpu_count(logical=True),
-        "mem_total": psutil.virtual_memory().total,
-        "swap_total": psutil.swap_memory().total,
+        "cpu_cores_physical": _safe(lambda: psutil.cpu_count(logical=False), None),
+        "cpu_cores_logical": _safe(lambda: psutil.cpu_count(logical=True), None),
+        "mem_total": _safe(lambda: psutil.virtual_memory().total, 0),
+        "swap_total": _safe(lambda: psutil.swap_memory().total, 0),
         "boot_time": int(boot),
         "uptime": int(time.time() - boot),
-        "user": psutil.Process().username(),
+        "user": _safe(lambda: psutil.Process().username(), "-"),
         "python": platform.python_version(),
         "addresses": addresses,
         "is_root": psutil.Process().username() == "root",

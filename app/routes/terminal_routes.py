@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import time
 from collections import deque
 
@@ -97,7 +98,11 @@ async def exec_command(body: ExecBody, auth: dict = Depends(require_exec_auth)):
     """
     if not body.command.strip():
         raise HTTPException(400, "命令不能为空")
-    if body.timeout <= 0 or body.timeout > 600:
+    if len(body.command) > 64 * 1024:
+        raise HTTPException(400, "命令过长（上限 64KB）")
+    # 链式比较连 NaN 一起拒：NaN 与任何值比较都是 False，
+    # 而 body.timeout <= 0 or body.timeout > 600 这种写法会让 NaN 溜过去
+    if not (1 <= body.timeout <= 600):
         raise HTTPException(400, "timeout 需在 1~600 秒之间")
     started = time.time()
     result = await shell.run(
@@ -110,7 +115,7 @@ async def exec_command(body: ExecBody, auth: dict = Depends(require_exec_auth)):
         "time": int(started),
         "kind": auth.get("kind", "session"),
         "ip": auth.get("ip", ""),
-        "command": body.command,
+        "command": body.command[:2000],  # 审计只留摘要，防超长命令撑爆内存
         "code": result.code,
         "duration": round(time.time() - started, 2),
     })
@@ -234,9 +239,11 @@ async def terminal_socket(websocket: WebSocket):
             pass
         if process.returncode is None:
             try:
-                process.terminate()
+                # shell 已 setsid 成会话首进程：收尾要 TERM 整个进程组，
+                # 否则用户在终端里跑的前台/后台程序会脱离管理继续存活
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
                 await asyncio.wait_for(process.wait(), timeout=3)
-            except (ProcessLookupError, asyncio.TimeoutError):
+            except (ProcessLookupError, PermissionError, asyncio.TimeoutError):
                 try:
                     process.kill()
                 except ProcessLookupError:

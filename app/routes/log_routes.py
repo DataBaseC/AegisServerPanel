@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -102,7 +103,12 @@ async def dmesg(lines: int = 200):
 async def tail(path: str, lines: int = 200):
     lines = max(1, min(lines, 5000))
     full = _check_readable(path)
+    before = os.stat(full)
     result = await shell.run(["tail", "-n", str(lines), full], timeout=20)
+    # 前后 stat 比对（dev/ino）：校验到 tail 执行之间文件被换成白名单外的链接就作废
+    after = os.stat(full)
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        raise HTTPException(403, "文件在校验后被替换为白名单外的链接，已拒绝读取")
     if not result.ok:
         raise HTTPException(500, result.text or "读取失败")
     return {"path": full, "lines": result.out.splitlines()}
@@ -113,10 +119,19 @@ async def read_log(path: str, max_bytes: int = 256 * 1024):
     full = _check_readable(path)
     size = os.path.getsize(full)
     limit = max(1024, min(max_bytes, 2 * 1024 * 1024))
-    with open(full, "rb") as fh:
-        if size > limit:
-            fh.seek(-limit, os.SEEK_END)
-        data = fh.read()
+
+    def _read() -> bytes:
+        with open(full, "rb") as fh:
+            # 打开后复核 fd 真实落点：白名单校验到打开之间若被换成指向名单外的
+            # 符号链接（TOCTOU），此刻已跟随链接打开，这里能抓住并拒绝。
+            fd_path = f"/proc/self/fd/{fh.fileno()}"
+            if os.path.exists(fd_path) and not _allowed_log_path(os.path.realpath(fd_path)):
+                raise HTTPException(403, "文件在校验后被替换为白名单外的链接，已拒绝读取")
+            if size > limit:
+                fh.seek(-limit, os.SEEK_END)
+            return fh.read()
+
+    data = await asyncio.to_thread(_read)  # 大日志读盘不阻塞事件循环
     return {
         "path": full,
         "size": size,

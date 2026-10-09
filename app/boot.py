@@ -534,7 +534,7 @@ def trim_logs(app_dir: Path | None = None) -> dict:
                 details.append({"name": rotated.name, "freed": size, "note": "已删除轮转归档"})
         runtime = supervisor.runtimes.get(app["id"])
         if runtime and runtime.log:
-            runtime.log._buffer.clear()
+            runtime.log.clear_memory()  # 走公开方法，不摸 _buffer 私有属性
 
     return {
         "ok": True,
@@ -642,10 +642,24 @@ def set_pref_with_check(patch: dict) -> dict:
                     (candidate if isinstance(candidate, list) else [candidate])]
         except OSError as exc:
             raise PrefsError(f"日志目录解析失败：{exc}")
-        secret = "/etc/shadow"
-        if any(secret == d or secret.startswith(os.path.join(d, "")) for d in dirs):
-            raise PrefsError("该目录会让 /etc/shadow 之类敏感文件进入白名单范围，已拒绝")
-        for probe in ("/", "/etc", "/root", "/usr"):
+        # 敏感目录：白名单目录与它们存在任意包含关系（等于、在其内部、或把它包进来）
+        # 都拒绝。否则把 /etc/ssh、/root/.ssh、面板配置目录放进白名单后，
+        # 公网只读模式的登录用户就能经日志接口读到私钥和面板密码哈希/令牌。
+        sensitive = (
+            "/etc", "/root", "/proc", "/sys", "/dev", "/run", "/boot",
+            "/var/lib", "/var/backups",
+        )
+        for d in dirs:
+            # 隐藏目录（.ssh / .aws / .config / .gnupg …）一律拒绝
+            if any(part.startswith(".") for part in d.split(os.sep) if part):
+                raise PrefsError(f"不能把隐藏目录加入日志白名单：{d}")
+            for probe in sensitive:
+                real = os.path.realpath(probe)
+                if (d == real or d.startswith(real + os.sep)
+                        or real.startswith(d + os.sep)):
+                    raise PrefsError(
+                        f"不能把 {d} 加入日志白名单：它与敏感目录 {probe} 存在包含关系")
+        for probe in ("/", "/usr"):
             real = os.path.realpath(probe)
             if any(d == real for d in dirs):
                 raise PrefsError(f"不能把系统关键目录加入日志白名单：{probe}")

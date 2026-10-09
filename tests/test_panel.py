@@ -1203,7 +1203,9 @@ def test_extract_zip_and_tar(authed, internal_mode, tmp_path):
         bad.size = 3
         tf.addfile(bad, io.BytesIO(b"bad"))
     r = authed.post("/api/files/extract", json={"path": str(evil)})
-    assert r.status_code in (200, 500)
+    # 新契约：3.12+ 过滤器拦下越界成员 → 400 整包拒绝并清场（原来是 500 炸掉）；
+    # 旧版逐成员跳过 → 200。两种都不允许写出目标目录。
+    assert r.status_code in (200, 400), r.text
     assert not (tmp_path / "evil.txt").exists(), "穿越成员不能写出目标目录"
 
 

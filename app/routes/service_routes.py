@@ -36,7 +36,7 @@ def _require_systemd() -> None:
 
 
 def _validate_unit(name: str) -> str:
-    if not UNIT_RE.match(name):
+    if not UNIT_RE.match(name) or name.startswith("-"):
         raise HTTPException(400, "服务名不合法")
     return name if "." in name else f"{name}.service"
 

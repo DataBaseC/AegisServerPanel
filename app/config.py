@@ -42,15 +42,23 @@ class Config:
     def __init__(self, path: Path | None = None) -> None:
         self.path = Path(path) if path else default_config_path()
         self._lock = threading.RLock()
-        self._mtime = 0.0
+        self._fingerprint: tuple[int, int, int] = (0, 0, 0)
         self.data: dict = {}
         self.load()
 
-    def _stat_mtime(self) -> float:
+    def _stat_fingerprint(self) -> tuple[int, int, int]:
+        """配置文件指纹 (mtime_ns, size, ino)。
+
+        只比 st_mtime 秒级浮点更可靠：PRoot/容器文件系统 mtime 可能只有秒级
+        精度，同秒内的外部修改（--disable-internal / --revoke-agent-token）
+        会被误判为「没变」，导致模式降级或令牌吊销迟迟不生效。三元组里任一
+        变化都触发重载。
+        """
         try:
-            return self.path.stat().st_mtime
+            st = self.path.stat()
+            return (st.st_mtime_ns, st.st_size, st.st_ino)
         except OSError:
-            return 0.0
+            return (0, 0, 0)
 
     def load(self) -> None:
         with self._lock:
@@ -62,13 +70,13 @@ class Config:
                 self.data = json.loads(self.path.read_text("utf-8"))
             except (OSError, json.JSONDecodeError):
                 self.data = {}
-        self._mtime = self._stat_mtime()
+        self._fingerprint = self._stat_fingerprint()
 
     def reload_if_changed(self) -> bool:
         """配置文件被外部命令（如 serverpanel --enable-internal）修改后热加载。"""
-        mtime = self._stat_mtime()
+        fingerprint = self._stat_fingerprint()
         with self._lock:
-            if mtime == self._mtime:
+            if fingerprint == self._fingerprint:
                 return False
             self._load_unlocked()
         return True
@@ -82,7 +90,7 @@ class Config:
             tmp.write_text(json.dumps(self.data, indent=2), "utf-8")
             os.chmod(tmp, 0o600)
             os.replace(tmp, self.path)
-            self._mtime = self._stat_mtime()
+            self._fingerprint = self._stat_fingerprint()
 
     # ---- 运行模式 ----
     @property
@@ -170,16 +178,20 @@ class Config:
     def hostname_label(self) -> str:
         return self.data.get("label") or "ServerPanel"
 
-    def set_password(self, password: str) -> None:
+    def set_password(self, password: str, only_if_uninitialized: bool = False) -> None:
         if len(password) < 8:
             raise ValueError("密码长度至少 8 位")
         salt = secrets.token_bytes(16)
         digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_ITERATIONS)
-        self.data["password_hash"] = (
-            f"pbkdf2_sha256${PBKDF2_ITERATIONS}${salt.hex()}${digest.hex()}"
-        )
-        self.data["updated_at"] = int(time.time())
-        self.save()
+        with self._lock:
+            self.reload_if_changed()  # 外部命令改过配置时以磁盘为准，防止旧内存态覆盖
+            if only_if_uninitialized and self.data.get("password_hash"):
+                raise ValueError("面板已初始化")
+            self.data["password_hash"] = (
+                f"pbkdf2_sha256${PBKDF2_ITERATIONS}${salt.hex()}${digest.hex()}"
+            )
+            self.data["updated_at"] = int(time.time())
+            self.save()
 
     def verify_password(self, password: str) -> bool:
         stored = self.data.get("password_hash")

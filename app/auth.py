@@ -88,7 +88,8 @@ class SessionStore:
             self._persist(force=True)
         return token
 
-    def validate(self, token: str | None) -> dict | None:
+    def validate(self, token: str | None, renew: bool = True) -> dict | None:
+        """校验会话。renew=False 时只查不续期（状态查询类接口用）。"""
         if not token:
             return None
         with self._lock:
@@ -99,8 +100,9 @@ class SessionStore:
                 self._sessions.pop(token, None)
                 self._persist()
                 return None
-            session["expires"] = time.time() + self.ttl  # 滑动续期
-            self._persist()
+            if renew:
+                session["expires"] = time.time() + self.ttl  # 滑动续期
+                self._persist()
             return dict(session)
 
     def revoke(self, token: str | None) -> None:

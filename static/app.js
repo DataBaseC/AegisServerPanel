@@ -78,6 +78,7 @@ function bar(pct, cls) {
 function toast(message, type = 'ok', timeout = 3400) {
   const node = document.createElement('div');
   node.className = `toast ${type}`;
+  node.setAttribute('role', type === 'err' ? 'alert' : 'status');  // 错误即时播报给读屏
   node.innerHTML = esc(message);
   $('#toast-wrap').appendChild(node);
   setTimeout(() => {
@@ -89,10 +90,12 @@ function toast(message, type = 'ok', timeout = 3400) {
 
 let modalStack = [];
 
-function openModal({ title, body, footer, size = '' }) {
+function openModal({ title, body, footer, size = '', onEscape = null }) {
   const root = $('#modal-root');
   const overlay = document.createElement('div');
   overlay.className = 'modal';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
   overlay.innerHTML = `
     <div class="modal-box ${size}">
       <div class="modal-head">
@@ -114,6 +117,8 @@ function openModal({ title, body, footer, size = '' }) {
   root.appendChild(overlay);
   const handle = {
     overlay, body: bodyEl, foot: $('.modal-foot', overlay),
+    // ESC 语义由调用方定：对话框走「取消」（resolve 出值），普通弹窗直接关闭
+    escape: onEscape || (() => handle.close()),
     close() {
       overlay.remove();
       modalStack = modalStack.filter((m) => m !== handle);
@@ -126,6 +131,14 @@ function openModal({ title, body, footer, size = '' }) {
   return handle;
 }
 
+// ESC 关闭最上层弹窗：键盘用户不必 Tab 去找 ✕
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && modalStack.length) {
+    event.preventDefault();
+    modalStack[modalStack.length - 1].escape();
+  }
+});
+
 function confirmDialog({ title, message, confirmText = '确认', danger = false, phrase = '' }) {
   return new Promise((resolve) => {
     const body = document.createElement('div');
@@ -137,8 +150,8 @@ function confirmDialog({ title, message, confirmText = '确认', danger = false,
     foot.className = 'row';
     foot.innerHTML = `<button class="btn" data-cancel>取消</button>
       <button class="btn ${danger ? 'danger' : 'primary'}" data-ok>${esc(confirmText)}</button>`;
-    const modal = openModal({ title, body, footer: foot, size: 'narrow' });
     const finish = (value) => { modal.close(); resolve(value); };
+    const modal = openModal({ title, body, footer: foot, size: 'narrow', onEscape: () => finish(false) });
     $('[data-cancel]', foot).onclick = () => finish(false);
     $('[data-ok]', foot).onclick = () => {
       if (phrase) {
@@ -160,10 +173,10 @@ function promptDialog({ title, label, value = '', confirmText = '确定' }) {
     foot.className = 'row';
     foot.innerHTML = `<button class="btn" data-cancel>取消</button>
       <button class="btn primary" data-ok>${esc(confirmText)}</button>`;
-    const modal = openModal({ title, body, footer: foot, size: 'narrow' });
+    const finish = (val) => { modal.close(); resolve(val); };
+    const modal = openModal({ title, body, footer: foot, size: 'narrow', onEscape: () => finish(null) });
     const input = $('#prompt-input', modal.body);
     setTimeout(() => { input.focus(); input.select(); }, 30);
-    const finish = (val) => { modal.close(); resolve(val); };
     $('[data-cancel]', foot).onclick = () => finish(null);
     $('[data-ok]', foot).onclick = () => finish(input.value);
     input.addEventListener('keydown', (event) => {
@@ -178,7 +191,23 @@ class ApiError extends Error {
   constructor(message, status) { super(message); this.status = status; }
 }
 
-async function request(method, url, payload, isForm = false) {
+let netFailures = 0;  // 连续失败计数：达到阈值显示断网横幅，成功即归零
+
+function setOfflineBanner(show) {
+  let banner = document.getElementById('offline-banner');
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'offline-banner';
+    banner.setAttribute('role', 'status');
+    banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#7f1d1d;'
+      + 'color:#fff;text-align:center;padding:6px 12px;font-size:13px;display:none';
+    banner.textContent = '⚠ 与服务器的连接中断，正在自动重试…（页面数据可能不是最新）';
+    document.body.appendChild(banner);
+  }
+  banner.style.display = show ? 'block' : 'none';
+}
+
+async function request(method, url, payload, isForm = false, timeoutMs = 120000) {
   const options = { method, headers: {}, credentials: 'same-origin' };
   if (payload !== undefined && payload !== null) {
     if (isForm) {
@@ -188,12 +217,25 @@ async function request(method, url, payload, isForm = false) {
       options.body = JSON.stringify(payload);
     }
   }
+  // 超时兜底：后端挂死 / 网络半死时请求不再永远悬着，界面不会永久卡在「加载中」
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  options.signal = controller.signal;
   let response;
   try {
     response = await fetch(url, options);
   } catch (err) {
-    throw new ApiError('无法连接服务器', 0);
+    netFailures += 1;
+    if (netFailures >= 2) setOfflineBanner(true);
+    throw new ApiError(
+      err && err.name === 'AbortError' ? `请求超时（${Math.round(timeoutMs / 1000)}s），请稍后重试` : '无法连接服务器',
+      0,
+    );
+  } finally {
+    clearTimeout(timer);
   }
+  netFailures = 0;
+  setOfflineBanner(false);
   if (response.status === 401) {
     showLogin(true);
     throw new ApiError('登录已过期，请重新登录', 401);
@@ -210,10 +252,11 @@ async function request(method, url, payload, isForm = false) {
 }
 
 const api = {
-  get: (url) => request('GET', url),
-  post: (url, body) => request('POST', url, body),
-  del: (url) => request('DELETE', url),
-  upload: (url, formData) => request('POST', url, formData, true),
+  get: (url, timeoutMs) => request('GET', url, undefined, false, timeoutMs || 120000),
+  post: (url, body, timeoutMs) => request('POST', url, body, false, timeoutMs || 120000),
+  put: (url, body, timeoutMs) => request('PUT', url, body, false, timeoutMs || 120000),
+  del: (url, timeoutMs) => request('DELETE', url, undefined, false, timeoutMs || 120000),
+  upload: (url, formData, timeoutMs) => request('POST', url, formData, true, timeoutMs || 600000),
 };
 
 /* ============================ 折线图 ============================ */
@@ -315,6 +358,12 @@ class Chart {
 
 /* ============================ 实时指标总线 ============================ */
 
+// 可见性感知轮询：页面切到后台（标签隐藏/最小化）时让轮询空转，回前台再继续。
+// 否则一堆 setInterval 在后台标签里照样每 2~5 秒打一轮接口，纯浪费服务器。
+function every(ms, fn) {
+  return setInterval(() => { if (!document.hidden) fn(); }, ms);
+}
+
 const live = {
   metrics: null,
   capabilities: null,
@@ -328,7 +377,7 @@ const live = {
     if (this.timer) return;
     const tick = async () => {
       try {
-        const data = await api.get('/api/system/metrics');
+        const data = await api.get('/api/system/metrics', 8000);
         this.metrics = data;
         this.failures = 0;
         renderTopbar(data);
@@ -341,7 +390,7 @@ const live = {
       }
     };
     tick();
-    this.timer = setInterval(tick, 2000);
+    this.timer = every(2000, tick);
   },
 
   stop() { clearInterval(this.timer); this.timer = null; },
@@ -489,6 +538,8 @@ function initTabs() {
   };
 }
 
+let viewSeq = 0;  // 视图代际：每次导航自增，过期的异步渲染结果一律丢弃
+
 async function navigate(id) {
   const wanted = NAV.find((n) => n.id === id);
   if (wanted && wanted.internalOnly && !isInternal()) id = 'overview';  // 公网模式下禁止直达内网视图
@@ -499,17 +550,33 @@ async function navigate(id) {
     try { currentCleanup(); } catch (err) { console.error(err); }
     currentCleanup = null;
   }
+  const seq = (viewSeq += 1);
   currentView = viewId;
   location.hash = `#/${viewId}`;
   renderTabs();
   $('#page-title').textContent = def.title;
   $$('#nav .nav-item').forEach((el) => el.classList.toggle('active', el.dataset.id === viewId));
-  const container = $('#view');
-  container.className = def.fullbleed ? 'view terminal-view' : 'view';
+  const host = $('#view');
+  // 清掉上个视图挂在容器上的事件属性与残留监听，避免旧闭包跨视图继续收事件
+  host.onclick = host.onchange = host.oninput = host.onkeydown = null;
+  host.className = def.fullbleed ? 'view terminal-view' : 'view';
+  // 每次导航给视图一个全新的 slot 容器（display:contents 不占布局）：
+  // 旧视图迟到的异步写入只会落在已脱离文档的旧 slot 里，盖不掉新视图
+  const container = document.createElement('div');
+  container.className = 'view-slot';
   container.innerHTML = '<div class="empty">加载中…</div>';
+  host.innerHTML = '';
+  host.appendChild(container);
   try {
-    currentCleanup = (await def.render(container)) || null;
+    const cleanup = (await def.render(container)) || null;
+    if (seq !== viewSeq) {
+      // 渲染期间用户已切去别的视图：立刻回收这个过期视图的定时器/监听
+      if (cleanup) { try { cleanup(); } catch (err) { console.error(err); } }
+      return;
+    }
+    currentCleanup = cleanup;
   } catch (err) {
+    if (seq !== viewSeq) return;
     container.innerHTML = `<div class="card"><h2>加载失败</h2><div class="dim">${esc(err.message)}</div></div>`;
   }
 }
@@ -574,8 +641,12 @@ async function submitLogin(event) {
 
 /* ============================ 启动 ============================ */
 
-async function startApp() {
-  const status = await api.get('/api/auth/status');
+async function startApp(precached = null) {
+  // 状态与能力探测并行；boot 已拿到 status 时直接复用，首屏少一次串行往返
+  const [status] = await Promise.all([
+    precached || api.get('/api/auth/status'),
+    api.get('/api/system/capabilities').then((c) => { live.capabilities = c; }).catch(() => {}),
+  ]);
   authState = status;
   if (!status.authenticated) { showLogin(false); return; }
   appMode = status.mode || 'public';
@@ -586,7 +657,6 @@ async function startApp() {
   renderModeBanner();
   initTabs();
   buildNav();
-  try { live.capabilities = await api.get('/api/system/capabilities'); } catch (err) { /* 忽略 */ }
   live.start();
   const hashView = location.hash.replace('#/', '');
   navigate(views[hashView] ? hashView : 'overview');
@@ -600,7 +670,7 @@ async function boot() {
   }
   $('#login-host').textContent = authState.hostname ? `主机 ${authState.hostname}` : '本机系统控制台';
   $('#login-form').addEventListener('submit', submitLogin);
-  if (authState.authenticated) await startApp();
+  if (authState.authenticated) await startApp(authState);  // 复用已拉到的状态，不重复请求
   else showLogin(false);
 }
 
@@ -764,7 +834,7 @@ registerView('overview', {
     }
 
     await Promise.all([loadProcs(), loadNets()]);
-    const procTimer = setInterval(loadProcs, 6000);
+    const procTimer = every(6000, loadProcs);
 
     root.onclick = async (event) => {
       const action = event.target.dataset?.act;
@@ -912,7 +982,7 @@ registerView('performance', {
       } catch (err) { /* 忽略 */ }
     }
     await loadProcs();
-    const procTimer = setInterval(loadProcs, 5000);
+    const procTimer = every(5000, loadProcs);
 
     return () => {
       unsubscribe();
@@ -933,7 +1003,7 @@ registerView('terminal', {
       <div class="terminal-bar">
         <span class="badge info">${esc(info.user)}@${esc($('#brand-host').textContent)}</span>
         <span class="mono">${esc(info.shell)}</span>
-        <span class="badge warn">root 权限</span>
+        ${info.is_root ? '<span class="badge warn">root 权限</span>' : `<span class="badge">${esc(info.user)} 权限</span>`}
         <div class="spacer"></div>
         <span class="badge" id="term-status">连接中…</span>
         <button class="btn sm ghost" data-act="clear">清屏</button>
@@ -962,6 +1032,7 @@ registerView('terminal', {
 
     let socket = null, disposed = false, reconnectTimer = null, fontSize = 13.5;
     let everConnected = false;
+    let reconnectDelay = 1500;  // 重连退避：1.5s 起步，每次翻倍，30s 封顶
     const statusEl = $('#term-status');
 
     const doFit = () => {
@@ -985,6 +1056,7 @@ registerView('terminal', {
           term.write('\r\n\x1b[33m[连接已恢复。每次连接都是新终端会话，服务升级后原会话已结束]\x1b[0m\r\n');
         }
         everConnected = true;
+        reconnectDelay = 1500;  // 连上了就把退避复位
         doFit();
         term.focus();
       };
@@ -993,11 +1065,16 @@ registerView('terminal', {
         else term.write(new Uint8Array(event.data));
       };
       socket.onclose = () => {
-        statusEl.textContent = '已断开';
+        statusEl.textContent = `已断开，${Math.round(reconnectDelay / 1000)} 秒后重连`;
         statusEl.className = 'badge danger';
         if (!disposed) {
-          term.write('\r\n\x1b[31m[连接已断开，1.5 秒后自动重连…]\x1b[0m\r\n');
-          reconnectTimer = setTimeout(connect, 1500);
+          // 只在首次断开写一行终端红字；之后靠状态栏提示，
+          // 不再固定 1.5s 一轮把屏幕刷成红字瀑布
+          if (reconnectDelay <= 1500) {
+            term.write('\r\n\x1b[31m[连接已断开，正在自动重连（间隔逐步加大）…]\x1b[0m\r\n');
+          }
+          reconnectTimer = setTimeout(connect, reconnectDelay);
+          reconnectDelay = Math.min(reconnectDelay * 2, 30000);
         }
       };
       socket.onerror = () => { statusEl.textContent = '连接错误'; statusEl.className = 'badge danger'; };
@@ -1114,14 +1191,15 @@ registerView('logs', {
 
     function paint() {
       const keyword = $('#log-filter').value.trim().toLowerCase();
-      const lines = keyword ? rawLines.filter((l) => l.toLowerCase().includes(keyword)) : rawLines;
+      const matched = keyword ? rawLines.filter((l) => l.toLowerCase().includes(keyword)) : rawLines;
+      const lines = matched.slice(0, 3000);  // 渲染上限：几千行 innerHTML 重建会明显掉帧
       const atBottom = output.scrollTop + output.clientHeight >= output.scrollHeight - 40;
       output.innerHTML = lines.length
         ? lines.map((line) => `<span class="${lineClass(line)}">${esc(line) || '&nbsp;'}</span>`).join('\n')
         : '<span class="dim">没有匹配的日志行</span>';
       if (atBottom) output.scrollTop = output.scrollHeight;
       meta.textContent = `共 ${rawLines.length} 行`
-        + (keyword ? `，匹配 ${lines.length} 行` : '')
+        + (keyword ? `，匹配 ${matched.length} 行${matched.length > 3000 ? '（仅渲染前 3000 行）' : ''}` : '')
         + `　更新于 ${new Date().toLocaleTimeString()}`;
     }
 
@@ -1165,7 +1243,11 @@ registerView('logs', {
     $('#log-priority').onchange = load;
     $('#log-lines').onchange = load;
     $('#log-refresh').onclick = load;
-    $('#log-filter').oninput = paint;
+    let filterTimer = null;
+    $('#log-filter').oninput = () => {
+      clearTimeout(filterTimer);
+      filterTimer = setTimeout(paint, 200);  // 200ms 防抖：逐字符重绘大日志会掉帧
+    };
     $('#log-copy').onclick = async () => {
       try {
         await navigator.clipboard.writeText(rawLines.join('\n'));
@@ -1176,13 +1258,13 @@ registerView('logs', {
       clearInterval(timer);
       timer = null;
       if (event.target.checked) {
-        timer = setInterval(load, 3000);
+        timer = every(3000, load);
         toast('已开启自动刷新（3 秒）');
       }
     };
 
     await load();
-    return () => clearInterval(timer);
+    return () => { clearInterval(timer); clearTimeout(filterTimer); };
   },
 });
 
@@ -1372,12 +1454,15 @@ registerView('processes', {
 
     let timer = null;
     let rows = [];
+    let loadSeq = 0;
 
     async function load() {
+      const seq = ++loadSeq;  // 请求序号：自动刷新与搜索并发时只认最后一次结果
       const q = encodeURIComponent($('#ps-search').value.trim());
       const sort = $('#ps-sort').value;
       try {
         const data = await api.get(`/api/processes?limit=200&sort=${sort}&q=${q}`);
+        if (seq !== loadSeq) return;  // 期间已有更新的请求返回，这份旧数据作废
         rows = data.processes;
         $('#ps-count').textContent = `${data.total} 个进程`;
         $('#ps-table').innerHTML = rows.length ? `
@@ -1470,11 +1555,17 @@ registerView('processes', {
     $('#ps-auto').onchange = (event) => {
       clearInterval(timer);
       timer = null;
-      if (event.target.checked) timer = setInterval(load, 4000);
+      if (event.target.checked) timer = every(4000, load);
     };
-    timer = setInterval(load, 4000);
+    timer = every(4000, load);
 
     $('#ps-table').onclick = (event) => {
+      const sorter = event.target.closest('[data-sort]');
+      if (sorter) {  // PID 表头接上排序（此前是死交互）
+        $('#ps-sort').value = sorter.dataset.sort;
+        load();
+        return;
+      }
       const target = event.target.closest('[data-act]');
       if (!target) return;
       const proc = rows[Number(target.dataset.index)];
@@ -1565,9 +1656,9 @@ registerView('apps-port', {
     $('#apps-auto').onchange = (event) => {
       clearInterval(timer);
       timer = null;
-      if (event.target.checked) timer = setInterval(load, 5000);
+      if (event.target.checked) timer = every(5000, load);
     };
-    timer = setInterval(load, 5000);
+    timer = every(5000, load);
 
     await load();
     return () => { clearInterval(timer); clearTimeout(searchTimer); };
@@ -1614,6 +1705,8 @@ registerView('services', {
       <div class="card flush"><div class="table-wrap" id="sv-table"><div class="empty">加载中…</div></div></div>`;
 
     let services = [];
+    let reloadTimer = null;
+    let loadSeq = 0;
 
     const stateBadge = (s) => {
       if (s.active === 'active') return `<span class="badge ok">运行中</span>`;
@@ -1623,10 +1716,12 @@ registerView('services', {
     };
 
     async function load() {
+      const seq = ++loadSeq;  // 请求序号：搜索与手动刷新并发时只认最后一次结果
       const q = encodeURIComponent($('#sv-search').value.trim());
       const state = $('#sv-state').value;
       try {
         const data = await api.get(`/api/services?q=${q}&state=${state}`);
+        if (seq !== loadSeq) return;
         services = data.services;
         $('#sv-count').textContent = `${data.total} 个服务`;
         $('#sv-table').innerHTML = services.length ? `
@@ -1654,17 +1749,19 @@ registerView('services', {
     }
 
     async function act(service, action, needConfirm) {
+      const actionLabel = { start: '启动', stop: '停止', restart: '重启',
+        enable: '设为开机自启', disable: '取消开机自启' }[action] || action;
       if (needConfirm) {
         const ok = await confirmDialog({
           title: '确认操作', danger: action === 'stop' || action === 'disable', confirmText: '确定',
-          message: `确定要对 <b class="mono">${esc(service.unit)}</b> 执行「${esc(action)}」吗？`,
+          message: `确定要对 <b class="mono">${esc(service.unit)}</b> 执行「${actionLabel}」吗？`,
         });
         if (!ok) return;
       }
       try {
         const res = await api.post(`/api/services/${encodeURIComponent(service.unit)}/action`, { action });
         toast(res.message);
-        setTimeout(load, 700);
+        reloadTimer = setTimeout(load, 700);  // systemd 状态切换有延迟，稍后再刷一次
       } catch (err) { toast(err.message, 'err'); }
     }
 
@@ -1701,7 +1798,7 @@ registerView('services', {
     };
 
     await load();
-    return () => clearTimeout(searchTimer);
+    return () => { clearTimeout(searchTimer); clearTimeout(reloadTimer); };
   },
 });
 
@@ -1824,11 +1921,15 @@ registerView('files', {
           </td></tr>`).join('')}</tbody></table>`;
     }
 
+    let loadSeq = 0;  // 请求序号：连点面包屑/搜索时，旧响应不能把目录倒回去
+
     async function load(path) {
+      const seq = ++loadSeq;
       try {
         const showHidden = $('#show-hidden')?.checked ?? true;
         const data = await api.get(`/api/files/list?path=${encodeURIComponent(path)}`
           + `&show_hidden=${showHidden}`);
+        if (seq !== loadSeq) return;  // 期间已有更新的导航返回，这份旧列表作废
         cwd = data.path;
         sessionStorage.setItem('sp_cwd', cwd);
         entries = data.entries;
@@ -1840,6 +1941,7 @@ registerView('files', {
         $('#file-meta').textContent = `${entries.length} 项`
           + (data.disk ? ` · 分区可用 ${bytes(data.disk.free)} / ${bytes(data.disk.total)}` : '');
       } catch (err) {
+        if (seq !== loadSeq) return;
         $('#file-table').innerHTML = `<div class="empty">读取失败：${esc(err.message)}</div>`;
         $('#file-meta').textContent = '';
       }
@@ -1870,6 +1972,9 @@ registerView('files', {
           style="width:100%;height:52vh;font-size:13px"></textarea>`;
         const area = $('#editor-area', body);
         area.value = data.content;
+        if (data.content.length > 512 * 1024) {
+          toast('大文件编辑可能卡顿，建议下载后在本地编辑', 'warn', 6000);  // 软提示，不阻断
+        }
         area.focus();
         let dirty = false;
         const markDirty = () => { dirty = true; };
@@ -1887,6 +1992,10 @@ registerView('files', {
         };
         $('[data-manual-close]', foot).onclick = () => modal.close();
         async function save(expected) {
+          const saveBtn = $('[data-save]', foot);
+          if (saveBtn.disabled) return;  // 保存期间禁用按钮，防连点重复写盘
+          saveBtn.disabled = true;
+          saveBtn.textContent = '保存中…';
           try {
             const payload = { path: entry.path, content: area.value };
             if (expected !== null) payload.expected_mtime = expected;
@@ -1901,7 +2010,15 @@ registerView('files', {
               title: '文件已被修改', danger: true, confirmText: '覆盖保存',
               message: `${esc(err.message)}<br><span class="dim">覆盖将丢弃磁盘上的新版本，建议先「关闭」后重新打开比对。</span>`,
             });
-            if (ok) await save(null);
+            if (ok) {
+              saveBtn.disabled = false;
+              saveBtn.textContent = '保存';
+              await save(null);  // 覆盖保存：走一次新的保存流程（不带乐观锁）
+              return;
+            }
+          } finally {
+            saveBtn.disabled = false;
+            saveBtn.textContent = '保存';
           }
         }
         $('[data-save]', foot).onclick = () => save(data.mtime);
@@ -2464,7 +2581,7 @@ registerView('agent', {
     };
 
     await refresh();
-    timer = setInterval(loadRecent, 8000);
+    timer = every(8000, loadRecent);
     return () => { clearInterval(timer); clearTimeout(searchTimer); };
   },
 });
@@ -2944,7 +3061,7 @@ registerView('apps', {
       return null;
     }
     paint();
-    timer = setInterval(() => { if (!logState) refresh().catch(() => {}); else loadLog(); }, 3000);
+    timer = every(3000, () => { if (!logState) refresh().catch(() => {}); else loadLog(); });
     return () => { clearInterval(timer); };
   },
 });
@@ -2956,7 +3073,7 @@ function waitForPanelRestart({ before = '', expected = null, timeoutMs = 180000,
                               onProgress = null, probeUrl = '/healthz' } = {}) {
   return new Promise((resolve) => {
     const deadline = Date.now() + timeoutMs;
-    const timer = setInterval(async () => {
+    const timer = every(2500, async () => {  // every：切后台暂停探测，回前台继续
       try {
         const data = await fetch(probeUrl, { cache: 'no-store' }).then((r) => r.json());
         const stamp = data.build || data.version || '';
@@ -2975,7 +3092,7 @@ function waitForPanelRestart({ before = '', expected = null, timeoutMs = 180000,
         clearInterval(timer);
         resolve({ ok: false, health: null });
       }
-    }, 2500);
+    });
   });
 }
 
@@ -3441,6 +3558,9 @@ serverpanel --show-mode          # 查看当前模式</div>
     }
 
     async function runBootAction(actionId) {
+      if (busy) return;
+      busy = true;
+      try {
       const actions = {};
       (bootInfo?.links || []).forEach((link) => link.actions.forEach((a) => { actions[a.id] = a; }));
       const action = actions[actionId] || {};
@@ -3491,12 +3611,18 @@ serverpanel --show-mode          # 查看当前模式</div>
         } catch (err) { toast(err.message, 'err'); }
         return;
       }
+      busy = false;  // 未识别的面板动作交给 runPanelAction，由它自己重新持锁
       await runPanelAction(actionId);
+      } finally {
+        busy = false;
+      }
     }
 
     /** 守护 / 备份 / 日志 / 时区 / 监听 等面板级动作（体检卡片与卡片按钮共用）。 */
     async function runPanelAction(action) {
       if (busy) return;
+      busy = true;
+      try {
       if (action === 'boot-refresh') {
         await loadQuick();
         paint();
@@ -3586,6 +3712,9 @@ serverpanel --show-mode          # 查看当前模式</div>
         return;
       }
       if (action === 'import-pick') { $('#import-file').click(); }
+      } finally {
+        busy = false;  // 面板级动作期间防重入（重启/清理/切地址都不该能连点）
+      }
     }
 
     async function applyListen(host, port, force) {

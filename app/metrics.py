@@ -155,24 +155,41 @@ class MetricsSampler:
 metrics = MetricsSampler()
 
 
+_FQDN_CACHE: str | None = None
+
+
+def _fqdn() -> str:
+    """socket.getfqdn 带缓存：它是同步反向 DNS 查询，坏 DNS 环境下能挂数秒，
+    而 FQDN 在进程生命周期内基本不变，查一次就够。"""
+    global _FQDN_CACHE
+    if _FQDN_CACHE is None:
+        try:
+            _FQDN_CACHE = socket.getfqdn()
+        except OSError:
+            _FQDN_CACHE = socket.gethostname()
+    return _FQDN_CACHE
+
+
 def basic_info() -> dict:
     """静态系统信息。"""
     uname = platform.uname()
     os_release = {}
     try:
-        for line in open("/etc/os-release", encoding="utf-8"):
-            if "=" in line:
-                key, _, value = line.strip().partition("=")
-                os_release[key] = value.strip('"')
+        with open("/etc/os-release", encoding="utf-8") as fh:
+            for line in fh:
+                if "=" in line:
+                    key, _, value = line.strip().partition("=")
+                    os_release[key] = value.strip('"')
     except OSError:
         pass
 
     cpu_model = uname.processor or ""
     try:
-        for line in open("/proc/cpuinfo", encoding="utf-8"):
-            if line.lower().startswith("model name"):
-                cpu_model = line.split(":", 1)[1].strip()
-                break
+        with open("/proc/cpuinfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.lower().startswith("model name"):
+                    cpu_model = line.split(":", 1)[1].strip()
+                    break
     except OSError:
         pass
 
@@ -188,7 +205,7 @@ def basic_info() -> dict:
     boot = psutil.boot_time()
     return {
         "hostname": socket.gethostname(),
-        "fqdn": socket.getfqdn(),
+        "fqdn": _fqdn(),
         "distro": os_release.get("PRETTY_NAME", uname.system),
         "distro_id": os_release.get("ID", ""),
         "kernel": uname.release,

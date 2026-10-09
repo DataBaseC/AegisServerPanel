@@ -158,10 +158,10 @@ def local_addresses() -> list[str]:
     except OSError:
         pass
     with contextlib.suppress(OSError):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.connect(("8.8.8.8", 80))
-        addresses.add(sock.getsockname()[0])
-        sock.close()
+        # closing 保证 connect 失败时也归还 fd（原写法异常路径会泄漏 socket）
+        with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_DGRAM)) as sock:
+            sock.connect(("8.8.8.8", 80))
+            addresses.add(sock.getsockname()[0])
     return sorted(a for a in addresses if not a.startswith("127."))
 
 

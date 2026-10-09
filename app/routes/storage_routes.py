@@ -87,6 +87,7 @@ async def dirsize(path: str = "/", depth: int = 1):
         ["du", "-x", "-B1", f"-d{depth}", path], timeout=60
     )
     entries = []
+    total = 0  # du 自身行 = 该目录（含全部子项）总占用
     for line in result.out.splitlines():
         size_str, _, item = line.partition("\t")
         if not item:
@@ -96,14 +97,15 @@ async def dirsize(path: str = "/", depth: int = 1):
         except ValueError:
             continue
         if os.path.abspath(item) == path:
+            total = size
             continue
         entries.append({"path": item, "name": os.path.basename(item.rstrip("/")) or item,
                         "size": size, "isdir": os.path.isdir(item)})
     entries.sort(key=lambda e: e["size"], reverse=True)
-    total = entries[0]["size"] if not entries else None
     usage = shutil.disk_usage(path)
     return {
         "path": path,
+        "total": total,
         "entries": entries[:200],
         "mount_total": usage.total,
         "mount_used": usage.used,
@@ -141,7 +143,7 @@ async def mount(body: MountBody):
         cmd += ["-t", body.fstype]
     if body.options:
         cmd += ["-o", body.options]
-    cmd += [body.device, body.mountpoint]
+    cmd += ["--", body.device, body.mountpoint]
     result = await shell.run(cmd, timeout=30)
     if not result.ok:
         raise HTTPException(500, result.text or "挂载失败")
@@ -152,7 +154,7 @@ async def mount(body: MountBody):
 async def unmount(body: UnmountBody):
     if not is_root():
         raise HTTPException(403, "卸载需要以 root 运行本服务")
-    cmd = ["umount"] + (["-f"] if body.force else []) + [body.path]
+    cmd = ["umount"] + (["-f"] if body.force else []) + ["--", body.path]
     result = await shell.run(cmd, timeout=30)
     if not result.ok:
         raise HTTPException(500, result.text or "卸载失败")

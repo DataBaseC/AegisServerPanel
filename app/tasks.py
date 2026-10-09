@@ -175,8 +175,12 @@ TASKS: tuple[Task, ...] = (
     Task(
         id="panel-status", group="面板", title="面板运行状态",
         description="版本、模式、健康检查、守护进程",
+        # 端口不写死（面板可能改过监听端口）：从监听套接字现探测面板进程的端口
         command="serverpanel --status 2>&1 | head -40; "
-                "echo; echo '== healthz =='; curl -sS --max-time 5 http://127.0.0.1:8787/healthz; echo",
+                "echo; echo '== healthz =='; "
+                "P=$(ss -lntpH 2>/dev/null | grep -iE 'python|uvicorn' | grep -oE ':[0-9]+ ' | head -1 | tr -d ': '); "
+                "[ -n \"$P\" ] && curl -sS --max-time 5 \"http://127.0.0.1:$P/healthz\" "
+                "|| echo '（未能探测到面板监听端口）'; echo",
         timeout=60,
     ),
     Task(

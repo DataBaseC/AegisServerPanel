@@ -120,7 +120,10 @@ class Registry:
                 if isinstance(raw, list):
                     apps = [a for a in raw if isinstance(a, dict) and a.get("id")]
             except (OSError, json.JSONDecodeError):
-                apps = []
+                # 读失败/文件损坏时保留上一份注册表：置空会让正在运行的托管应用
+                # 瞬间失去管理（Supervisor.list 会把不在注册表的 runtime 丢弃），
+                # 一次瞬时 IO 失败就不该把守护中的进程全变成孤儿
+                apps = list(self._apps)
         self._apps = apps
         self._mtime = self._mtime_now()
 
@@ -336,6 +339,11 @@ class AppLog:
                 pass
             for line in text.splitlines():
                 self._buffer.append(line[:TRUNCATE_LINE])
+
+    def clear_memory(self) -> None:
+        """清空内存环形缓冲（日志清理用；已落盘文件由调用方另行截断）。"""
+        with self._lock:
+            self._buffer.clear()
 
     def _rotate_if_needed(self) -> None:
         try:

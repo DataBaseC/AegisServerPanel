@@ -199,15 +199,23 @@ async def read_file(path: str, max_bytes: int = EDIT_LIMIT):
     full = _abs(path)
     if not os.path.isfile(full):
         raise HTTPException(404, "文件不存在或不是普通文件")
+    # 上限钳制在服务端：客户端传再大的 max_bytes 也只按 EDIT_LIMIT 读，
+    # 否则一个查询参数就能让面板把任意大文件整个读进内存（OOM 打挂面板）
+    max_bytes = max(1, min(max_bytes, EDIT_LIMIT))
     size = os.path.getsize(full)
     if size > max_bytes:
         raise HTTPException(413, f"文件过大（{size} 字节），请直接下载查看")
-    with open(full, "rb") as fh:
-        data = fh.read()
+
+    def _load() -> tuple[bytes, int]:
+        with open(full, "rb") as fh:
+            data = fh.read(max_bytes + 1)
+        return data, os.stat(full).st_mtime_ns
+
+    data, mtime_ns = await asyncio.to_thread(_load)  # 大文件读盘不阻塞事件循环
     if b"\x00" in data[:8192]:
         raise HTTPException(415, "二进制文件，不支持在线编辑")
     return {"path": full, "size": size,
-            "content": data.decode("utf-8", "replace"), "mtime": int(os.path.getmtime(full))}
+            "content": data.decode("utf-8", "replace"), "mtime": mtime_ns}
 
 
 @router.post("/write")
@@ -218,13 +226,19 @@ async def write_file(body: WriteBody):
     if len(body.content.encode()) > EDIT_LIMIT:
         raise HTTPException(413, "内容过大，请改用上传方式")
     if body.expected_mtime is not None and os.path.exists(full):
-        current = int(os.path.getmtime(full))
+        # 纳秒精度乐观锁：秒级精度下同秒内外部修改检测不到（st_mtime 只有秒级时更糟）
+        current = os.stat(full).st_mtime_ns
         if current != body.expected_mtime:
-            raise HTTPException(409, f"文件在编辑期间已被修改（磁盘上的版本更新于 {current}），"
+            when = time.strftime("%H:%M:%S", time.localtime(current / 1e9))
+            raise HTTPException(409, f"文件在编辑期间已被修改（磁盘版本更新于 {when}），"
                                      f"直接保存会覆盖它")
-    os.makedirs(os.path.dirname(full) or "/", exist_ok=True)
-    with open(full, "w", encoding="utf-8") as fh:
-        fh.write(body.content)
+
+    def _save() -> None:
+        os.makedirs(os.path.dirname(full) or "/", exist_ok=True)
+        with open(full, "w", encoding="utf-8") as fh:
+            fh.write(body.content)
+
+    await asyncio.to_thread(_save)  # 写盘不阻塞事件循环
     return {"ok": True, "message": f"已保存 {full}"}
 
 
@@ -234,9 +248,9 @@ async def make_dir(body: PathBody):
     if os.path.exists(full):
         raise HTTPException(400, "路径已存在")
     try:
-        os.makedirs(full, exist_ok=False)
+        await asyncio.to_thread(os.makedirs, full, exist_ok=False)
     except OSError as exc:
-        raise HTTPException(500, f"创建失败: {exc}")
+        raise HTTPException(500, f"创建失败: {exc.strerror or exc}")
     return {"ok": True, "message": f"已创建目录 {full}"}
 
 
@@ -250,11 +264,15 @@ async def rename(body: RenameBody):
         raise HTTPException(404, "源路径不存在")
     if os.path.exists(target):
         raise HTTPException(400, "目标路径已存在")
-    try:
+
+    def _move() -> None:
         os.makedirs(os.path.dirname(target) or "/", exist_ok=True)
-        shutil.move(source, target)
+        shutil.move(source, target)  # 跨设备 move = 复制 + 删除，大目录会很久
+
+    try:
+        await asyncio.to_thread(_move)
     except OSError as exc:
-        raise HTTPException(500, f"移动失败: {exc}")
+        raise HTTPException(500, f"移动失败: {exc.strerror or exc}")
     return {"ok": True, "message": f"已移动到 {target}"}
 
 
@@ -266,14 +284,18 @@ async def copy(body: RenameBody):
         raise HTTPException(404, "源路径不存在")
     if os.path.exists(target):
         raise HTTPException(400, "目标路径已存在")
-    try:
+
+    def _copy() -> None:
         if os.path.isdir(source):
             shutil.copytree(source, target, symlinks=True)
         else:
             os.makedirs(os.path.dirname(target) or "/", exist_ok=True)
             shutil.copy2(source, target)
+
+    try:
+        await asyncio.to_thread(_copy)  # 大目录复制动辄几十秒，绝不能卡事件循环
     except OSError as exc:
-        raise HTTPException(500, f"复制失败: {exc}")
+        raise HTTPException(500, f"复制失败: {exc.strerror or exc}")
     return {"ok": True, "message": f"已复制到 {target}"}
 
 
@@ -281,23 +303,28 @@ async def copy(body: RenameBody):
 async def delete(body: DeleteBody):
     if not body.paths:
         raise HTTPException(400, "未指定要删除的路径")
-    removed, failed = [], []
-    for item in body.paths:
-        full = _abs(item)
-        try:
-            _guard_delete(full)
-            if not os.path.lexists(full):
-                failed.append({"path": full, "error": "不存在"})
-                continue
-            if os.path.isdir(full) and not os.path.islink(full):
-                shutil.rmtree(full)
-            else:
-                os.remove(full)
-            removed.append(full)
-        except HTTPException as exc:
-            failed.append({"path": full, "error": exc.detail})
-        except OSError as exc:
-            failed.append({"path": full, "error": str(exc)})
+
+    def _delete() -> tuple[list, list]:
+        removed, failed = [], []
+        for item in body.paths:
+            full = _abs(item)
+            try:
+                _guard_delete(full)
+                if not os.path.lexists(full):
+                    failed.append({"path": full, "error": "不存在"})
+                    continue
+                if os.path.isdir(full) and not os.path.islink(full):
+                    shutil.rmtree(full)
+                else:
+                    os.remove(full)
+                removed.append(full)
+            except HTTPException as exc:
+                failed.append({"path": full, "error": exc.detail})
+            except OSError as exc:
+                failed.append({"path": full, "error": str(exc)})
+        return removed, failed
+
+    removed, failed = await asyncio.to_thread(_delete)  # rmtree 大目录会很久
     return {"ok": not failed, "removed": removed, "failed": failed,
             "message": f"已删除 {len(removed)} 项" + (f"，{len(failed)} 项失败" if failed else "")}
 
@@ -349,10 +376,13 @@ async def upload(
         if os.path.exists(destination) and not overwrite:
             failed.append({"name": raw_name, "error": "文件已存在"})
             continue
-        try:
-            os.makedirs(os.path.dirname(destination), exist_ok=True)
-            with open(destination, "wb") as fh:
+        def _save(dest: str = destination) -> None:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "wb") as fh:
                 shutil.copyfileobj(upload_file.file, fh, length=1024 * 1024)
+
+        try:
+            await asyncio.to_thread(_save)  # 大文件写盘不阻塞事件循环
             saved.append(destination)
         except OSError as exc:
             failed.append({"name": raw_name, "error": str(exc)})
@@ -458,23 +488,34 @@ def _extract(source: str, dest: str) -> int:
             return len(bundle.namelist())
     base = os.path.realpath(dest)
     count = 0
-    with tarfile.open(source, "r:*") as bundle:
-        if sys.version_info >= (3, 12):
-            bundle.extractall(dest, filter="data")   # 3.12+ 官方安全过滤器
-            return len(bundle.getmembers())
-        safe = []
-        for member in bundle.getmembers():
-            parts = Path(member.name).parts
-            if member.name.startswith(("/", "\\")) or ".." in parts:
-                continue  # 绝对路径 / 穿越目标目录：丢弃
-            if member.isdev():
-                continue  # 设备文件不还原
-            target = os.path.realpath(os.path.join(base, member.name))
-            if target != base and not target.startswith(base + os.sep):
-                continue
-            safe.append(member)
-        bundle.extractall(dest, members=safe)
-        count = len(safe)
+    try:
+        with tarfile.open(source, "r:*") as bundle:
+            if sys.version_info >= (3, 12):
+                # 3.12+ 官方安全过滤器：越界链接 / 设备文件 / 绝对路径会被拒绝并抛 FilterError
+                bundle.extractall(dest, filter="data")
+                return len(bundle.getmembers())
+            safe = []
+            for member in bundle.getmembers():
+                parts = Path(member.name).parts
+                if member.name.startswith(("/", "\\")) or ".." in parts:
+                    continue  # 绝对路径 / 穿越目标目录：丢弃
+                if member.isdev():
+                    continue  # 设备文件不还原
+                if member.issym() or member.islnk():
+                    # 链接不还原：「link -> /etc」+「link/shadow」两段式成员在校验阶段
+                    # 第二段的目标还不存在（realpath 解析不出逃逸），只有落盘后才暴露，
+                    # 因此这个分支直接不建链接，彻底断掉该路径（3.12+ 分支走官方 data 过滤器）
+                    continue
+                target = os.path.realpath(os.path.join(base, member.name))
+                if target != base and not target.startswith(base + os.sep):
+                    continue
+                safe.append(member)
+            bundle.extractall(dest, members=safe)
+            count = len(safe)
+    except tarfile.FilterError as exc:
+        # 越界条目被过滤器拦下：清掉半解压现场，按用户输入错误报 400 而不是 500
+        shutil.rmtree(dest, ignore_errors=True)
+        raise HTTPException(400, f"压缩包包含越界或非法条目，已中止解压（{type(exc).__name__}）")
     return count
 
 

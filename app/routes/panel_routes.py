@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import io
 import json
@@ -83,21 +84,21 @@ def _guard(fn, *args, **kwargs):
 @router.get("/boot")
 async def boot_probe(request: Request, _session: dict = Depends(require_internal)):
     health = await _health_probe(request)
-    data = _guard(boot_mod.probe, None, None, health)
+    data = await asyncio.to_thread(_guard, boot_mod.probe, None, None, health)  # 体检要跑一串系统命令
     return data
 
 
 @router.post("/boot/cron")
 async def cron_install(_session: dict = Depends(require_internal)):
     """写入容器 crontab 的 @reboot 兜底（幂等、可回滚）。"""
-    result = _guard(boot_mod.cron_install)
+    result = await asyncio.to_thread(_guard, boot_mod.cron_install)  # 读写 crontab 走子进程
     record("cron-install", result["message"])
     return result
 
 
 @router.delete("/boot/cron")
 async def cron_remove(_session: dict = Depends(require_internal)):
-    result = _guard(boot_mod.cron_remove)
+    result = await asyncio.to_thread(_guard, boot_mod.cron_remove)
     record("cron-remove", result["message"])
     return result
 
@@ -127,7 +128,7 @@ async def guardian_restart(_session: dict = Depends(require_internal)):
 
     app_dir = Path(boot_mod.listen_status()["app_dir"])
     record("guardian-restart", str(app_dir))
-    code = manage.cmd_restart(app_dir)
+    code = await asyncio.to_thread(manage.cmd_restart, app_dir)  # 可能触发 systemd/supervisor 子进程
     if code != 0:
         raise HTTPException(500, "重启指令下发失败，请查看 panel.log")
     return {"ok": True, "message": "重启指令已下发，面板将在数秒内回来"}
@@ -141,7 +142,9 @@ async def guardian_repair(_session: dict = Depends(require_internal)):
     listen = boot_mod.listen_status()
     app_dir = Path(listen["app_dir"])
     record("guardian-repair", f"{listen['host']}:{listen['port']}")
-    code = manage.cmd_install(app_dir, str(listen["host"]), int(listen["port"]))
+    code = await asyncio.to_thread(  # cmd_install 内含 pip install，可能跑数分钟
+        manage.cmd_install, app_dir, str(listen["host"]), int(listen["port"])
+    )
     if code != 0:
         raise HTTPException(500, "重装守护失败，请查看命令输出与 panel.log")
     return {"ok": True, "message": f"守护已按 {prefs_obj.get('listen.host')}:{prefs_obj.get('listen.port')} 重新安装"}
@@ -182,7 +185,7 @@ async def get_prefs(_session: dict = Depends(require_internal)):
 
 @router.put("/prefs")
 async def put_prefs(body: PrefsBody, _session: dict = Depends(require_internal)):
-    result = _guard(boot_mod.set_pref_with_check, body.values)
+    result = await asyncio.to_thread(_guard, boot_mod.set_pref_with_check, body.values)  # 含路径自检与写盘
     record("prefs", json.dumps(result["changed"], ensure_ascii=False)[:300])
     return {**result, "fields": prefs.describe()}
 
@@ -211,7 +214,7 @@ def recent_audit() -> list[dict]:
 
 @router.post("/logs/trim")
 async def trim_logs(_session: dict = Depends(require_internal)):
-    result = _guard(boot_mod.trim_logs)
+    result = await asyncio.to_thread(_guard, boot_mod.trim_logs)  # 逐个截断日志文件
     record("logs-trim", result["message"])
     return result
 
@@ -228,7 +231,7 @@ async def get_timezone(_session: dict = Depends(require_internal)):
 async def set_timezone(body: TimezoneBody, _session: dict = Depends(require_internal)):
     if os.name == "posix" and not is_root():
         raise HTTPException(403, "切换时区需要 root 权限（要写入 /etc/timezone 与 /etc/localtime）")
-    result = _guard(boot_mod.set_timezone, body.zone, body.enable_ntp)
+    result = await asyncio.to_thread(_guard, boot_mod.set_timezone, body.zone, body.enable_ntp)  # timedatectl 子进程
     record("timezone", result["message"])
     return {**result, "status": boot_mod.timezone_status()}
 
@@ -254,7 +257,7 @@ async def set_listen(body: ListenBody, _session: dict = Depends(require_internal
     if host in ("127.0.0.1", "::1") and current["host"] not in ("127.0.0.1", "::1") and not body.force:
         raise HTTPException(409, "改成只监听回环地址后，局域网设备将无法访问面板；"
                                  "确认继续请再次提交")
-    result = _guard(boot_mod.apply_listen, host, port)
+    result = await asyncio.to_thread(_guard, boot_mod.apply_listen, host, port)  # 写配置 + 下发重启
     record("listen", f"{current['host']}:{current['port']} → {result['host']}:{result['port']}")
     return result
 
@@ -452,17 +455,18 @@ async def import_config(file: UploadFile = File(...),
                                  "utf-8")
             applied.append("install.json")
 
+    # 统一判定「监听是否变更」：两处用同一表达式，避免 pending_restart 与提示语不一致
+    listen_changed = (isinstance(incoming_prefs, dict)
+                      and any(key.startswith("listen.") for key in incoming_prefs.keys()))
     record("config-import", f"applied={applied}")
     return {
         "ok": True,
         "applied": applied,
         "kept_secrets": sorted(kept),
         "backup": str(backup) if backup else None,
-        "pending_restart": any(key.startswith("listen.") for key in incoming_prefs.keys())
-        if isinstance(incoming_prefs, dict) else False,
+        "pending_restart": listen_changed,
         "message": "配置已导入（本机密码、Agent 令牌与运行模式保持不变）"
-                   + ("，监听地址变更需重启面板" if isinstance(incoming_prefs, dict)
-                      and "listen" in incoming_prefs else ""),
+                   + ("，监听地址变更需重启面板" if listen_changed else ""),
     }
 
 

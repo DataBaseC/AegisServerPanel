@@ -199,8 +199,8 @@ function setOfflineBanner(show) {
     banner = document.createElement('div');
     banner.id = 'offline-banner';
     banner.setAttribute('role', 'status');
-    banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#7f1d1d;'
-      + 'color:#fff;text-align:center;padding:6px 12px;font-size:13px;display:none';
+    banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#2a0d0d;'
+      + 'box-shadow:inset 0 -2px 0 #ff4d4d;color:#fff;text-align:center;padding:6px 12px;font-size:13px;display:none';
     banner.textContent = '⚠ 与服务器的连接中断，正在自动重试…（页面数据可能不是最新）';
     document.body.appendChild(banner);
   }
@@ -264,7 +264,7 @@ const api = {
 class Chart {
   constructor(canvas, opts = {}) {
     this.canvas = canvas;
-    this.series = opts.series || [{ color: '#38bdf8' }];
+    this.series = opts.series || [{ color: '#ffd802' }];
     this.capacity = opts.capacity || 60;
     this.fixedMax = opts.max ?? null;
     this.height = opts.height || 46;
@@ -308,7 +308,7 @@ class Chart {
     }
 
     // 横向网格
-    ctx.strokeStyle = 'rgba(255,255,255,.06)';
+    ctx.strokeStyle = 'rgba(107,116,128,.18)';
     ctx.lineWidth = 1;
     for (let i = 0; i <= 2; i += 1) {
       const y = Math.round((height - 1) * (i / 2)) + 0.5;
@@ -316,7 +316,7 @@ class Chart {
     }
 
     // 上限标注
-    ctx.fillStyle = 'rgba(157,176,197,.65)';
+    ctx.fillStyle = 'rgba(154,162,173,.75)';
     ctx.font = '10px ui-monospace, monospace';
     ctx.fillText(this.fmt(max), 3, 11);
 
@@ -420,9 +420,9 @@ const NAV = [
   { id: 'processes', label: '进程管理', icon: '⚙' },
   { id: 'services', label: '服务管理', icon: '⏻' },
   { id: 'apps-port', label: '应用与端口', icon: '⧉', internalOnly: true },
-  { id: 'files', label: '文件管理', icon: '🗀', internalOnly: true },
+  { id: 'files', label: '文件管理', icon: '▦', internalOnly: true },
   { id: 'agent', label: 'Agent 接入', icon: '⌘', internalOnly: true },
-  { id: 'security', label: '安全中心', icon: '🛡', internalOnly: true },
+  { id: 'security', label: '安全中心', icon: '◈', internalOnly: true },
   { id: 'settings', label: '设置', icon: '⚒' },
 ];
 
@@ -540,6 +540,42 @@ function initTabs() {
 }
 
 let viewSeq = 0;  // 视图代际：每次导航自增，过期的异步渲染结果一律丢弃
+let inflightResources = null;  // 正在渲染（还没 return cleanup）的那次导航的资源登记表
+
+/**
+ * 视图资源登记表：render 想随视图一起销毁、但**必须在渲染期间就登记**的东西
+ * （定时器 / 订阅 / 观察器）。
+ * 为什么不能只靠 render 的返回值：render 抛错时返回值根本拿不到，路由就永远
+ * 回收不了这个视图已经建好的定时器——那正是「进程管理 / 应用与端口」每 4~5 秒
+ * 在已卸载 DOM 上抛 TypeError 的来源（首屏 await 期间被切走 → reject → cleanup 丢失）。
+ * 登记过的资源在三种情况下都会被回收：视图正常销毁（cleanup）、render 抛错、
+ * 渲染期间被切走（seq 过期）。dispose() 可重复调用。
+ */
+function makeViewResources() {
+  const owned = [];
+  let disposed = false;
+  return {
+    get disposed() { return disposed; },
+    own(fn) {
+      if (typeof fn !== 'function') return fn;
+      if (disposed) {
+        // 视图已经被回收（render 还在跑，或结算得太晚）：后到的登记立刻执行，
+        // 否则「先切走、后订阅实时总线」这种竞态会留下一个对着空 DOM 的订阅
+        try { fn(); } catch (err) { console.error(err); }
+        return fn;
+      }
+      owned.push(fn);
+      return fn;
+    },
+    dispose() {
+      disposed = true;
+      while (owned.length) {
+        const fn = owned.pop();
+        try { fn(); } catch (err) { console.error(err); }
+      }
+    },
+  };
+}
 
 async function navigate(id) {
   const wanted = NAV.find((n) => n.id === id);
@@ -551,7 +587,12 @@ async function navigate(id) {
     try { currentCleanup(); } catch (err) { console.error(err); }
     currentCleanup = null;
   }
+  // 上一次导航的 render 可能还没结算（首屏请求很慢、甚至永远不结算）：
+  // 它的 cleanup 还没拿到，但它已经登记的资源现在就回收，不能无限期等它
+  if (inflightResources) { inflightResources.dispose(); inflightResources = null; }
   const seq = (viewSeq += 1);
+  const resources = makeViewResources();
+  inflightResources = resources;
   currentView = viewId;
   location.hash = `#/${viewId}`;
   renderTabs();
@@ -569,14 +610,19 @@ async function navigate(id) {
   host.innerHTML = '';
   host.appendChild(container);
   try {
-    const cleanup = (await def.render(container)) || null;
+    const cleanup = (await def.render(container, resources)) || null;
+    if (inflightResources === resources) inflightResources = null;
     if (seq !== viewSeq) {
       // 渲染期间用户已切去别的视图：立刻回收这个过期视图的定时器/监听
       if (cleanup) { try { cleanup(); } catch (err) { console.error(err); } }
+      resources.dispose();
       return;
     }
     currentCleanup = cleanup;
   } catch (err) {
+    if (inflightResources === resources) inflightResources = null;
+    // render 抛错也必须回收它已经登记的资源：视图没起来，定时器却活着会一直报错
+    resources.dispose();
     if (seq !== viewSeq) return;
     container.innerHTML = `<div class="card"><h2>加载失败</h2><div class="dim">${esc(err.message)}</div></div>`;
   }
@@ -705,7 +751,7 @@ window.addEventListener('hashchange', () => {
 
 registerView('overview', {
   title: '概览',
-  async render(root) {
+  async render(root, res) {
     const info = await api.get('/api/system/info');
     const addressRows = info.addresses.length
       ? info.addresses.map((a) => `<dd>${esc(a.address)} <span class="dim">(${esc(a.interface)})</span></dd>`).join('')
@@ -789,11 +835,12 @@ registerView('overview', {
       </div>`;
 
     const charts = {
-      cpu: new Chart($('#ov-cpu'), { max: 100, series: [{ color: '#38bdf8', fill: 'rgba(56,189,248,.25)' }], fmt: (v) => `${v.toFixed(0)}%` }),
-      mem: new Chart($('#ov-mem'), { max: 100, series: [{ color: '#a78bfa', fill: 'rgba(167,139,250,.25)' }], fmt: (v) => `${v.toFixed(0)}%` }),
-      disk: new Chart($('#ov-disk'), { series: [{ color: '#38bdf8', fill: 'rgba(56,189,248,.22)' }, { color: '#fbbf24' }], fmt: rate }),
-      net: new Chart($('#ov-net'), { series: [{ color: '#34d399', fill: 'rgba(52,211,153,.22)' }, { color: '#f472b6' }], fmt: rate }),
+      cpu: new Chart($('#ov-cpu'), { max: 100, series: [{ color: '#ffd802', fill: 'rgba(255,216,2,.16)' }], fmt: (v) => `${v.toFixed(0)}%` }),
+      mem: new Chart($('#ov-mem'), { max: 100, series: [{ color: '#4aa3ff', fill: 'rgba(74,163,255,.16)' }], fmt: (v) => `${v.toFixed(0)}%` }),
+      disk: new Chart($('#ov-disk'), { series: [{ color: '#ffd802', fill: 'rgba(255,216,2,.14)' }, { color: '#b26bff' }], fmt: rate }),
+      net: new Chart($('#ov-net'), { series: [{ color: '#b8e619', fill: 'rgba(184,230,25,.14)' }, { color: '#4aa3ff' }], fmt: rate }),
     };
+    res.own(() => Object.values(charts).forEach((c) => c.destroy()));
 
     const history = await api.get('/api/system/history').catch(() => ({ points: [] }));
     charts.cpu.load(history.points, (p) => [p.cpu]);
@@ -820,6 +867,9 @@ registerView('overview', {
     };
     if (live.metrics) update(live.metrics);
     const unsubscribe = live.subscribe(update);
+    // 订阅必须**当场**登记到路由：下面还有首屏 await（几秒），
+    // 期间被切走的话，晚登记的订阅会继续每 2 秒往已卸载的 DOM 写数据
+    res.own(unsubscribe);
 
     async function loadProcs() {
       try {
@@ -856,6 +906,7 @@ registerView('overview', {
 
     await Promise.all([loadProcs(), loadNets()]);
     const procTimer = every(6000, loadProcs);
+    res.own(() => clearInterval(procTimer));
 
     root.onclick = async (event) => {
       const action = event.target.dataset?.act;
@@ -892,7 +943,7 @@ registerView('overview', {
 
 registerView('performance', {
   title: '性能监控',
-  async render(root) {
+  async render(root, res) {
     root.innerHTML = `
       <div class="grid c2" style="margin-bottom:14px">
         <div class="card">
@@ -910,12 +961,12 @@ registerView('performance', {
         <div class="card">
           <h2>磁盘 I/O <span class="spacer"></span><span class="badge" id="pf-disk-now">--</span></h2>
           <canvas class="spark" id="pf-disk" style="height:110px"></canvas>
-          <div class="metric-sub">蓝：读取　黄：写入</div>
+          <div class="metric-sub">黄：读取　紫：写入</div>
         </div>
         <div class="card">
           <h2>网络吞吐 <span class="spacer"></span><span class="badge" id="pf-net-now">--</span></h2>
           <canvas class="spark" id="pf-net" style="height:110px"></canvas>
-          <div class="metric-sub">绿：接收　粉：发送</div>
+          <div class="metric-sub">酸绿：接收　蓝：发送</div>
         </div>
       </div>
       <div class="grid c2" style="margin-bottom:14px">
@@ -929,11 +980,12 @@ registerView('performance', {
       </div>`;
 
     const charts = {
-      cpu: new Chart($('#pf-cpu'), { max: 100, height: 120, series: [{ color: '#38bdf8', fill: 'rgba(56,189,248,.25)' }], fmt: (v) => `${v.toFixed(0)}%` }),
-      mem: new Chart($('#pf-mem'), { max: 100, height: 120, series: [{ color: '#a78bfa', fill: 'rgba(167,139,250,.25)' }], fmt: (v) => `${v.toFixed(0)}%` }),
-      disk: new Chart($('#pf-disk'), { height: 110, series: [{ color: '#38bdf8', fill: 'rgba(56,189,248,.22)' }, { color: '#fbbf24' }], fmt: rate }),
-      net: new Chart($('#pf-net'), { height: 110, series: [{ color: '#34d399', fill: 'rgba(52,211,153,.22)' }, { color: '#f472b6' }], fmt: rate }),
+      cpu: new Chart($('#pf-cpu'), { max: 100, height: 120, series: [{ color: '#ffd802', fill: 'rgba(255,216,2,.16)' }], fmt: (v) => `${v.toFixed(0)}%` }),
+      mem: new Chart($('#pf-mem'), { max: 100, height: 120, series: [{ color: '#4aa3ff', fill: 'rgba(74,163,255,.16)' }], fmt: (v) => `${v.toFixed(0)}%` }),
+      disk: new Chart($('#pf-disk'), { height: 110, series: [{ color: '#ffd802', fill: 'rgba(255,216,2,.14)' }, { color: '#b26bff' }], fmt: rate }),
+      net: new Chart($('#pf-net'), { height: 110, series: [{ color: '#b8e619', fill: 'rgba(184,230,25,.14)' }, { color: '#4aa3ff' }], fmt: rate }),
     };
+    res.own(() => Object.values(charts).forEach((c) => c.destroy()));
 
     const history = await api.get('/api/system/history').catch(() => ({ points: [] }));
     charts.cpu.load(history.points, (p) => [p.cpu]);
@@ -987,6 +1039,9 @@ registerView('performance', {
     };
     if (live.metrics) update(live.metrics);
     const unsubscribe = live.subscribe(update);
+    // 订阅必须**当场**登记到路由：下面还有首屏 await（几秒），
+    // 期间被切走的话，晚登记的订阅会继续每 2 秒往已卸载的 DOM 写数据
+    res.own(unsubscribe);
 
     async function loadProcs() {
       try {
@@ -1004,6 +1059,7 @@ registerView('performance', {
     }
     await loadProcs();
     const procTimer = every(5000, loadProcs);
+    res.own(() => clearInterval(procTimer));
 
     return () => {
       unsubscribe();
@@ -1041,10 +1097,10 @@ registerView('terminal', {
       scrollback: 5000,
       allowProposedApi: true,
       theme: {
-        background: '#05080c', foreground: '#dce7f3', cursor: '#38bdf8',
-        selectionBackground: 'rgba(56,189,248,.3)',
-        black: '#1b2530', red: '#f87171', green: '#34d399', yellow: '#fbbf24',
-        blue: '#60a5fa', magenta: '#c084fc', cyan: '#22d3ee', white: '#dce7f3',
+        background: '#08090b', foreground: '#e9ebee', cursor: '#ffd802',
+        selectionBackground: 'rgba(255,216,2,.24)',
+        black: '#1b1f24', red: '#ff4d4d', green: '#b8e619', yellow: '#ffd802',
+        blue: '#4aa3ff', magenta: '#b26bff', cyan: '#58c8c8', white: '#e9ebee',
       },
     });
     const fit = new FitAddon.FitAddon();
@@ -1149,7 +1205,7 @@ registerView('terminal', {
 
 registerView('logs', {
   title: '控制台 / 日志',
-  async render(root) {
+  async render(root, res) {
     const sources = await api.get('/api/logs/sources').catch(() => ({ journal: false, dmesg: false, files: [] }));
     const fileOptions = sources.files
       .map((f) => `<option value="${esc(f.path)}">${esc(f.path)} (${bytes(f.size)})</option>`).join('');
@@ -1283,6 +1339,7 @@ registerView('logs', {
         toast('已开启自动刷新（3 秒）');
       }
     };
+    res.own(() => clearInterval(timer));   // 自动刷新定时器也登记到路由
 
     await load();
     return () => { clearInterval(timer); clearTimeout(filterTimer); };
@@ -1460,7 +1517,7 @@ registerView('storage', {
 
 registerView('processes', {
   title: '进程管理',
-  async render(root) {
+  async render(root, res) {
     root.innerHTML = `
       <div class="card" style="margin-bottom:14px">
         <div class="toolbar" style="margin-bottom:0">
@@ -1482,15 +1539,27 @@ registerView('processes', {
     let loadSeq = 0;
 
     async function load() {
+      // 先把本次要写的节点抓在手里。视图可能已经被切走（上一代定时器 / 迟到的防抖回调），
+      // 这时读文档里的 #ps-search 会拿到 null，写入落在已脱离文档的旧节点上则无害作废。
+      const searchEl = $('#ps-search');
+      const sortEl = $('#ps-sort');
+      const table = $('#ps-table');
+      if (!searchEl || !sortEl || !table) {
+        // 残骸回调：顺手把定时器关掉（根因已在 navigate() 修掉，这里是双保险，
+        // 保证即使将来再出现孤儿定时器，也只在第一次触发时报一次）
+        clearInterval(timer);
+        return;
+      }
       const seq = ++loadSeq;  // 请求序号：自动刷新与搜索并发时只认最后一次结果
-      const q = encodeURIComponent($('#ps-search').value.trim());
-      const sort = $('#ps-sort').value;
+      const q = encodeURIComponent(searchEl.value.trim());
+      const sort = sortEl.value;
       try {
         const data = await api.get(`/api/processes?limit=200&sort=${sort}&q=${q}`);
         if (seq !== loadSeq) return;  // 期间已有更新的请求返回，这份旧数据作废
         rows = data.processes;
-        $('#ps-count').textContent = `${data.total} 个进程`;
-        $('#ps-table').innerHTML = rows.length ? `
+        const countEl = $('#ps-count');
+        if (countEl) countEl.textContent = `${data.total} 个进程`;
+        table.innerHTML = rows.length ? `
           <table class="data"><thead><tr>
             <th class="sortable" data-sort="pid">PID</th><th>名称</th><th>用户</th>
             <th class="num">CPU%</th><th class="num">内存%</th><th class="num">RSS</th>
@@ -1512,7 +1581,7 @@ registerView('processes', {
             </td></tr>`).join('')}</tbody></table>`
           : '<div class="empty">没有匹配的进程</div>';
       } catch (err) {
-        $('#ps-table').innerHTML = `<div class="empty">读取失败：${esc(err.message)}</div>`;
+        table.innerHTML = `<div class="empty">读取失败：${esc(err.message)}</div>`;
       }
     }
 
@@ -1573,6 +1642,7 @@ registerView('processes', {
     $('#ps-refresh').onclick = load;
     $('#ps-sort').onchange = load;
     let searchTimer = null;
+    res.own(() => clearTimeout(searchTimer));
     $('#ps-search').oninput = () => {
       clearTimeout(searchTimer);
       searchTimer = setTimeout(load, 260);
@@ -1583,6 +1653,7 @@ registerView('processes', {
       if (event.target.checked) timer = every(4000, load);
     };
     timer = every(4000, load);
+    res.own(() => clearInterval(timer));   // 先登记再生效：render 抛错时路由也能关掉它
 
     $('#ps-table').onclick = (event) => {
       const sorter = event.target.closest('[data-sort]');
@@ -1610,7 +1681,7 @@ registerView('processes', {
 
 registerView('apps-port', {
   title: '应用与端口',
-  async render(root) {
+  async render(root, res) {
     root.innerHTML = `
       <div class="card" style="margin-bottom:14px">
         <div class="toolbar" style="margin-bottom:0">
@@ -1646,15 +1717,23 @@ registerView('apps-port', {
     }
 
     async function load() {
+      // 同「进程管理」：节点先抓在手里；视图已被切走就让旧回调作废并关掉定时器
+      const countEl = $('#apps-count');
+      const searchEl = $('#apps-search');
+      const table = $('#apps-table');
+      if (!countEl || !searchEl || !table) {
+        clearInterval(timer);
+        return;
+      }
       try {
         const data = await api.get('/api/apps');
-        $('#apps-count').textContent = `${data.total_apps} 个应用 · ${data.total_ports} 个监听端口`;
-        const q = $('#apps-search').value.trim().toLowerCase();
+        countEl.textContent = `${data.total_apps} 个应用 · ${data.total_ports} 个监听端口`;
+        const q = searchEl.value.trim().toLowerCase();
         const rows = (data.apps || []).filter((a) => !q
           || a.name.toLowerCase().includes(q)
           || (a.cmdline || '').toLowerCase().includes(q)
           || a.ports.some((p) => S(p.port).includes(q)));
-        $('#apps-table').innerHTML = rows.length ? `
+        table.innerHTML = rows.length ? `
           <table class="data"><thead><tr>
             <th>应用</th><th>PID</th><th>用户</th><th class="num">内存%</th>
             <th>监听端口 / 访问入口</th><th>命令行</th></tr></thead>
@@ -1668,12 +1747,13 @@ registerView('apps-port', {
           </tr>`).join('')}</tbody></table>`
           : '<div class="empty">没有匹配的应用</div>';
       } catch (err) {
-        $('#apps-table').innerHTML = `<div class="empty">读取失败：${esc(err.message)}</div>`;
+        table.innerHTML = `<div class="empty">读取失败：${esc(err.message)}</div>`;
       }
     }
 
     $('#apps-refresh').onclick = load;
     let searchTimer = null;
+    res.own(() => clearTimeout(searchTimer));
     $('#apps-search').oninput = () => {
       clearTimeout(searchTimer);
       searchTimer = setTimeout(load, 200);
@@ -1684,6 +1764,7 @@ registerView('apps-port', {
       if (event.target.checked) timer = every(5000, load);
     };
     timer = every(5000, load);
+    res.own(() => clearInterval(timer));   // 先登记再生效：render 抛错时路由也能关掉它
 
     await load();
     return () => { clearInterval(timer); clearTimeout(searchTimer); };
@@ -1741,15 +1822,21 @@ registerView('services', {
     };
 
     async function load() {
+      // 同「进程管理」：节点先抓在手里，视图已被切走就让迟到的回调作废
+      const searchEl = $('#sv-search');
+      const stateEl = $('#sv-state');
+      const table = $('#sv-table');
+      if (!searchEl || !stateEl || !table) return;
       const seq = ++loadSeq;  // 请求序号：搜索与手动刷新并发时只认最后一次结果
-      const q = encodeURIComponent($('#sv-search').value.trim());
-      const state = $('#sv-state').value;
+      const q = encodeURIComponent(searchEl.value.trim());
+      const state = stateEl.value;
       try {
         const data = await api.get(`/api/services?q=${q}&state=${state}`);
         if (seq !== loadSeq) return;
         services = data.services;
-        $('#sv-count').textContent = `${data.total} 个服务`;
-        $('#sv-table').innerHTML = services.length ? `
+        const countEl = $('#sv-count');
+        if (countEl) countEl.textContent = `${data.total} 个服务`;
+        table.innerHTML = services.length ? `
           <table class="data"><thead><tr><th>服务</th><th>状态</th><th>开机自启</th><th>描述</th><th></th></tr></thead>
           <tbody>${services.map((s, index) => `<tr>
             <td class="cell-main">${esc(s.unit)}</td>
@@ -1769,7 +1856,7 @@ registerView('services', {
             </td></tr>`).join('')}</tbody></table>`
           : '<div class="empty">没有匹配的服务</div>';
       } catch (err) {
-        $('#sv-table').innerHTML = `<div class="empty">读取失败：${esc(err.message)}</div>`;
+        table.innerHTML = `<div class="empty">读取失败：${esc(err.message)}</div>`;
       }
     }
 
@@ -2426,7 +2513,7 @@ registerView('files', {
 
 registerView('agent', {
   title: 'Agent 接入',
-  async render(root) {
+  async render(root, res) {
     let info = null;
     let timer = null;
     let snippets = [];          // 由 /api/snippets 提供（服务端按当前地址渲染）
@@ -2670,6 +2757,8 @@ registerView('agent', {
 
     await refresh();
     timer = every(8000, loadRecent);
+    res.own(() => clearInterval(timer));   // 登记到路由：render 抛错也能回收
+    res.own(() => clearTimeout(searchTimer));
     return () => { clearInterval(timer); clearTimeout(searchTimer); };
   },
 });
@@ -2715,7 +2804,7 @@ function formDialog({ title, fields, confirmText = '确定', note = '' }) {
 
 registerView('apps', {
   title: '常驻应用',
-  async render(root) {
+  async render(root, res) {
     let tab = localStorage.getItem('sp-apps-tab') === 'tasks' ? 'tasks' : 'apps';
     let data = { apps: [], self: {}, audit: [] };
     let tasks = { tasks: [], recent: [] };
@@ -3155,6 +3244,7 @@ registerView('apps', {
     }
     paint();
     timer = every(3000, () => { if (!logState) refresh().catch(() => {}); else loadLog(); });
+    res.own(() => clearInterval(timer));   // 登记到路由：render 抛错也能回收
     return () => { clearInterval(timer); };
   },
 });

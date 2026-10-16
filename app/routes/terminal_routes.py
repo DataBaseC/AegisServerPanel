@@ -133,16 +133,20 @@ async def exec_command(body: ExecBody, auth: dict = Depends(require_exec_auth)):
         cwd=body.cwd if body.cwd and os.path.isdir(body.cwd) else None,
     )
     # 统一审计管道：落盘可追溯（面板会话与 Agent 令牌共用同一通道）
+    kind = "agent" if auth.get("kind") == "agent" else "web"
     audit.record(AuditEvent(
         action="exec",
         target=body.command,  # AuditEvent 内部统一截断到 2000 字符
         summary=f"cwd={body.cwd or '-'} timeout={body.timeout:g}s",
-        source="agent" if auth.get("kind") == "agent" else "web",
+        source=kind,
         ip=auth.get("ip", ""),
         actor=auth.get("token_name", ""),
         ok=result.code == 0,
         code=result.code,
         duration=time.time() - started,
+        # 兼容字段：面板「Agent 接入 → 最近执行」按 kind/command 渲染
+        # （1.4.0 换成审计事件后这两列曾经变成空白/错标）
+        extra={"kind": kind, "command": body.command[:2000]},
     ))
     return {"code": result.code, "stdout": result.out, "stderr": result.err}
 

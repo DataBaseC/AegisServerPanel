@@ -427,9 +427,6 @@ async def upload(
     target_dir = _abs(path)
     if not os.path.isdir(target_dir):
         raise HTTPException(400, "上传目标必须是已存在的目录")
-    # 符号链接逃逸防护（1.4.0）：目标目录自身不得是指向外部的链接
-    if not _within(target_dir, target_dir):
-        raise HTTPException(400, "上传目标目录是指向外部的符号链接，已拒绝")
     saved, failed = [], []
     for upload_file in files:
         raw_name = (upload_file.filename or "unnamed").replace("\\", "/")
@@ -438,7 +435,10 @@ async def upload(
             failed.append({"name": raw_name, "error": "文件名不合法"})
             continue
         destination = os.path.join(target_dir, *parts)
-        # 逐级校验：中间目录若是逃逸链接，落盘位置会跑到目标目录之外
+        # 符号链接逃逸防护（1.4.1 修）：中间目录或最终目标若是指向
+        # target_dir 之外的链接，落盘位置会跑到用户看到的目录之外。
+        # 原实现在这里调 _within(target_dir, target_dir)——按定义恒为真，
+        # 等于没有检查。
         probe = target_dir
         escaped = False
         for part in parts[:-1]:
@@ -448,6 +448,9 @@ async def upload(
                 break
         if escaped:
             failed.append({"name": raw_name, "error": "路径中包含逃逸符号链接，已拒绝"})
+            continue
+        if os.path.islink(destination) and not _within(target_dir, destination):
+            failed.append({"name": raw_name, "error": "目标是逃逸符号链接，已拒绝"})
             continue
         if os.path.exists(destination) and not overwrite:
             failed.append({"name": raw_name, "error": "文件已存在"})
@@ -667,9 +670,13 @@ def _ip_blocked(ip_text: str) -> bool:
 def _assert_url_allowed(url: str) -> None:
     """URL 级 SSRF 校验：协议白名单 + 主机名解析后不得落入私网。
 
-    解析在此处一次性完成并返回给调用方复用，避免「校验用 DNS、连接用
-    另一套解析」的 TOCTOU 窗口（DNS rebinding）。配置
-    ``fetch_allow_private=true`` 可显式放行内网目标（内网运维场景）。
+    配置 ``fetch_allow_private=true`` 可显式放行内网目标（内网运维场景）。
+
+    **残余风险（1.4.1 起如实标注）**：这里是"解析→校验→交给 urllib 连接"，
+    连接时 urllib 会**重新解析一次域名**，因此理论上存在 DNS rebinding 的
+    TOCTOU 窗口；本函数不再声称"防住 rebinding"。真正消除它需要把连接
+    固定到已校验的 IP（自定义 opener / 直连 IP + Host 头），代价与收益
+    不成比例，这里只做"DNS 层拦截 + 重定向逐跳复核"。
     """
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
@@ -693,6 +700,16 @@ def _assert_url_allowed(url: str) -> None:
                                      f"已被 SSRF 防护拦截（可在配置中放行私网）")
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """关闭 urllib 的自动跳转：重定向由 _fetch_sync 自己逐跳校验。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        return None
+
+
+_FETCH_MAX_REDIRECTS = 5
+
+
 def _within(root: str, path: str) -> bool:
     """realpath(path) 是否仍落在 realpath(root) 之内（符号链接逃逸防护）。"""
     real_root = os.path.realpath(root)
@@ -700,18 +717,40 @@ def _within(root: str, path: str) -> bool:
     return real_path == real_root or real_path.startswith(real_root + os.sep)
 
 
+def _open_checked(url: str):
+    """逐跳校验并打开 URL，返回 (response, final_url)。
+
+    每跳都先过 _assert_url_allowed 再发起请求，避免"只有最终 URL 被复核"
+    ——自动跳转时中间那几跳（例如先跳到 127.0.0.1 触发探测）不会被看到。
+    """
+    opener = urllib.request.build_opener(_NoRedirect)
+    current = url
+    for _ in range(_FETCH_MAX_REDIRECTS + 1):
+        _assert_url_allowed(current)
+        request = urllib.request.Request(current, headers={
+            "User-Agent": "AegisServerPanel/1.4",
+            "Accept": "*/*",
+        })
+        resp = opener.open(request, timeout=FETCH_TIMEOUT)
+        status = getattr(resp, "status", None) or resp.getcode()
+        if status in (301, 302, 303, 307, 308):
+            location = resp.headers.get("Location")
+            with contextlib.suppress(Exception):
+                resp.close()
+            if not location:
+                raise HTTPException(502, f"重定向缺少 Location（HTTP {status}）")
+            current = urllib.parse.urljoin(current, location)
+            continue
+        return resp, current
+    raise HTTPException(502, f"重定向次数超过 {_FETCH_MAX_REDIRECTS} 次，已中止")
+
+
 def _fetch_sync(url: str, dest_file: str) -> int:
-    """同步流式下载，返回字节数。仅 http/https，且目标不得是内网地址。"""
-    _assert_url_allowed(url)
-    request = urllib.request.Request(url, headers={"User-Agent": "AegisServerPanel/1.4"})
+    """同步流式下载，返回字节数。仅 http/https，且每一跳都不得是内网地址。"""
     total = 0
     try:
-        with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT) as resp, \
-                open(dest_file, "wb") as fh:
-            # 重定向可能跳到内网：逐跳复核最终 URL
-            final_url = resp.geturl()
-            if final_url != url:
-                _assert_url_allowed(final_url)
+        resp, _final = _open_checked(url)
+        with resp, open(dest_file, "wb") as fh:
             while True:
                 chunk = resp.read(FETCH_CHUNK)
                 if not chunk:
@@ -743,9 +782,11 @@ async def fetch_url(body: FetchBody, request: Request):
     dest_file = os.path.join(dest_dir, name)
     if os.path.exists(dest_file):
         raise HTTPException(400, f"目标已存在：{dest_file}")
-    # 符号链接逃逸防护：目标目录内的链接不得指向声明边界之外
-    if not _within(dest_dir, os.path.dirname(dest_file) or dest_dir):
-        raise HTTPException(400, "目标目录内包含指向外部的符号链接，已拒绝写入")
+    # 符号链接逃逸防护（1.4.1 修）：原实现在这里比的是
+    # _within(dest_dir, dirname(dest_file))，而 dirname == dest_dir，
+    # 按定义恒为真。真正要拦的是"同名的符号链接指向目标目录之外"。
+    if os.path.islink(dest_file) and not _within(dest_dir, dest_file):
+        raise HTTPException(400, "目标文件是指向目录之外的符号链接，已拒绝写入")
     size = await asyncio.to_thread(_fetch_sync, body.url, dest_file)
     audit.record(AuditEvent(action="file_fetch", target=dest_file,
                             summary=f"url={body.url[:500]} bytes={size}",

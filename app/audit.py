@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import queue
@@ -32,6 +33,10 @@ _MAX_TARGET = 1024
 
 # 内存速览缓冲（面板「最近事件」直接读它，不碰盘）
 _RECENT_MAX = 200
+
+# 查询时的倒读粒度与单文件读取上限（避免 readlines() 把整天文件塞进内存）
+_READ_CHUNK = 256 * 1024
+_MAX_READ_BYTES = 8 * 1024 * 1024
 
 # 默认保留天数；SERVERPANEL_AUDIT_RETENTION_DAYS 可覆盖
 _DEFAULT_RETENTION_DAYS = 90
@@ -139,6 +144,10 @@ class AuditLog:
         with self._lock:
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
+            # 文件本身也要 0600（目录 0700 之外的第二道；文档原先声称
+            # 0600 但只 chmod 了目录）
+            with contextlib.suppress(OSError):
+                os.chmod(path, 0o600)
             with self._recent_lock_guard():
                 self._recent.append(event.to_dict())
                 if len(self._recent) > _RECENT_MAX:
@@ -174,12 +183,47 @@ class AuditLog:
             items = list(reversed(self._recent))
         return items[: max(1, min(limit, 500))]
 
+    @staticmethod
+    def _tail_lines(path: Path, min_lines: int) -> list[str]:
+        """从文件尾部倒读，返回最近若干行（保持原顺序）。
+
+        1.4.1 起不再 ``readlines()`` 整文件：一次查询可能只要 500 条，
+        却把几十上百 MB 读进内存（实测 44.6MB 文件峰值 51MB），
+        在手机上直接把面板拖死。这里按块倒读，最多读
+        :data:`_MAX_READ_BYTES`，读够 ``min_lines`` 就停。
+
+        代价：单个文件超过该上限时更早的事件查不到（需要就看磁盘上的
+        JSONL）。这是"面板可用性优先"的取舍，文档已写明。
+        """
+        lines: list[str] = []
+        buf = b""
+        read = 0
+        reached_start = False
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                pos = fh.tell()
+                while pos > 0 and read < _MAX_READ_BYTES and len(lines) < min_lines + 1:
+                    step = min(_READ_CHUNK, pos)
+                    pos -= step
+                    fh.seek(pos)
+                    buf = fh.read(step) + buf
+                    read += step
+                    lines = buf.split(b"\n")
+                reached_start = pos == 0
+        except OSError:
+            return []
+        rows = buf.decode("utf-8", "replace").split("\n")
+        if not reached_start and rows:
+            rows = rows[1:]  # 首行可能被块边界截断，丢弃
+        return [row for row in rows if row.strip()]
+
     def query(self, days: int = 7, action: str = "", source: str = "",
               q: str = "", limit: int = 500) -> list[dict]:
         """按条件查审计日志：读最近 N 天的文件，倒序返回。
 
         ``action`` / ``source`` 精确匹配；``q`` 对 target+summary 做大小写
-       不敏感的子串匹配。查询走文件尾部的 reverse 读取，天数越大越慢，
+       不敏感的子串匹配。查询从文件尾部倒读（不再全量载入内存），
        所以 limit 与 days 都有上限。
         """
         days = max(1, min(days, 90))
@@ -190,12 +234,7 @@ class AuditLog:
             path = self._path_for(now - offset * 86400)
             if not path.exists():
                 continue
-            try:
-                with open(path, "r", encoding="utf-8") as fh:
-                    lines = fh.readlines()
-            except OSError:
-                continue
-            for line in reversed(lines):
+            for line in reversed(self._tail_lines(path, limit)):
                 item = self._parse_line(line)
                 if item is None:
                     continue  # 空行或半行（写入中途被杀）

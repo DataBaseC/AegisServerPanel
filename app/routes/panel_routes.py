@@ -14,6 +14,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import socket
 import time
 import zipfile
@@ -73,7 +74,9 @@ def record(action: str, detail: str = "", ip: str = "") -> None:
 
 @router.get("/audit")
 async def audit_timeline(request: Request, _session: dict = Depends(require_internal)):
-    return {"recent": recent_audit()}
+    # 读审计文件是同步磁盘 I/O，必须下线程池（1.4.1 修：原实现在
+    # async 路由里直调，日志一大就冻住整个事件循环）
+    return {"recent": await asyncio.to_thread(recent_audit)}
 
 
 def recent_audit() -> list[dict]:
@@ -209,7 +212,8 @@ async def get_prefs(_session: dict = Depends(require_internal)):
         "pending_restart": False,
         "listen": boot_mod.listen_status(),
         "timezone": boot_mod.timezone_status(),
-        "audit": recent_audit(),
+        # 读审计文件（含 apps/task 视图）是同步 I/O，下线程池（1.4.1）
+        "audit": await asyncio.to_thread(recent_audit),
     }
 
 
@@ -547,6 +551,8 @@ async def security_summary(request: Request, _session: dict = Depends(require_in
     """安全中心摘要：2FA 状态、防爆破状态、会话与令牌概况、审计统计。"""
     from ..auth import failures
 
+    # 审计统计要扫最近 7 天的 JSONL，同样是同步 I/O → 下线程池
+    audit_counts = await asyncio.to_thread(audit.actions_summary, 7)
     return {
         "totp": {
             "enabled": config.totp_enabled,
@@ -561,7 +567,7 @@ async def security_summary(request: Request, _session: dict = Depends(require_in
             "total": len(config.agent_tokens),
             "full": sum(1 for t in config.agent_tokens if t.get("scope") == "full"),
         },
-        "audit": audit.actions_summary(days=7),
+        "audit": audit_counts,
         "trash": trash.usage(),
     }
 
@@ -570,8 +576,8 @@ async def security_summary(request: Request, _session: dict = Depends(require_in
 async def audit_log(days: int = 7, action: str = "", source: str = "", q: str = "",
                     limit: int = 200, _session: dict = Depends(require_internal)):
     """统一审计日志查询（安全中心 → 审计日志）。"""
-    return {"events": audit.query(days=days, action=action, source=source,
-                                  q=q, limit=limit)}
+    events = await asyncio.to_thread(audit.query, days, action, source, q, limit)
+    return {"events": events}
 
 
 @router.get("/sessions")
@@ -594,18 +600,27 @@ class SessionIdBody(BaseModel):
     id: str
 
 
+# 会话短标识：token_digest() 的前 12 位十六进制
+_SESSION_ID_RE = re.compile(r"[0-9a-f]{12}")
+
+
 @router.post("/sessions/revoke")
 async def revoke_session(body: SessionIdBody, request: Request,
                          _session: dict = Depends(require_internal)):
-    """踢出指定会话（按哈希前缀定位）。"""
-    target = None
-    for digest in list(sessions_mod._sessions):
-        if digest.startswith(body.id):
-            target = digest
-            break
+    """踢出指定会话（按列表里展示的 12 位哈希短标识精确定位）。
+
+    1.4.1 修：原实现用 ``digest.startswith(body.id)`` 做前缀匹配且不校验
+    长度——``id=""`` 会匹配到字典里的第一个会话并把它踢掉，"不能踢当前
+    会话"的守卫也只在 id 恰好 12 位时才生效。现在要求 id 必须是
+    12 位十六进制，并且必须与某个会话的短标识完全相等。
+    """
+    if not _SESSION_ID_RE.fullmatch(body.id or ""):
+        raise HTTPException(400, "会话标识格式不对（应为 12 位十六进制短标识）")
+    target = next((d for d in list(sessions_mod._sessions)
+                   if d[:12] == body.id), None)
     if target is None:
         raise HTTPException(404, "会话不存在或已过期")
-    if target[:12] == body.id and _is_current(request, target):
+    if _is_current(request, target):
         raise HTTPException(400, "不能踢出当前会话（请直接退出登录）")
     if sessions_mod.revoke_digest(target):
         audit.record(AuditEvent(action="session_revoked", target=body.id,

@@ -102,7 +102,8 @@ async def list_apps(_session: dict = Depends(require_internal)):
             "log_dir": str(supervisor.log_dir),
             "systemd": os.path.isdir("/run/systemd/system"),
         },
-        "audit": recent_audit(),
+        # 读审计文件是同步 I/O，下线程池（1.4.1）
+        "audit": await asyncio.to_thread(recent_audit),
     }
 
 

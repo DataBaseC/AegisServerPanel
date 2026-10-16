@@ -47,7 +47,13 @@ def code(secret_b32: str, at: float | None = None) -> str:
 
 
 def verify(secret_b32: str, candidate: str, at: float | None = None) -> bool:
-    """校验动态码，容忍 ±1 步漂移；空码/格式错直接拒。"""
+    """校验动态码，容忍 ±1 步漂移；空密钥/空码/格式错直接拒。
+
+    空密钥必须显式拒绝：``hmac.new(b"", ...)`` 是合法调用，会算出一个
+    任何人都能复现的"动态码"，等于没有第二因素。
+    """
+    if not secret_b32:
+        return False
     candidate = (candidate or "").strip().replace(" ", "")
     if len(candidate) != _DIGITS or not candidate.isdigit():
         return False

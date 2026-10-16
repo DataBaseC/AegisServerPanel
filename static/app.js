@@ -2428,17 +2428,13 @@ registerView('agent', {
   title: 'Agent 接入',
   async render(root) {
     let info = null;
-    let revealed = false;
     let timer = null;
     let snippets = [];          // 由 /api/snippets 提供（服务端按当前地址渲染）
     let snippetQuery = '';
 
-    const mask = (t) => (t ? `${t.slice(0, 6)}••••••${t.slice(-4)}` : '');
-
     async function loadSnippets() {
-      // 令牌未「显示」时不带 reveal_token，服务端渲染为 YOUR_TOKEN 占位符
+      // 令牌只存哈希、无法回显：片段里的令牌位固定是 YOUR_TOKEN 占位符
       const params = new URLSearchParams();
-      if (revealed) params.set('reveal_token', '1');
       if (snippetQuery) params.set('q', snippetQuery);
       const query = params.toString();
       const data = await api.get(`/api/snippets${query ? `?${query}` : ''}`);
@@ -2477,11 +2473,11 @@ registerView('agent', {
         <th class="num">退出码</th><th class="num">耗时</th></tr></thead>
         <tbody>${records.map((r) => `<tr>
           <td class="cell-sub">${datetime(r.time)}</td>
-          <td>${r.kind === 'agent'
+          <td>${(r.kind || r.source) === 'agent'
             ? '<span class="badge warn">Agent</span>'
             : '<span class="badge info">面板</span>'}</td>
           <td class="cell-sub">${esc(r.ip || '-')}</td>
-          <td class="cell-main" title="${esc(r.command)}">${esc(S(r.command).slice(0, 80))}</td>
+          <td class="cell-main" title="${esc(r.command || r.target || '')}">${esc(S(r.command || r.target).slice(0, 80))}</td>
           <td class="num"><span class="badge ${r.code === 0 ? 'ok' : 'danger'}">${r.code}</span></td>
           <td class="num">${r.duration}s</td>
         </tr>`).join('')}</tbody></table></div>`;
@@ -2499,29 +2495,45 @@ registerView('agent', {
       }
     }
 
+    /** 一次性展示令牌明文（磁盘只存哈希，关掉就找不回来）。 */
+    function showPlainToken(token) {
+      const body = document.createElement('div');
+      body.innerHTML = `
+        <div style="line-height:1.8;font-size:13px">
+          <p style="margin-top:0">令牌明文<b>仅此一次</b>展示，关闭后无法找回；磁盘上只保存 SHA-256 哈希。</p>
+          <div class="token-box"><code>${esc(token || '')}</code></div>
+          <div class="row" style="margin-top:10px">
+            <button class="btn sm ghost" id="agt-token-copy">复制令牌</button>
+          </div>
+        </div>`;
+      const foot = document.createElement('div');
+      foot.className = 'row';
+      foot.innerHTML = '<button class="btn primary" data-ok>我已保存</button>';
+      const modal = openModal({ title: '令牌已生成', body, footer: foot, size: 'narrow' });
+      $('#agt-token-copy', body).onclick = () => copyText(token, '令牌已复制');
+      $('[data-ok]', foot).onclick = () => modal.close();
+    }
+
     function paint() {
-      const tokenShown = info.enabled ? (revealed ? info.token : mask(info.token)) : '';
       root.innerHTML = `
         <div class="grid c2">
           <div class="card">
             <h2>Agent 令牌</h2>
             <div class="row">
-              <span class="badge ${info.enabled ? 'ok' : 'danger'}">${info.enabled ? '已启用' : '未生成'}</span>
+              <span class="badge ${info.enabled ? 'ok' : 'danger'}">${info.enabled ? `已启用 ${info.token_count || 0} 个` : '未生成'}</span>
+              ${info.full_tokens ? `<span class="badge warn">${info.full_tokens} 个完整权限</span>` : '<span class="badge">无完整权限令牌</span>'}
               <span class="dim" style="font-size:12px">${info.token_updated_at ? `更新于 ${datetime(info.token_updated_at)}` : ''}</span>
             </div>
             <div class="token-box">
-              <code id="agt-token">${info.enabled ? esc(tokenShown) : '尚未生成令牌'}</code>
+              <code>令牌以 SHA-256 哈希存储，创建后<b>无法再次回显</b>；请在「安全中心 → Agent 令牌」按最小权限签发</code>
             </div>
             <div class="row" style="margin-top:12px">
-              <button class="btn sm ghost" data-act="reveal" ${info.enabled ? '' : 'disabled'}>显示 / 隐藏</button>
-              <button class="btn sm ghost" data-act="copy" ${info.enabled ? '' : 'disabled'}>复制令牌</button>
-              <div class="spacer"></div>
-              <button class="btn sm primary" data-act="rotate">生成 / 轮换</button>
-              <button class="btn sm danger" data-act="revoke" ${info.enabled ? '' : 'disabled'}>吊销</button>
+              <button class="btn sm primary" data-act="rotate">生成新令牌（full）</button>
+              <button class="btn sm ghost" data-act="goto-security">安全中心管理令牌</button>
             </div>
             <div class="dim" style="font-size:12px;margin-top:12px;line-height:1.7">
-              令牌保存在服务器本机配置文件（权限 0600），<b>仅在【内网模式】下生效</b>；
-              关闭内网模式后所有 Agent 请求立即被拒绝。也可在服务器执行
+              令牌保存在服务器本机配置文件（权限 0600），磁盘上只有哈希，明文仅在创建时展示一次；
+              <b>仅在【内网模式】下生效</b>，关闭内网模式后所有 Agent 请求立即被拒绝。也可在服务器执行
               <span class="mono">serverpanel --agent-token</span> 生成。
             </div>
           </div>
@@ -2531,7 +2543,7 @@ registerView('agent', {
             <dl class="kv" style="grid-template-columns:96px 1fr">
               <dt>请求地址</dt><dd>POST ${esc(info.base_url)}${esc(info.endpoint)}</dd>
               <dt>鉴权头</dt><dd>X-Agent-Token: &lt;令牌&gt;</dd>
-              <dt>兼容方式</dt><dd>Authorization: Bearer &lt;令牌&gt; 或 ?token=&lt;令牌&gt;</dd>
+              <dt>兼容方式</dt><dd>Authorization: Bearer &lt;令牌&gt;（不再支持 ?token= 查询参数）</dd>
               <dt>请求体</dt><dd>{"command":"ls -al","cwd":"/opt","timeout":60}</dd>
               <dt>返回体</dt><dd>{"code":0,"stdout":"...","stderr":"..."}</dd>
               <dt>运行身份</dt><dd>${info.is_root ? '<span class="badge warn">root</span>' : '<span class="badge danger">非 root</span>'} · ${esc(info.shell)}</dd>
@@ -2594,45 +2606,18 @@ registerView('agent', {
       if (!button) return;
       const action = button.dataset.act;
 
-      if (action === 'reveal') {
-        revealed = !revealed;
-        $('#agt-token').textContent = revealed ? info.token : mask(info.token);
-        try {
-          await loadSnippets();               // 示例中的令牌同步显示/占位
-          $('#agt-snippets').innerHTML = snippetHTML();
-        } catch (err) { toast(err.message, 'err'); }
-        return;
-      }
-      if (action === 'copy') {
-        if (!info.token) { toast('尚未生成令牌', 'err'); return; }
-        copyText(info.token, '令牌已复制');
-        return;
-      }
+      if (action === 'goto-security') { navigate('security'); return; }
       if (action === 'rotate') {
         const ok = await confirmDialog({
-          title: '生成 / 轮换 Agent 令牌', confirmText: '生成',
-          message: '生成新令牌后，<b>旧令牌会立即失效</b>，正在使用旧令牌的脚本或 Agent 需要更新。确定继续吗？',
+          title: '生成 Agent 令牌', confirmText: '生成',
+          message: '将新建一个 <b>完整权限（full）</b>令牌，明文只在下一步展示一次。'
+            + '建议改用「安全中心 → 创建令牌」按最小权限签发。确定继续吗？',
         });
         if (!ok) return;
         try {
-          await api.post('/api/agent/token', { token: '' });
-          revealed = true;
+          const res = await api.post('/api/agent/token', { token: '' });
           await refresh();
-          toast('新令牌已生成');
-        } catch (err) { toast(err.message, 'err'); }
-        return;
-      }
-      if (action === 'revoke') {
-        const ok = await confirmDialog({
-          title: '吊销 Agent 令牌', danger: true, confirmText: '吊销',
-          message: '吊销后所有使用该令牌的脚本与 Agent 将立即失去访问权限。确定继续吗？',
-        });
-        if (!ok) return;
-        try {
-          await api.del('/api/agent/token');
-          revealed = false;
-          await refresh();
-          toast('令牌已吊销');
+          showPlainToken(res.token);
         } catch (err) { toast(err.message, 'err'); }
         return;
       }

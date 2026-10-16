@@ -1,12 +1,14 @@
 """会话管理：登录令牌签发、校验、失败锁定。
 
 会话写穿到 sessions.json（0600，与配置文件同目录）：
-重启后面板登录态不丢，升级对浏览器用户无感。
+重启后面板登录态不丢。
 
 1.4.0 起：
 
 - **会话令牌磁盘哈希化**：sessions.json 里存的是令牌的 SHA-256，
-  配置文件泄露也无法直接冒用会话。
+  配置文件泄露也无法直接冒用会话。注意：从 1.3.1 及更早版本升级时，
+  磁盘上是明文令牌、无法反推哈希，**旧会话一律失效（需要重新登录）**，
+  加载时会把明文键直接清出文件。
 - **失败锁定指数退避 + 持久化**：失败计数落盘（重启不清零），
   按累计失败次数升级锁定时长；IP 与全局双维度计数，防分布式慢速尝试。
 """
@@ -16,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -27,6 +30,9 @@ from .config import COOKIE_NAME, MODE_INTERNAL, config
 from .prefs import prefs
 
 INTERNAL_HINT = "该功能仅在内网模式可用，请在服务器上执行 serverpanel --enable-internal 激活"
+
+# 会话键的合法形态：令牌的 SHA-256 十六进制摘要（旧版明文键不符合）
+_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 
 # 下面是出厂默认值；实际取值走 prefs（可在「设置 → 快捷设置」里改，立即生效）。
 # 保留常量是为了兼容既有测试与外部引用。
@@ -59,11 +65,19 @@ class FailureTracker:
     - ``ips``：按来源 IP 计数（防单 IP 快速爆破）
     - ``global``：全局计数（防分布式慢速尝试）
     成功登录清除对应 IP 与全局计数；重启不再清零（计数落盘）。
+
+    1.4.1 起锁定时长从**跨过档位阈值的那一刻**起算（``locked_until``），
+    而不是"档位时长 − 最早一次失败的年龄"。原实现按后者计算：10 次失败
+    若散布在 1 小时以上，剩余时长算出来是负数 → 直接不锁，慢速爆破反而
+    永远不会被锁（实测 5 次/10 分钟、10 次/2 小时都是 0 秒）。
     """
 
     def __init__(self) -> None:
         self._ips: dict[str, list[float]] = {}
         self._global: list[float] = []
+        # ip -> 锁定截止时间戳；global 维度单独一个
+        self._locked_until: dict[str, float] = {}
+        self._global_locked_until: float = 0.0
         self._lock = threading.RLock()  # status() 会在持锁状态下调用 locked_for
         self._load()
 
@@ -90,14 +104,26 @@ class FailureTracker:
         if isinstance(glob, list):
             self._global = [float(t) for t in glob
                             if isinstance(t, (int, float)) and now - float(t) < FAILURE_WINDOW]
+        locked = data.get("locked_until")
+        if isinstance(locked, dict):
+            for ip, until in locked.items():
+                if isinstance(ip, str) and isinstance(until, (int, float)) and float(until) > now:
+                    self._locked_until[ip] = float(until)
+        gun = data.get("global_locked_until")
+        if isinstance(gun, (int, float)) and float(gun) > now:
+            self._global_locked_until = float(gun)
 
     def _save(self) -> None:
         path = self._file()
         tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(json.dumps({"ips": self._ips, "global": self._global}),
-                           "utf-8")
+            tmp.write_text(json.dumps({
+                "ips": self._ips,
+                "global": self._global,
+                "locked_until": self._locked_until,
+                "global_locked_until": self._global_locked_until,
+            }), "utf-8")
             os.chmod(tmp, 0o600)
             os.replace(tmp, path)
         except OSError:
@@ -113,6 +139,10 @@ class FailureTracker:
                    if not any(now - t < FAILURE_WINDOW for t in v)]:
             self._ips.pop(ip, None)
         self._global = [t for t in self._global if now - t < FAILURE_WINDOW]
+        for ip in [k for k, until in self._locked_until.items() if until <= now]:
+            self._locked_until.pop(ip, None)
+        if self._global_locked_until <= now:
+            self._global_locked_until = 0.0
 
     @staticmethod
     def _tier(attempts: list[float], base_limit: int) -> int:
@@ -128,40 +158,35 @@ class FailureTracker:
                 tier += 1
         return tier
 
+    def _tier_seconds(self, tier: int, base_limit: int) -> int:
+        """第 tier 档的锁定时长（第一档跟随 prefs）。"""
+        if tier <= 0:
+            return 0
+        if tier == 1:
+            return max(prefs.lockout_seconds(), 1)
+        index = min(tier, len(ESCALATION_TIERS)) - 1
+        return ESCALATION_TIERS[index][1]
+
     def locked_for(self, ip: str) -> int:
         """返回剩余锁定秒数；0 = 未锁定。
 
         两个维度：
 
-        - **IP 维度**：本 IP 的累计失败达到档位即锁，时长随档位升级
-          （第一档时长跟 prefs.lockout_seconds，可调）；
+        - **IP 维度**：本 IP 的累计失败达到档位时，从跨档那一刻起锁
+          ``ESCALATION_TIERS`` 对应时长（第一档时长跟 prefs，可调）；
         - **全局维度**：窗口内全局失败达到第三档阈值时，对所有来源
-          短暂限流 60 秒——防"每个 IP 只试一两次"的分布式慢速爆破。
+          限流 60 秒——防"每个 IP 只试一两次"的分布式慢速爆破。
           正常使用下全局失败很难攒到这个量级，误伤可控。
         """
-        limit = prefs.max_failures()
-        first_tier_seconds = max(prefs.lockout_seconds(), 1)
+        self._prune()
+        now = time.time()
         with self._lock:
             self._prune()
-            now = time.time()
-            ip_attempts = [t for t in self._ips.get(ip, []) if now - t < FAILURE_WINDOW]
-            ip_tier = self._tier(ip_attempts, limit)
-            if ip_tier > 0:
-                seconds = (first_tier_seconds if ip_tier == 1
-                           else ESCALATION_TIERS[min(ip_tier, len(ESCALATION_TIERS)) - 1][1])
-                base = ip_attempts[0] if ip_attempts else now
-                remaining = seconds - (now - base)
-                if remaining <= 0:
-                    return 0
-                return int(remaining) + (1 if remaining > int(remaining) else 0)
-            # 全局高压限流：只在达到最高档阈值时触发，时长固定 60 秒
-            if len(self._global) >= ESCALATION_TIERS[-1][0]:
-                base = self._global[0] if self._global else now
-                remaining = 60 - (now - base)
-                if remaining <= 0:
-                    return 0
-                return int(remaining) + (1 if remaining > int(remaining) else 0)
-            return 0
+            deadline = max(self._locked_until.get(ip, 0.0), self._global_locked_until)
+            if deadline <= now:
+                return 0
+            remaining = deadline - now
+        return int(remaining) + (1 if remaining > int(remaining) else 0)
 
     def record_failure(self, ip: str) -> None:
         now = time.time()
@@ -169,12 +194,22 @@ class FailureTracker:
             self._ips.setdefault(ip, []).append(now)
             self._global.append(now)
             self._prune()
+            # 跨档即起算锁定时长（同一档不重复续期，避免攻击者靠持续
+            # 失败把"1 小时"无限延长；要升级需要攒到下一档）
+            tier = self._tier(self._ips.get(ip, []), prefs.max_failures())
+            if tier > 0 and now >= self._locked_until.get(ip, 0.0):
+                self._locked_until[ip] = now + self._tier_seconds(tier, prefs.max_failures())
+            if (len(self._global) >= ESCALATION_TIERS[-1][0]
+                    and now >= self._global_locked_until):
+                self._global_locked_until = now + 60
             self._save()
 
     def clear_failures(self, ip: str) -> None:
         with self._lock:
             self._ips.pop(ip, None)
+            self._locked_until.pop(ip, None)
             self._global = []
+            self._global_locked_until = 0.0
             self._save()
 
     def status(self, ip: str) -> dict:
@@ -220,14 +255,23 @@ class SessionStore:
         if not isinstance(data, dict):
             return
         now = time.time()
+        dropped = 0
         for key, session in data.items():
             if not isinstance(session, dict):
                 continue
             if session.get("expires", 0) < now:
                 continue
-            # 兼容旧格式：键曾是明文令牌；1.4.0 起键与 token_digest 均为哈希，
-            # 校验时用哈希查表，明文永不落盘。
+            # 键就是令牌的 SHA-256（64 位十六进制）。1.4.0 之前的旧格式
+            # 存的是明文令牌，无法反推哈希 → 直接丢弃并重写文件，
+            # 否则明文会一直留在 sessions.json 里（与"磁盘只存哈希"矛盾，
+            # 也会被 list_active 当成 id 前 12 位展示出来）。
+            if not _DIGEST_RE.fullmatch(str(key)):
+                dropped += 1
+                continue
             self._sessions[key] = session
+        if dropped:
+            # 升级后所有浏览器会话失效（需重新登录），把明文键清出磁盘
+            self._persist(force=True)
 
     def _persist(self, force: bool = False) -> None:
         """落盘。create/revoke 立即写；滑动续期按 PERSIST_MIN_INTERVAL 节流。"""
@@ -410,15 +454,20 @@ async def require_exec_auth(request: Request) -> dict:
     Agent 令牌只在内网模式下有效，管理员关闭内网模式后立即失效。
     1.4.0 起返回令牌的作用域信息（scope / prefixes / token_id），
     由调用方按作用域校验具体命令（见 app/scopes.py）。
+
+    1.4.1 修：这里**无条件**调用 :meth:`Config.find_agent_token`。
+    原实现先判断 ``config.agent_token`` 是否为真，而该属性在"只有旧版
+    明文字段"的配置上返回空串（迁移恰恰发生在 find_agent_token 内部），
+    于是旧令牌第一次调用就被 401，自动迁移永远跑不到——升级即断所有
+    既有令牌。现在由 find_agent_token/agent_tokens 负责触发迁移。
     """
     if config.mode != MODE_INTERNAL:
         raise HTTPException(status.HTTP_403_FORBIDDEN, INTERNAL_HINT)
     session = sessions.validate(extract_token(request))
     if session is not None:
         return {"kind": "session", "ip": client_ip(request)}
-    expected = config.agent_token
     provided = extract_agent_token(request)
-    if expected and provided:
+    if provided:
         record = config.find_agent_token(provided)
         if record is not None:
             config.touch_agent_token(str(record.get("id", "")))
@@ -431,8 +480,6 @@ async def require_exec_auth(request: Request) -> dict:
                 "token_name": record.get("name", ""),
             }
         # 令牌存在配置中但校验未过：区分「无效」与「过期」意义不大，统一 401
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Agent 令牌无效")
-    if provided:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Agent 令牌无效")
     raise HTTPException(status.HTTP_401_UNAUTHORIZED, "未登录或会话已过期")
 

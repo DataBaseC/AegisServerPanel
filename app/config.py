@@ -151,15 +151,13 @@ class Config:
     @property
     def agent_tokens(self) -> list[dict]:
         self.reload_if_changed()
+        # 先做旧版迁移：任何读取者（列表、鉴权门、CLI）都会顺带把
+        # agent_token 明文字段哈希化，避免"迁移只挂在某一条路径上"。
+        self._migrate_legacy_token()
         tokens = self.data.get("agent_tokens")
         if not isinstance(tokens, list):
             return []
         return [t for t in tokens if isinstance(t, dict) and t.get("hash")]
-
-    @property
-    def agent_token(self) -> str:
-        """兼容旧接口：任一令牌存在即视为「已启用」（不再能取回明文）。"""
-        return "configured" if self.agent_tokens else ""
 
     @property
     def agent_token_updated_at(self) -> int:
@@ -168,6 +166,7 @@ class Config:
 
     def _migrate_legacy_token(self) -> bool:
         """把旧版 agent_token 明文迁移进多令牌列表（哈希化）。"""
+        self.reload_if_changed()  # 先吸收外部改动，避免用陈旧内存覆盖别人刚写的配置
         legacy = self.data.get("agent_token")
         if not legacy or not isinstance(legacy, str):
             return False
@@ -357,10 +356,14 @@ class Config:
         return []
 
     def set_totp_secret(self, secret: str) -> None:
-        """保存尚未启用的 secret（setup 阶段，可反复重置）。"""
+        """保存 secret（setup 阶段）。
+
+        1.4.1 起**不再**顺手把 ``totp_enabled`` 置回 False：那等于给
+        「仅凭会话调 /totp/setup」留了一键关闭二次认证的后门。
+        关闭 2FA 只能走 :meth:`disable_totp`（接口层要求验证密码）。
+        """
         with self._lock:
             self.data["totp_secret"] = secret
-            self.data["totp_enabled"] = False
             self.save()
 
     def enable_totp(self, recovery_hashes: list[str]) -> None:

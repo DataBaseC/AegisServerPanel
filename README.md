@@ -11,7 +11,7 @@
 - **快捷设置**：开机自启体检、运行参数调整、配置备份迁移，全部在面板里完成
 - **重度优化**：慢操作全部下线程池（单个慢请求不再冻结面板）、后台标签页停止轮询、断网有提示、大目录不卡界面
 
-当前版本 `1.4.0`。
+当前版本 `1.4.1`。
 
 ---
 
@@ -525,7 +525,8 @@ serverpanel --agent-token      # 复制输出的令牌
 
 ```
 POST /api/terminal/exec
-X-Agent-Token: <令牌>            # 也支持 Authorization: Bearer <令牌> 或 ?token=<令牌>
+X-Agent-Token: <令牌>            # 也支持 Authorization: Bearer <令牌>
+                                 # 注意：HTTP 接口不接受 ?token= 查询参数（仅 WebSocket 兼容保留）
 Content-Type: application/json
 
 {"command": "systemctl restart nginx", "cwd": "/opt", "timeout": 60}
@@ -662,14 +663,33 @@ serverpanel --host 0.0.0.0 --port 8787 --ssl-certfile /path/cert.pem --ssl-keyfi
 - **用完就关**：内网模式是临时授权，操作完执行 `serverpanel --disable-internal`
 - **妥善保管 Agent 令牌**，不要提交进版本库或粘贴到公开场合；1.4.0 起令牌按「名称 + 作用域」管理，请按最小权限签发（只读令牌只能执行查看类命令），可疑令牌在「安全中心」单独吊销，不必全场轮换
 - **开启二次认证**：公网部署建议在「安全中心」启用 TOTP（密码 + 6 位动态码），并妥善保管恢复码
+- **从 1.3.1 及更早版本升级**：会话令牌改为哈希存储，**浏览器需要重新登录一次**；既有 Agent 令牌会被自动迁移为一条 full 作用域的「默认令牌（迁移自旧版）」，无需重签（迁移后 `serverpanel --show-agent-token` 只能看到元数据，看不到明文）
+- **配置备份不含凭据**：密码哈希、Agent 令牌、TOTP 密钥与 2FA 启用状态都不在导出包里（`include_secrets=1` 也只带本机既有的那部分）。换机恢复后需要重新签发令牌、重新绑定二次认证
+- **审计查询只回溯文件尾部**：单日 JSONL 超过 8MB 时，面板查询不会翻更早的记录（可用 `q`/`action` 缩小范围，或直接在服务器上看 `/etc/serverpanel/audit/` 下的 JSONL）
 - **日志白名单**：日志接口只能读取白名单目录（默认 `/var/log`，可在配置文件用 `log_dirs` 数组扩展）。无论服务是否以 root 运行，白名单外一律拒绝
-- 日志白名单**不接受**敏感目录（`/etc`、`/root`、`/proc`、`/sys`、`/dev`、`/run`、`/boot`、`var/lib`、`/var/backups` 及其包含关系）与隐藏目录（`.ssh`、`.config` 等）。这条判定在「写参数 / 导入配置 / 读日志」三处都生效，无法绕过
+- 日志白名单**不接受**敏感目录（`/etc`、`/root`、`/proc`、`/sys`、`/dev`、`/run`、`/boot`、`/var/lib`、`/var/backups` 及其包含关系）与隐藏目录（`.ssh`、`.config` 等）。这条判定在「写参数 / 导入配置 / 读日志」三处都生效，无法绕过
 - 已内置的防护：无 API 文档暴露、`nosniff` / `DENY` / `no-referrer` / 加固 CSP / `Permissions-Policy` / HSTS、接口响应 `no-store`、WebSocket 跨站 Origin 校验、状态变更请求同源校验、系统关键目录删除与下载保护、命令执行超时与输出截断、HTTPS 部署时 Cookie 自动加 `Secure`、登录失败指数退避锁定（持久化）、远程拉取 SSRF 防护、会话与令牌哈希化存储、统一审计日志
 - 已知取舍：WebSocket 的 `?token=` 查询参数方式便于脚本调用，但令牌可能进入中间层日志，敏感环境请只用请求头传令牌（HTTP 接口已不再接受查询参数传令牌）；首次部署密码未设置时，局域网内先到者可完成初始化，装完请立即设置强密码并启用二次认证
 
 ---
 
 ## 十、更新记录
+
+### 1.4.1（1.4.0 安全版的验收修复）
+
+对 1.4.0 交付物做独立对抗性验收后，修掉 2 个 P0、2 个 P1、4 个 P2 与若干小问题（`pytest` 81 用例：81 通过 / 7 项 POSIX-only 跳过）。
+
+- **只读 / 自定义作用域真正关进笼子**（P0）：原实现只按分隔符拆段且只看段首 token，`ls & rm -rf /`、`ls $(...)`、反引号、换行拼接、`df -h > /etc/x` 全部被放行（等于只读令牌可执行任意命令）。现在先拒 shell 元字符（含单个 `&`、换行、`$()`、反引号、重定向、通配），再按 `&&`/`||`/`;`/`|` 拆段逐段校验
+- **只读白名单收紧**（P0）：移出 `mount`、改名用 `hostname`、`ifconfig`、`ip addr/route/link` 的非 show 形式、`dmesg -C`、`journalctl --vacuum-*`、`date -s`；`cat` 只允许 `/proc`、`/sys` 下的虚拟文件并排除 `/proc/*/mem`、`/proc/*/environ`、`kcore` 等
+- **升级迁移不再断令牌**（P0）：原实现先判断 `config.agent_token` 是否为真，而旧配置下该属性为空（迁移恰恰发生在 `find_agent_token` 内部），导致 1.3.1 的旧令牌升级后立刻 401、自动迁移永不执行。现在鉴权无条件调用 `find_agent_token`，`agent_tokens` 读取即触发迁移
+- **`/api/auth/totp/setup` 不得静默关闭 2FA**（P1）：原实现只要求登录态，且 `set_totp_secret` 会把 `totp_enabled` 置回 False —— 任何有效会话一个 POST 就能拆掉二次认证、绕过 `/totp/disable` 的密码校验。现在已启用时直接 400，且设置密钥不再改动启用状态
+- **修掉两处恒真的"安全检查"**（P1）：`upload` / `fetch` 里的 `_within(x, x)` 自比较按定义永远为真（死代码），改为真正校验"最终目标是否逃逸符号链接"；SSRF 侧删除"已防住 DNS rebinding"的不实声明，改为**重定向逐跳复核**（禁用 urllib 自动跳转），并如实标注残余 TOCTOU 窗口
+- **前端列不再空白**（P2）：接口从内存 deque 改为审计事件后，`/api/agent/info.recent` 与 `/api/panel/tasks/recent` 丢了 `kind`/`command`/`task_id`/`title` 字段，导致 Agent 页命令列空白、来源徽章恒显示"面板"、任务卡片"上次执行"永不显示。现在审计事件带上这些兼容字段
+- **移除哨兵令牌**（P2）：`config.agent_token` 在有多令牌时返回 `"configured"`，被 `/api/agent/info` 与代码片段库当令牌消费（"显示令牌"复制出去必然 401）。该属性已删除，片段库永远只渲染 `YOUR_TOKEN` 占位符，Agent 页改为引导去「安全中心」按最小权限签发
+- **审计查询不再全量读盘**（P2）：`readlines()` 改为从文件尾部按块倒读（单文件上限 8MB，实测 44.6MB 文件峰值内存 51.2MB → 1.1MB、232ms → 11ms）；`/api/panel/security`、`/api/panel/audit/log`、`/api/panel/audit`、`/api/panel/prefs`、`/api/panel/apps`、`/api/agent/info`、`/api/panel/tasks*` 的审计读取全部下线程池，不再阻塞事件循环
+- **锁定阶梯按文档生效**（P2）：原实现用"档位时长 − 最早一次失败的年龄"算剩余时间，慢速爆破实测 5 次/10 分钟、10 次/2 小时都算成 **0 秒**（永远不锁）。现在跨档那一刻起算并落盘 `locked_until`，重启仍锁
+- **小问题**：会话踢出要求 12 位十六进制短标识（空串/前缀不再能踢掉任意会话）；升级时旧明文会话键从 `sessions.json` 清除（并明确"升级需重新登录一次"）；审计 JSONL 文件补 `chmod 0600`；`totp.verify` 拒绝空密钥（空 HMAC key 会产出可预测的"动态码"）；空/缺失 TOTP 密钥的异常配置不再把管理员挡在门外（记审计并跳过第二因素）
+- **文档勘误**：`/var/lib` 笔误、`?token=` 与"HTTP 不再接受查询参数"的自相矛盾、升级后需重新登录、备份不含 2FA/令牌、审计只回溯尾部 8MB
 
 ### 1.4.0（安全版）
 

@@ -18,11 +18,19 @@ router = APIRouter(prefix="/api/snippets", tags=["snippets"])
 
 
 def _context(request: Request, reveal_token: bool) -> dict[str, str]:
+    """渲染上下文。
+
+    1.4.1 起 ``token`` **永远**是 ``YOUR_TOKEN`` 占位符：1.4.0 把令牌改成
+    只存哈希后，``config.agent_token`` 变成了哨兵串 "configured"，
+    ``reveal_token=1`` 会把它当令牌渲染进片段正文——用户"显示令牌→复制"
+    拿到的是 ``X-Agent-Token: configured``，粘出去必然 401。
+    真要令牌请在「安全中心 → Agent 令牌」创建（明文只展示一次）。
+    """
     base_url = str(request.base_url).rstrip("/")
     return {
         "base_url": base_url,
         "endpoint": f"{base_url}/api/terminal/exec",
-        "token": (config.agent_token or TOKEN_PLACEHOLDER) if reveal_token else TOKEN_PLACEHOLDER,
+        "token": TOKEN_PLACEHOLDER,
         "host": request.url.hostname or "-",
         "port": str(request.url.port or ""),
         "shell": "/bin/bash" if sys.platform != "win32" else "cmd.exe",
@@ -50,7 +58,9 @@ async def list_snippets(request: Request, category: str = "", q: str = "",
         "total": len(items),
         "categories": categories,
         "snippets": items,
-        "token_revealed": bool(reveal_token and config.agent_token),
+        # 令牌不可回显（哈希存储），保留字段是为了兼容旧前端
+        "token_revealed": False,
+        "token_hint": "令牌以哈希存储，无法回显；请在「安全中心 → Agent 令牌」创建后填入",
         "endpoint": context["endpoint"],
     }
 

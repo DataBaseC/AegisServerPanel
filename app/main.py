@@ -218,8 +218,10 @@ def banner(host: str, port: int) -> None:
         print("  当前模式:   %s" % MODE_LABELS.get(config.mode, config.mode))
         if internal:
             print("              （已解锁终端、文件管理与全部控制功能）")
-            agent = "已启用" if config.agent_token else "未启用"
-            print("  Agent 接入: %s（serverpanel --agent-token 生成令牌）" % agent)
+            tokens = config.agent_tokens
+            agent = (f"已启用（{len(tokens)} 个令牌）" if tokens
+                     else "未启用（serverpanel --agent-token 生成）")
+            print("  Agent 接入: %s" % agent)
         else:
             print("              （只读监控；执行 serverpanel --enable-internal 解锁全部功能）")
         if not config.initialized:

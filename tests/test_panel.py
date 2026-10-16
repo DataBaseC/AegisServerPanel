@@ -214,12 +214,16 @@ def test_exec_timeout_returns_clean_error(authed, internal_mode):
 
 def test_agent_token_dead_in_public_mode(anon):
     """不进入内网模式：即使持有有效令牌也必须 403。"""
-    token = config_mod.config.agent_token
-    if not token:
-        token = config_mod.config.issue_agent_token()
-    r = anon.post("/api/terminal/exec", json={"command": "echo hi"},
-                  headers={"X-Agent-Token": token})
-    assert r.status_code == 403
+    # 1.4.1 起令牌只存哈希、无法取回明文，只能现场签发一只用于探测
+    token = config_mod.config.issue_agent_token("public-mode-probe-0000001")
+    try:
+        r = anon.post("/api/terminal/exec", json={"command": "echo hi"},
+                      headers={"X-Agent-Token": token})
+        assert r.status_code == 403
+    finally:
+        record = config_mod.config.find_agent_token(token)
+        if record:
+            config_mod.config.revoke_agent_token(str(record.get("id", "")))
 
 
 # ---------- 文件下载保护 ----------
@@ -610,16 +614,15 @@ def test_snippets_render_current_endpoint(authed, internal_mode):
     first = data["snippets"][0]
     assert "/api/terminal/exec" in first["code"]
     assert "{{" not in first["code"], "占位符必须全部被渲染掉"
-    # 默认不回显真实令牌
-    token = config_mod.config.agent_token
-    if token:
-        assert token not in first["code"]
-        assert "YOUR_TOKEN" in first["code"]
-    # 显式 reveal 才填入令牌
+    # 1.4.1 起令牌只存哈希、无法回显：无论是否 reveal，都只能是占位符，
+    # 更不允许出现 1.4.0 那个被当成令牌的哨兵串 "configured"
+    codes = "\n".join(s["code"] for s in data["snippets"])
+    assert "YOUR_TOKEN" in codes
+    assert "configured" not in codes
     revealed = authed.get("/api/snippets", params={"reveal_token": 1}).json()
-    if token:
-        assert token in revealed["snippets"][0]["code"]
-        assert revealed["token_revealed"] is True
+    assert revealed["token_revealed"] is False
+    assert "YOUR_TOKEN" in revealed["snippets"][0]["code"]
+    assert "configured" not in revealed["snippets"][0]["code"]
     # 分类与关键词过滤
     only = authed.get("/api/snippets", params={"category": "Docker"}).json()
     assert only["snippets"] and all(s["category"] == "Docker" for s in only["snippets"])

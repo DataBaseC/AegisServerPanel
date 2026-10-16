@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -27,7 +28,11 @@ class RunBody(BaseModel):
 
 
 def recent_runs(limit: int = 30) -> list[dict]:
-    """最近任务执行记录（读审计管道）。"""
+    """最近任务执行记录（读审计管道）。
+
+    事件里带 ``extra`` 兼容字段（task_id / title / params / command），
+    面板「常用操作 → 最近执行记录」与任务卡片下的"上次执行"按这些字段渲染。
+    """
     return audit.query(action="task_run", limit=max(1, min(limit, 100)))
 
 
@@ -42,12 +47,15 @@ def _record(task_id: str, title: str, params: dict, result, duration: float,
         ok=result.code == 0,
         code=result.code,
         duration=duration,
+        extra={"task_id": task_id, "title": title, "params": params,
+               "command": command[:500]},
     ))
 
 
 @router.get("")
 async def list_tasks(_session: dict = Depends(require_internal)):
-    return {"tasks": public_tasks(), "recent": recent_runs()}
+    return {"tasks": public_tasks(),
+            "recent": await asyncio.to_thread(recent_runs)}
 
 
 @router.post("/{task_id}/run")
@@ -83,7 +91,7 @@ async def run_task(task_id: str, request: Request, body: RunBody | None = None,
 
 @router.get("/recent")
 async def recent(_session: dict = Depends(require_internal)):
-    return {"recent": recent_runs()}
+    return {"recent": await asyncio.to_thread(recent_runs)}
 
 
 @router.delete("/recent")

@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import time
@@ -65,11 +66,18 @@ def _token_view(item: dict) -> dict:
 @router.get("/info")
 async def agent_info(request: Request, _session: dict = Depends(require_internal)):
     info = basic_info()
+    tokens = config.agent_tokens
+    # 读审计文件是同步 I/O，下线程池
+    recent = await asyncio.to_thread(recent_execs)
     return {
         "internal": config.mode == MODE_INTERNAL,
-        "enabled": bool(config.agent_tokens),
-        "token_count": len(config.agent_tokens),
-        "token": config.agent_token,
+        "enabled": bool(tokens),
+        "token_count": len(tokens),
+        "full_tokens": sum(1 for t in tokens if t.get("scope") == "full"),
+        # 1.4.1 起这里不再返回任何"令牌"字段：1.4.0 曾返回哨兵串
+        # "configured"（config.agent_token 的兼容值），前端会把它当令牌
+        # 展示、甚至渲染进代码片段，复制出去必然 401。
+        "token_hint": "令牌以 SHA-256 哈希存储，无法取回明文；请在「安全中心 → Agent 令牌」创建",
         "token_updated_at": config.agent_token_updated_at,
         "endpoint": "/api/terminal/exec",
         "base_url": str(request.base_url).rstrip("/"),
@@ -78,7 +86,7 @@ async def agent_info(request: Request, _session: dict = Depends(require_internal
         "shell": _pick_shell(),
         "user": os.environ.get("USER") or "root",
         "is_root": is_root(),
-        "recent": recent_execs(),
+        "recent": recent,
     }
 
 

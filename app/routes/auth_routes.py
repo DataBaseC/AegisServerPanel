@@ -120,8 +120,8 @@ async def login(body: LoginBody, request: Request, response: Response):
         raise HTTPException(401, "密码错误")
 
     # 第二因素：TOTP（启用后强制；未启用时忽略 code 字段）
-    if config.totp_enabled:
-        secret = config.totp_secret
+    secret = config.totp_secret
+    if config.totp_enabled and secret:
         if totp_mod.verify(secret, body.code):
             pass  # 动态码正确
         elif config.consume_recovery_code(body.code):
@@ -133,6 +133,13 @@ async def login(body: LoginBody, request: Request, response: Response):
             if not body.code:
                 raise HTTPException(401, "需要二次验证码")
             raise HTTPException(401, "二次验证码错误")
+    elif config.totp_enabled:
+        # 配置里 enabled=true 但没有密钥（手工改坏/导入残缺包）：
+        # 若按"校对空密钥的 HMAC"处理等于没有第二因素，且会把管理员
+        # 永久挡在门外。这里明确降级为不校验，并留审计痕迹。
+        audit.record(AuditEvent(action="totp_misconfigured", ok=False,
+                                summary="totp_enabled=true 但缺少 totp_secret，已跳过第二因素",
+                                source="web", ip=ip))
 
     sessions.clear_failures(ip)
     _issue(request, response)
@@ -189,7 +196,16 @@ async def totp_status(_session: dict = Depends(require_auth)):
 
 @router.post("/totp/setup")
 async def totp_setup(_session: dict = Depends(require_auth)):
-    """生成 secret（未启用）。重复调用会换一个新 secret，旧绑定作废。"""
+    """生成 secret（未启用时的绑定流程）。
+
+    1.4.1 修：**已启用时拒绝**。原实现只要求登录态，且
+    ``set_totp_secret`` 会顺手把 ``totp_enabled`` 置回 False，
+    于是任何有效会话（被劫持的 Cookie / 同站 CSRF / 脚本）一个 POST
+    就能把二次认证拆掉，绕过 ``/totp/disable`` 的密码校验。
+    重新绑定必须走"先用密码关闭，再重新 setup + enable"。
+    """
+    if config.totp_enabled:
+        raise HTTPException(400, "二次认证已启用；如需重新绑定，请先用当前密码关闭二次认证")
     secret = totp_mod.generate_secret()
     config.set_totp_secret(secret)
     audit.record(AuditEvent(action="totp_setup", summary="生成 TOTP 密钥（未启用）",

@@ -12,7 +12,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from .. import shell
-from ..auth import require_auth, require_internal
+from ..audit import AuditEvent, audit
+from ..auth import client_ip, require_auth, require_internal
 from ..config import MODE_INTERNAL, config
 from ..metrics import basic_info, metrics, top_processes
 from ..utils import is_root
@@ -116,7 +117,7 @@ async def capabilities():
 
 
 @router.post("/power", dependencies=[Depends(require_internal)])
-async def power(body: PowerBody):
+async def power(body: PowerBody, request: Request):
     if body.confirm != "CONFIRM":
         raise HTTPException(400, "危险操作，需要确认参数 confirm=CONFIRM")
     if not os.path.isdir("/run/systemd/system") or not shell.available("systemctl"):
@@ -132,6 +133,8 @@ async def power(body: PowerBody):
     result = await shell.run(cmd, timeout=10)
     if not result.ok and body.action != "cancel":
         raise HTTPException(500, result.text or "执行失败")
+    audit.record(AuditEvent(action="power", target=body.action, source="web",
+                            ip=client_ip(request), ok=result.ok))
     return {"ok": True, "message": message}
 
 

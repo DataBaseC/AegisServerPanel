@@ -7,10 +7,11 @@ import os
 import signal as signal_module
 
 import psutil
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from ..auth import require_auth, require_internal
+from ..audit import AuditEvent, audit
+from ..auth import client_ip, require_auth, require_internal
 from ..config import MODE_INTERNAL, config
 
 router = APIRouter(prefix="/api/processes", tags=["processes"], dependencies=[Depends(require_auth)])
@@ -144,7 +145,7 @@ async def process_detail(pid: int):
 
 
 @router.post("/{pid}/signal", dependencies=[Depends(require_internal)])
-async def send_signal(pid: int, body: SignalBody):
+async def send_signal(pid: int, body: SignalBody, request: Request):
     if body.signal not in SIGNALS:
         raise HTTPException(400, f"不支持的信号，可选：{', '.join(SIGNALS)}")
     _guard_pid(pid)
@@ -156,11 +157,14 @@ async def send_signal(pid: int, body: SignalBody):
         raise HTTPException(404, "进程不存在")
     except psutil.AccessDenied:
         raise HTTPException(403, "权限不足")
+    audit.record(AuditEvent(action="process_signal", target=f"{name}({pid})",
+                            summary=body.signal.upper(), source="web",
+                            ip=client_ip(request)))
     return {"ok": True, "message": f"已向 {name}({pid}) 发送 {body.signal.upper()}"}
 
 
 @router.post("/{pid}/nice", dependencies=[Depends(require_internal)])
-async def set_nice(pid: int, body: NiceBody):
+async def set_nice(pid: int, body: NiceBody, request: Request):
     if not -20 <= body.nice <= 19:
         raise HTTPException(400, "nice 值需在 -20 ~ 19 之间")
     _guard_pid(pid)  # 与 signal 一致：PID 0/1 与面板自身进程一律不碰
@@ -171,4 +175,7 @@ async def set_nice(pid: int, body: NiceBody):
         raise HTTPException(404, "进程不存在")
     except psutil.AccessDenied:
         raise HTTPException(403, "权限不足（降低 nice 值需要 root）")
+    audit.record(AuditEvent(action="process_nice", target=f"PID {pid}",
+                            summary=f"nice={body.nice}", source="web",
+                            ip=client_ip(request)))
     return {"ok": True, "message": f"PID {pid} 优先级已设为 {body.nice}"}

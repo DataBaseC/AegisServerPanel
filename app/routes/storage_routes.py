@@ -6,11 +6,12 @@ import json
 import os
 import shutil
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from .. import shell
-from ..auth import require_auth, require_internal
+from ..audit import AuditEvent, audit
+from ..auth import client_ip, require_auth, require_internal
 from ..utils import is_root
 
 router = APIRouter(prefix="/api/storage", tags=["storage"], dependencies=[Depends(require_auth)])
@@ -146,7 +147,7 @@ async def mounts():
 
 
 @router.post("/mount", dependencies=[Depends(require_internal)])
-async def mount(body: MountBody):
+async def mount(body: MountBody, request: Request):
     if not is_root():
         raise HTTPException(403, "挂载需要以 root 运行本服务")
     if not os.path.isabs(body.mountpoint):
@@ -161,17 +162,23 @@ async def mount(body: MountBody):
     result = await shell.run(cmd, timeout=30)
     if not result.ok:
         raise HTTPException(500, result.text or "挂载失败")
+    audit.record(AuditEvent(action="mount", target=body.mountpoint,
+                            summary=f"{body.device} type={body.fstype or '-'} opts={body.options or '-'}",
+                            source="web", ip=client_ip(request)))
     return {"ok": True, "message": f"已挂载 {body.device} 到 {body.mountpoint}"}
 
 
 @router.post("/unmount", dependencies=[Depends(require_internal)])
-async def unmount(body: UnmountBody):
+async def unmount(body: UnmountBody, request: Request):
     if not is_root():
         raise HTTPException(403, "卸载需要以 root 运行本服务")
     cmd = ["umount"] + (["-f"] if body.force else []) + ["--", body.path]
     result = await shell.run(cmd, timeout=30)
     if not result.ok:
         raise HTTPException(500, result.text or "卸载失败")
+    audit.record(AuditEvent(action="umount", target=body.path,
+                            summary=f"force={body.force}", source="web",
+                            ip=client_ip(request)))
     return {"ok": True, "message": f"已卸载 {body.path}"}
 
 

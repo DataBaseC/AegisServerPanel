@@ -42,8 +42,8 @@ def authed(client):
 def test_healthz(client):
     r = client.get("/healthz")
     assert r.status_code == 200
-    assert r.json()["ok"] is True
-    assert "version" in r.json()
+    # 健康端点最小化：不泄露版本/构建/初始化状态等指纹信息
+    assert r.json() == {"ok": True}
 
 
 def test_unauthenticated_rejected(client):
@@ -81,8 +81,8 @@ def test_login_lockout_and_xff(authed):
     assert r.status_code == 429  # 未被 XFF 绕过，触发锁定
     r = authed.post("/api/auth/login", json={"password": PASSWORD})
     assert r.status_code == 429
-    # 等锁定期过后正常登录，恢复后续用例
-    deadline = time.time() + 70
+    # 等锁定期过后正常登录，恢复后续用例（留 20s 余量防慢机器边界抖动）
+    deadline = time.time() + 80
     while time.time() < deadline:
         r = authed.post("/api/auth/login", json={"password": PASSWORD})
         if r.status_code == 200:
@@ -279,11 +279,19 @@ def test_metrics_degrades_when_io_counters_blocked(monkeypatch):
 
 
 def test_sessions_survive_restart(authed):
-    """会话落盘：新起的 SessionStore 实例（等价进程重启后）能恢复登录态。"""
-    from app.auth import SessionStore, sessions
+    """会话落盘：新起的 SessionStore 实例（等价进程重启后）能恢复登录态。
 
-    token = next(iter(sessions._sessions), None)
+    1.4.0 起磁盘上只存令牌哈希；明文只存在浏览器 Cookie 里，
+    所以这里从 Cookie 取回明文令牌来验证跨实例恢复。
+    """
+    from app.auth import SessionStore
+
+    token = authed.cookies.get("sp_session")
     assert token, "应存在至少一个活动会话"
+    # 落盘文件里不允许出现明文令牌
+    from app.config import config as cfg
+    on_disk = (Path(cfg.path).parent / "sessions.json").read_text("utf-8")
+    assert token not in on_disk, "sessions.json 不得存储明文令牌"
 
     revived = SessionStore()
     assert revived.validate(token) is not None
@@ -301,8 +309,14 @@ def test_sessions_file_permissions(authed):
     assert stat_mod.S_IMODE(f.stat().st_mode) & 0o777 == 0o600
 
 
-def test_healthz_has_build_field(client):
-    r = client.get("/healthz")
+def test_healthz_has_build_field(client, authed):
+    """版本/构建信息改走登录后的 /api/system/version，未登录必须 401。"""
+    with TestClient(app) as fresh:  # 全新连接：无会话 Cookie
+        r = fresh.get("/api/system/version")
+        assert r.status_code == 401
+    r = authed.get("/api/system/version")
+    assert r.status_code == 200
+    assert "version" in r.json()
     assert "build" in r.json()
 
 
@@ -571,11 +585,16 @@ def test_task_list_and_run(authed, internal_mode):
     assert body["command"] and "uptime" in body["command"]
     assert isinstance(body["code"], int)
 
-    # 执行记录可查、可清空
+    # 执行记录走统一审计管道：可查、落盘、不可删（安全审计不可清空）
     recent = authed.get("/api/panel/tasks/recent").json()["recent"]
-    assert any(item["task_id"] == "sys-snapshot" for item in recent)
-    assert authed.delete("/api/panel/tasks/recent").status_code == 200
-    assert authed.get("/api/panel/tasks/recent").json()["recent"] == []
+    assert any(item["action"] == "task_run" and item["target"] == "资源总览"
+               for item in recent)
+    r = authed.delete("/api/panel/tasks/recent")
+    assert r.status_code == 200
+    assert "审计" in r.json()["message"]
+    # 审计记录仍在（可追溯性优先）
+    again = authed.get("/api/panel/tasks/recent").json()["recent"]
+    assert any(item["action"] == "task_run" for item in again)
 
 
 def test_unknown_task_returns_404(authed, internal_mode):
@@ -1263,11 +1282,22 @@ def test_fetch_url_from_local_server(authed, internal_mode, tmp_path):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         port = server.server_address[1]
+        # SSRF 防护（1.4.0）：默认拒绝回环/内网目标
         r = authed.post("/api/files/fetch", json={
             "url": f"http://127.0.0.1:{port}/tool.tar.gz", "dest_dir": str(tmp_path)})
-        assert r.status_code == 200, r.text
-        saved = tmp_path / "tool.tar.gz"
-        assert saved.read_bytes() == payload
+        assert r.status_code == 400, r.text
+        assert "SSRF" in r.json()["detail"]
+
+        # 显式放行私网后允许（内网运维场景）
+        config_mod.config.data["fetch_allow_private"] = True
+        try:
+            r = authed.post("/api/files/fetch", json={
+                "url": f"http://127.0.0.1:{port}/tool.tar.gz", "dest_dir": str(tmp_path)})
+            assert r.status_code == 200, r.text
+            saved = tmp_path / "tool.tar.gz"
+            assert saved.read_bytes() == payload
+        finally:
+            config_mod.config.data["fetch_allow_private"] = False
 
         # 重名拒绝
         r = authed.post("/api/files/fetch", json={

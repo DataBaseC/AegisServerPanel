@@ -17,7 +17,6 @@ import os
 import socket
 import time
 import zipfile
-from collections import deque
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
@@ -26,19 +25,21 @@ from pydantic import BaseModel
 
 from .. import boot as boot_mod
 from ..apps import supervisor
-from ..auth import require_internal
+from ..audit import AuditEvent, audit
+from ..auth import client_ip, extract_token, require_internal
+from ..auth import sessions as sessions_mod
 from ..config import config
 from ..prefs import PrefsError, prefs
+from ..trash import trash
 from ..utils import is_root
 from .apps_routes import recent_audit as apps_audit
 from .tasks_routes import recent_runs
 
 router = APIRouter(prefix="/api/panel", tags=["panel-settings"])
 
-AUDIT_LIMIT = 60
-_audit: deque[dict] = deque(maxlen=AUDIT_LIMIT)
-
-SECRET_KEYS = ("password_hash", "agent_token", "agent_token_updated_at")
+SECRET_KEYS = ("password_hash", "agent_token", "agent_token_updated_at",
+               "agent_tokens", "totp_secret", "totp_enabled",
+               "totp_recovery_hashes", "totp_enabled_at")
 BACKUP_KEEP = 10
 BACKUP_DIRNAME = "backups"
 MASK_HINTS = ("TOKEN", "KEY", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL")
@@ -59,14 +60,43 @@ class TimezoneBody(BaseModel):
     enable_ntp: bool | None = None
 
 
-def record(action: str, detail: str = "", extra: dict | None = None) -> None:
-    _audit.appendleft({
-        "time": int(time.time()),
-        "kind": "panel",
-        "action": action,
-        "detail": detail[:400],
-        **(extra or {}),
-    })
+def record(action: str, detail: str = "", ip: str = "") -> None:
+    """面板设置类操作记入统一审计管道（1.4.0 起落盘可追溯）。"""
+    audit.record(AuditEvent(
+        action=f"panel_{action}",
+        summary=detail[:400],
+        source="web",
+        ip=ip,
+        extra={"detail": detail[:400]},
+    ))
+
+
+@router.get("/audit")
+async def audit_timeline(request: Request, _session: dict = Depends(require_internal)):
+    return {"recent": recent_audit()}
+
+
+def recent_audit() -> list[dict]:
+    """面板设置 + 常驻应用 + 常用操作，合并成一条时间线（读统一审计管道）。"""
+    merged: list[dict] = []
+    for item in audit.query(days=7, limit=500):
+        action = str(item.get("action", ""))
+        if action.startswith("panel_"):
+            merged.append({
+                "time": item.get("time", 0),
+                "kind": "panel",
+                "action": action[6:],
+                "detail": (item.get("detail") or item.get("summary") or "")[:400],
+            })
+    for item in apps_audit():
+        merged.append({**item, "kind": "apps"})
+    for item in recent_runs():
+        merged.append({
+            "time": item["time"], "kind": "task", "action": item.get("target", ""),
+            "detail": f"退出码 {item['code']} · {item['duration']}s · {item['summary'][:120]}",
+        })
+    merged.sort(key=lambda item: item["time"], reverse=True)
+    return merged[:40]
 
 
 def _guard(fn, *args, **kwargs):
@@ -188,25 +218,6 @@ async def put_prefs(body: PrefsBody, _session: dict = Depends(require_internal))
     result = await asyncio.to_thread(_guard, boot_mod.set_pref_with_check, body.values)  # 含路径自检与写盘
     record("prefs", json.dumps(result["changed"], ensure_ascii=False)[:300])
     return {**result, "fields": prefs.describe()}
-
-
-@router.get("/audit")
-async def audit(_session: dict = Depends(require_internal)):
-    return {"recent": recent_audit()}
-
-
-def recent_audit() -> list[dict]:
-    """面板设置类操作 + 常驻应用操作 + 常用操作执行，合并成一条时间线。"""
-    merged: list[dict] = list(_audit)
-    for item in apps_audit():
-        merged.append({**item, "kind": "apps"})
-    for item in recent_runs():
-        merged.append({
-            "time": item["time"], "kind": "task", "action": item["title"],
-            "detail": f"退出码 {item['code']} · {item['duration']}s · {item['command'][:120]}",
-        })
-    merged.sort(key=lambda item: item["time"], reverse=True)
-    return merged[:40]
 
 
 # ---------------------------------------------------------------- 日志清理
@@ -526,3 +537,103 @@ def _write_backup(reason: str) -> Path | None:
         for stale in existing[BACKUP_KEEP:]:
             stale.unlink()
     return target
+
+
+# ---------------------------------------------------------------- 安全中心（1.4.0）
+
+
+@router.get("/security")
+async def security_summary(request: Request, _session: dict = Depends(require_internal)):
+    """安全中心摘要：2FA 状态、防爆破状态、会话与令牌概况、审计统计。"""
+    from ..auth import failures
+
+    return {
+        "totp": {
+            "enabled": config.totp_enabled,
+            "pending": bool(config.totp_secret) and not config.totp_enabled,
+            "recovery_left": len(config.totp_recovery_hashes),
+        },
+        "lockout": failures.status(client_ip(request)),
+        "sessions": {
+            "active": sessions_mod.active_count(),
+        },
+        "tokens": {
+            "total": len(config.agent_tokens),
+            "full": sum(1 for t in config.agent_tokens if t.get("scope") == "full"),
+        },
+        "audit": audit.actions_summary(days=7),
+        "trash": trash.usage(),
+    }
+
+
+@router.get("/audit/log")
+async def audit_log(days: int = 7, action: str = "", source: str = "", q: str = "",
+                    limit: int = 200, _session: dict = Depends(require_internal)):
+    """统一审计日志查询（安全中心 → 审计日志）。"""
+    return {"events": audit.query(days=days, action=action, source=source,
+                                  q=q, limit=limit)}
+
+
+@router.get("/sessions")
+async def active_sessions(request: Request, _session: dict = Depends(require_internal)):
+    """活跃会话列表（安全中心 → 会话管理）。"""
+    current = sessions_mod.validate(extract_token(request))
+    current_id = ""
+    if current:
+        from ..auth import token_digest
+
+        token = extract_token(request)
+        current_id = token_digest(token)[:12] if token else ""
+    items = sessions_mod.list_active()
+    for item in items:
+        item["current"] = item["id"] == current_id
+    return {"sessions": items}
+
+
+class SessionIdBody(BaseModel):
+    id: str
+
+
+@router.post("/sessions/revoke")
+async def revoke_session(body: SessionIdBody, request: Request,
+                         _session: dict = Depends(require_internal)):
+    """踢出指定会话（按哈希前缀定位）。"""
+    target = None
+    for digest in list(sessions_mod._sessions):
+        if digest.startswith(body.id):
+            target = digest
+            break
+    if target is None:
+        raise HTTPException(404, "会话不存在或已过期")
+    if target[:12] == body.id and _is_current(request, target):
+        raise HTTPException(400, "不能踢出当前会话（请直接退出登录）")
+    if sessions_mod.revoke_digest(target):
+        audit.record(AuditEvent(action="session_revoked", target=body.id,
+                                source="web", ip=client_ip(request)))
+        return {"ok": True, "message": "会话已踢出"}
+    raise HTTPException(404, "会话不存在或已过期")
+
+
+def _is_current(request: Request, digest: str) -> bool:
+    from ..auth import token_digest
+
+    token = extract_token(request)
+    return bool(token) and token_digest(token) == digest
+
+
+@router.post("/sessions/revoke-others")
+async def revoke_other_sessions(request: Request,
+                                _session: dict = Depends(require_internal)):
+    """踢出除当前会话外的所有会话。"""
+    from ..auth import token_digest
+
+    token = extract_token(request)
+    current = token_digest(token) if token else ""
+    count = 0
+    for digest in list(sessions_mod._sessions):
+        if digest != current and sessions_mod.revoke_digest(digest):
+            count += 1
+    audit.record(AuditEvent(action="sessions_revoked_others", target="-",
+                            summary=f"踢出 {count} 个会话",
+                            source="web", ip=client_ip(request)))
+    return {"ok": True, "message": f"已踢出 {count} 个其他会话"}

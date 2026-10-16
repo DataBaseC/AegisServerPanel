@@ -9,15 +9,18 @@ import logging
 import os
 import socket
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
 from .apps import supervisor
+from .audit import audit
+from .auth import require_auth
 from .config import MODE_INTERNAL, MODE_LABELS, MODE_PUBLIC, config
 from .metrics import metrics
 from .routes import (
@@ -82,18 +85,47 @@ app = FastAPI(
 )
 
 
-CSP = "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'"
+CSP = ("default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+       "connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; "
+       "frame-ancestors 'none'")
+
+# 状态变更类方法：对这些请求做 Origin 同源校验（Cookie 认证的 CSRF 纵深防御）
+_STATE_CHANGING = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def _origin_ok(request: Request) -> bool:
+    """有 Origin 头的状态变更请求必须同源或在白名单内。
+
+    浏览器发跨站 POST 一定带 Origin；curl / 脚本不带 Origin，不受影响
+    （它们本来也不用 Cookie）。与 SameSite=Lax 构成双重防护。
+    """
+    origin = request.headers.get("origin")
+    if not origin:
+        return True
+    host = request.headers.get("host")
+    if host and origin in (f"http://{host}", f"https://{host}"):
+        return True
+    return origin in config.allowed_origins
 
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
+    if request.method in _STATE_CHANGING and not _origin_ok(request):
+        return JSONResponse(status_code=403, content={"detail": "跨站请求被拒绝（Origin 不匹配）"})
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Content-Security-Policy"] = CSP
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     if request.url.path.startswith("/api/"):
         response.headers["Cache-Control"] = "no-store"
+    # TLS 部署（含反代终止）时下发 HSTS
+    proto = request.url.scheme
+    if config.trust_proxy:
+        proto = (request.headers.get("x-forwarded-proto") or proto).split(",")[0].strip()
+    if proto == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
 
 
@@ -126,11 +158,21 @@ for module in (
 
 @app.get("/healthz")
 async def healthz():
+    # 1.4.0 起最小化：不再对外暴露版本号与构建号（便于攻击者匹配已知漏洞），
+    # 也不暴露 initialized（探测"是否已设置密码"）。升级流程的版本观察
+    # 改走登录后的 /api/system/version。
+    return {"ok": True}
+
+
+@app.get("/api/system/version")
+async def system_version(_session: dict = Depends(require_auth)):
+    """版本信息（需登录）：前端升级流程轮询用，公网不可见。"""
     build = None
     version_file = BASE_DIR / "VERSION"
     if version_file.exists():
         build = version_file.read_text("utf-8").strip() or None
-    return {"ok": True, "version": __version__, "build": build, "initialized": config.initialized}
+    return {"ok": True, "version": __version__, "build": build,
+            "initialized": config.initialized}
 
 
 @app.get("/")
@@ -186,6 +228,21 @@ def banner(host: str, port: int) -> None:
         print("  按 Ctrl+C 停止\n")
     finally:
         sys.stdout.flush()  # 保证在 systemd / 重定向场景下也能立即看到地址
+
+
+def _show_agent_tokens() -> None:
+    """列出 Agent 令牌（哈希存储，只能展示元数据）。"""
+    tokens = config.agent_tokens
+    if not tokens:
+        print("尚未生成 Agent 接入令牌，执行 serverpanel --agent-token 生成。")
+        return
+    print(f"当前 Agent 接入令牌（共 {len(tokens)} 个，哈希存储无法取回明文）：")
+    for item in tokens:
+        expires = int(item.get("expires_at") or 0)
+        expire_text = ("永不过期" if not expires
+                       else f"{datetime.fromtimestamp(expires):%Y-%m-%d} 过期")
+        print(f"  [{item.get('id')}] {item.get('name')} · "
+              f"{item.get('scope')} · {expire_text}")
 
 
 def main() -> int:
@@ -299,27 +356,27 @@ def main() -> int:
 
     if args.agent_token:
         token = config.issue_agent_token()
-        print("Agent 接入令牌已生成（旧令牌立即失效）：")
+        audit.record_cli("token_created", "CLI 生成令牌", "scope=full")
+        print("Agent 接入令牌已生成（full 作用域）：")
         print(f"  {token}")
         print("  使用方式：POST /api/terminal/exec，请求头 X-Agent-Token: <令牌>")
         print("  生效条件：仅在【内网模式】下有效；关闭内网模式后立即失效。")
+        print("  明文仅此一次展示，遗失请重新生成（磁盘上只存哈希）。")
         return 0
 
     if args.show_agent_token:
-        token = config.agent_token
-        if token:
-            print(f"当前 Agent 接入令牌:\n  {token}")
-        else:
-            print("尚未生成 Agent 接入令牌，执行 serverpanel --agent-token 生成。")
+        _show_agent_tokens()
         return 0
 
     if args.revoke_agent_token:
-        config.revoke_agent_token()
-        print("Agent 接入令牌已吊销，旧令牌立即失效。")
+        count = config.revoke_all_agent_tokens()
+        audit.record_cli("tokens_revoked_all", "-", f"吊销 {count} 个令牌")
+        print(f"已吊销全部 {count} 个 Agent 接入令牌，旧令牌立即失效。")
         return 0
 
     if args.enable_internal:
         config.set_mode(MODE_INTERNAL)
+        audit.record_cli("mode_change", "internal", "激活内网模式")
         print("已激活内网模式（完全控制）")
         print("  已解锁：网页终端、文件读写、进程信号、服务启停、挂载/卸载、开关机")
         print("  生效说明：正在运行的面板会在数秒内自动识别，无需重启服务")
@@ -328,6 +385,7 @@ def main() -> int:
 
     if args.disable_internal:
         config.set_mode(MODE_PUBLIC)
+        audit.record_cli("mode_change", "public", "关闭内网模式")
         print("已关闭内网模式，回到公网模式（只读监控）")
         print("  终端、文件管理、电源等敏感功能已锁定")
         return 0

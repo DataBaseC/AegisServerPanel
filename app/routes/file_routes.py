@@ -1,12 +1,18 @@
-"""文件管理：浏览、读写、上传下载、删除、重命名、搜索、解压、远程拉取、权限。"""
+"""文件管理：浏览、读写、上传下载、删除、重命名、搜索、解压、远程拉取、权限。
+
+1.4.0 起：所有变更类操作记入统一审计管道；远程拉取增加 SSRF 防护；
+覆盖写/删除自动进回收站（可还原）。
+"""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import os
 import re
 import shutil
+import socket
 import stat
 import sys
 import tarfile
@@ -18,12 +24,15 @@ import zipfile
 from pathlib import Path
 from typing import List
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from .. import shell
-from ..auth import require_internal
+from ..audit import AuditEvent, audit
+from ..auth import client_ip, require_internal
+from ..config import config
+from ..trash import trash
 
 # 文件管理涉及读写、上传、删除，仅在内网模式开放
 router = APIRouter(prefix="/api/files", tags=["files"], dependencies=[Depends(require_internal)])
@@ -222,7 +231,7 @@ async def read_file(path: str, max_bytes: int = EDIT_LIMIT):
 
 
 @router.post("/write")
-async def write_file(body: WriteBody):
+async def write_file(body: WriteBody, request: Request):
     full = _abs(body.path)
     if os.path.isdir(full):
         raise HTTPException(400, "目标是一个目录")
@@ -247,17 +256,41 @@ async def write_file(body: WriteBody):
             raise HTTPException(409, f"文件在编辑期间已被修改（磁盘版本更新于 {when}），"
                                      f"直接保存会覆盖它")
 
+    # 覆盖写前自动进回收站（1.4.0）：误操作可从「文件管理 → 回收站」还原
+    trashed = None
+    if os.path.isfile(full):
+        try:
+            trashed = await asyncio.to_thread(trash.move, full, "overwrite")
+        except OSError as exc:
+            raise HTTPException(500, f"备份原文件到回收站失败，已取消保存: {exc}")
+
     def _save() -> None:
         os.makedirs(os.path.dirname(full) or "/", exist_ok=True)
         with open(full, "w", encoding="utf-8") as fh:
             fh.write(body.content)
 
-    await asyncio.to_thread(_save)  # 写盘不阻塞事件循环
-    return {"ok": True, "message": f"已保存 {full}"}
+    try:
+        await asyncio.to_thread(_save)  # 写盘不阻塞事件循环
+    except OSError as exc:
+        # 保存失败：把刚备份的原文件放回去，不留"改了半截"的现场
+        if trashed:
+            with contextlib.suppress(Exception):
+                trash.restore(trashed.entry_id)
+        raise HTTPException(500, f"保存失败: {exc}")
+    audit.record(AuditEvent(
+        action="file_write",
+        target=full,
+        summary=f"bytes={len(body.content.encode())}"
+                + (f" 原文件已备份（回收站 {trashed.entry_id}）" if trashed else ""),
+        source="web",
+        ip=client_ip(request),
+    ))
+    return {"ok": True, "message": f"已保存 {full}"
+            + ("（原文件已存入回收站）" if trashed else "")}
 
 
 @router.post("/mkdir")
-async def make_dir(body: PathBody):
+async def make_dir(body: PathBody, request: Request):
     full = _abs(body.path)
     if os.path.exists(full):
         raise HTTPException(400, "路径已存在")
@@ -265,11 +298,13 @@ async def make_dir(body: PathBody):
         await asyncio.to_thread(os.makedirs, full, exist_ok=False)
     except OSError as exc:
         raise HTTPException(500, f"创建失败: {exc.strerror or exc}")
+    audit.record(AuditEvent(action="file_mkdir", target=full, source="web",
+                            ip=client_ip(request)))
     return {"ok": True, "message": f"已创建目录 {full}"}
 
 
 @router.post("/rename")
-async def rename(body: RenameBody):
+async def rename(body: RenameBody, request: Request):
     source = _abs(body.path)
     _guard_delete(source)
     target = body.target if os.path.isabs(body.target) else os.path.join(os.path.dirname(source), body.target)
@@ -287,11 +322,13 @@ async def rename(body: RenameBody):
         await asyncio.to_thread(_move)
     except OSError as exc:
         raise HTTPException(500, f"移动失败: {exc.strerror or exc}")
+    audit.record(AuditEvent(action="file_rename", target=f"{source} → {target}",
+                            source="web", ip=client_ip(request)))
     return {"ok": True, "message": f"已移动到 {target}"}
 
 
 @router.post("/copy")
-async def copy(body: RenameBody):
+async def copy(body: RenameBody, request: Request):
     source = _abs(body.path)
     target = os.path.abspath(body.target)
     if not os.path.lexists(source):
@@ -310,11 +347,13 @@ async def copy(body: RenameBody):
         await asyncio.to_thread(_copy)  # 大目录复制动辄几十秒，绝不能卡事件循环
     except OSError as exc:
         raise HTTPException(500, f"复制失败: {exc.strerror or exc}")
+    audit.record(AuditEvent(action="file_copy", target=f"{source} → {target}",
+                            source="web", ip=client_ip(request)))
     return {"ok": True, "message": f"已复制到 {target}"}
 
 
 @router.post("/delete")
-async def delete(body: DeleteBody):
+async def delete(body: DeleteBody, request: Request):
     if not body.paths:
         raise HTTPException(400, "未指定要删除的路径")
 
@@ -327,10 +366,8 @@ async def delete(body: DeleteBody):
                 if not os.path.lexists(full):
                     failed.append({"path": full, "error": "不存在"})
                     continue
-                if os.path.isdir(full) and not os.path.islink(full):
-                    shutil.rmtree(full)
-                else:
-                    os.remove(full)
+                # 1.4.0：删除 = 移入回收站（可还原），purge 才真正抹除
+                trash.move(full, "delete")
                 removed.append(full)
             except HTTPException as exc:
                 failed.append({"path": full, "error": exc.detail})
@@ -338,9 +375,19 @@ async def delete(body: DeleteBody):
                 failed.append({"path": full, "error": str(exc)})
         return removed, failed
 
-    removed, failed = await asyncio.to_thread(_delete)  # rmtree 大目录会很久
+    removed, failed = await asyncio.to_thread(_delete)  # 大目录移动可能跨盘复制
+    audit.record(AuditEvent(
+        action="file_delete",
+        target=", ".join(removed)[:1024] if removed else "-",
+        summary=f"删除 {len(removed)} 项（已入回收站）"
+                + (f"，{len(failed)} 项失败" if failed else ""),
+        source="web",
+        ip=client_ip(request),
+        ok=not failed,
+    ))
     return {"ok": not failed, "removed": removed, "failed": failed,
-            "message": f"已删除 {len(removed)} 项" + (f"，{len(failed)} 项失败" if failed else "")}
+            "message": f"已移入回收站 {len(removed)} 项（可在回收站还原）"
+                       + (f"，{len(failed)} 项失败" if failed else "")}
 
 
 @router.get("/download")
@@ -372,6 +419,7 @@ async def download(background: BackgroundTasks, path: str = Query(...)):
 
 @router.post("/upload")
 async def upload(
+    request: Request,
     path: str = Form(...),
     overwrite: bool = Form(True),
     files: List[UploadFile] = File(...),
@@ -379,6 +427,9 @@ async def upload(
     target_dir = _abs(path)
     if not os.path.isdir(target_dir):
         raise HTTPException(400, "上传目标必须是已存在的目录")
+    # 符号链接逃逸防护（1.4.0）：目标目录自身不得是指向外部的链接
+    if not _within(target_dir, target_dir):
+        raise HTTPException(400, "上传目标目录是指向外部的符号链接，已拒绝")
     saved, failed = [], []
     for upload_file in files:
         raw_name = (upload_file.filename or "unnamed").replace("\\", "/")
@@ -387,9 +438,29 @@ async def upload(
             failed.append({"name": raw_name, "error": "文件名不合法"})
             continue
         destination = os.path.join(target_dir, *parts)
+        # 逐级校验：中间目录若是逃逸链接，落盘位置会跑到目标目录之外
+        probe = target_dir
+        escaped = False
+        for part in parts[:-1]:
+            probe = os.path.join(probe, part)
+            if os.path.islink(probe) and not _within(target_dir, probe):
+                escaped = True
+                break
+        if escaped:
+            failed.append({"name": raw_name, "error": "路径中包含逃逸符号链接，已拒绝"})
+            continue
         if os.path.exists(destination) and not overwrite:
             failed.append({"name": raw_name, "error": "文件已存在"})
             continue
+        # 覆盖上传同样先备份（与在线编辑一致）
+        pre_trash = None
+        if os.path.isfile(destination):
+            try:
+                pre_trash = await asyncio.to_thread(trash.move, destination, "upload-overwrite")
+            except OSError as exc:
+                failed.append({"name": raw_name, "error": f"备份原文件失败: {exc}"})
+                continue
+
         def _save(dest: str = destination) -> None:
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             with open(dest, "wb") as fh:
@@ -399,9 +470,20 @@ async def upload(
             await asyncio.to_thread(_save)  # 大文件写盘不阻塞事件循环
             saved.append(destination)
         except OSError as exc:
+            if pre_trash:
+                with contextlib.suppress(Exception):
+                    trash.restore(pre_trash.entry_id)
             failed.append({"name": raw_name, "error": str(exc)})
         finally:
             await upload_file.close()
+    audit.record(AuditEvent(
+        action="file_upload",
+        target=target_dir,
+        summary=f"上传 {len(saved)} 个文件" + (f"，{len(failed)} 个失败" if failed else ""),
+        source="web",
+        ip=client_ip(request),
+        ok=not failed,
+    ))
     return {"ok": not failed, "saved": saved, "failed": failed,
             "message": f"已上传 {len(saved)} 个文件" + (f"，{len(failed)} 个失败" if failed else "")}
 
@@ -534,7 +616,7 @@ def _extract(source: str, dest: str) -> int:
 
 
 @router.post("/extract")
-async def extract(body: PathBody):
+async def extract(body: PathBody, request: Request):
     source = _abs(body.path)
     if not os.path.isfile(source):
         raise HTTPException(404, "压缩包不存在或不是普通文件")
@@ -545,22 +627,91 @@ async def extract(body: PathBody):
     except (zipfile.BadZipFile, tarfile.TarError, OSError) as exc:
         shutil.rmtree(dest, ignore_errors=True)  # 解压失败不留半个目录
         raise HTTPException(500, f"解压失败: {exc}")
+    audit.record(AuditEvent(action="file_extract", target=f"{source} → {dest}",
+                            summary=f"{count} 项", source="web",
+                            ip=client_ip(request)))
     return {"ok": True, "dest": dest, "count": count,
             "message": f"已解压 {count} 项到 {dest}"}
 
 
 # ---------------------------------------------------------------- 远程拉取
 
-def _fetch_sync(url: str, dest_file: str) -> int:
-    """同步流式下载，返回字节数。仅 http/https（urllib 对 file:// 等协议照单全收，必须显式拦）。"""
+# SSRF 防护（1.4.0）：默认拒绝解析到私网/回环/链路本地的目标。
+# 面板以 root 运行， unrestricted fetch 可被用作探测/读取内网服务
+# （含云元数据 169.254.169.254）的跳板，且响应会落盘成文件可被读回。
+_BLOCKED_NETS = [
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("100.64.0.0/10"),      # CGNAT
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),     # 链路本地 / 云元数据
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.0.0.0/24"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),           # IPv6 唯一本地
+    ipaddress.ip_network("fe80::/10"),          # IPv6 链路本地
+]
+
+
+def _ip_blocked(ip_text: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip_text)
+    except ValueError:
+        return True  # 解析不出来的地址一律按拒绝处理
+    if addr.is_link_local or addr.is_loopback or addr.is_unspecified or addr.is_multicast:
+        return True
+    return any(addr in net for net in _BLOCKED_NETS)
+
+
+def _assert_url_allowed(url: str) -> None:
+    """URL 级 SSRF 校验：协议白名单 + 主机名解析后不得落入私网。
+
+    解析在此处一次性完成并返回给调用方复用，避免「校验用 DNS、连接用
+    另一套解析」的 TOCTOU 窗口（DNS rebinding）。配置
+    ``fetch_allow_private=true`` 可显式放行内网目标（内网运维场景）。
+    """
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise HTTPException(400, "仅支持 http/https 直链")
-    request = urllib.request.Request(url, headers={"User-Agent": "AegisServerPanel/1.1"})
+    host = parsed.hostname or ""
+    if not host:
+        raise HTTPException(400, "URL 缺少主机名")
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80),
+                                   proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise HTTPException(400, f"无法解析主机名 {host}: {exc}")
+    addresses = {info[4][0] for info in infos}
+    if not addresses:
+        raise HTTPException(400, f"无法解析主机名 {host}")
+    if config.fetch_allow_private:
+        return
+    for address in addresses:
+        if _ip_blocked(address):
+            raise HTTPException(400, f"目标地址 {address} 属于内网/回环/链路本地地址，"
+                                     f"已被 SSRF 防护拦截（可在配置中放行私网）")
+
+
+def _within(root: str, path: str) -> bool:
+    """realpath(path) 是否仍落在 realpath(root) 之内（符号链接逃逸防护）。"""
+    real_root = os.path.realpath(root)
+    real_path = os.path.realpath(path)
+    return real_path == real_root or real_path.startswith(real_root + os.sep)
+
+
+def _fetch_sync(url: str, dest_file: str) -> int:
+    """同步流式下载，返回字节数。仅 http/https，且目标不得是内网地址。"""
+    _assert_url_allowed(url)
+    request = urllib.request.Request(url, headers={"User-Agent": "AegisServerPanel/1.4"})
     total = 0
     try:
         with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT) as resp, \
                 open(dest_file, "wb") as fh:
+            # 重定向可能跳到内网：逐跳复核最终 URL
+            final_url = resp.geturl()
+            if final_url != url:
+                _assert_url_allowed(final_url)
             while True:
                 chunk = resp.read(FETCH_CHUNK)
                 if not chunk:
@@ -581,7 +732,7 @@ def _fetch_sync(url: str, dest_file: str) -> int:
 
 
 @router.post("/fetch")
-async def fetch_url(body: FetchBody):
+async def fetch_url(body: FetchBody, request: Request):
     dest_dir = _abs(body.dest_dir)
     if not os.path.isdir(dest_dir):
         raise HTTPException(400, "目标必须是已存在的目录")
@@ -592,7 +743,13 @@ async def fetch_url(body: FetchBody):
     dest_file = os.path.join(dest_dir, name)
     if os.path.exists(dest_file):
         raise HTTPException(400, f"目标已存在：{dest_file}")
+    # 符号链接逃逸防护：目标目录内的链接不得指向声明边界之外
+    if not _within(dest_dir, os.path.dirname(dest_file) or dest_dir):
+        raise HTTPException(400, "目标目录内包含指向外部的符号链接，已拒绝写入")
     size = await asyncio.to_thread(_fetch_sync, body.url, dest_file)
+    audit.record(AuditEvent(action="file_fetch", target=dest_file,
+                            summary=f"url={body.url[:500]} bytes={size}",
+                            source="web", ip=client_ip(request)))
     return {"ok": True, "path": dest_file, "size": size,
             "message": f"已下载 {name}（{size} 字节）到 {dest_dir}"}
 
@@ -600,7 +757,7 @@ async def fetch_url(body: FetchBody):
 # ---------------------------------------------------------------- 权限
 
 @router.post("/chmod")
-async def chmod_path(body: ChmodBody):
+async def chmod_path(body: ChmodBody, request: Request):
     full = _abs(body.path)
     if not os.path.lexists(full):
         raise HTTPException(404, "路径不存在")
@@ -623,6 +780,67 @@ async def chmod_path(body: ChmodBody):
             failed.append({"path": target, "error": str(exc)})
     if failed and not changed:
         raise HTTPException(500, f"权限修改失败: {failed[0]['error']}")
+    audit.record(AuditEvent(
+        action="file_chmod",
+        target=full,
+        summary=f"mode={body.mode} recursive={body.recursive} changed={changed}",
+        source="web",
+        ip=client_ip(request),
+        ok=not failed,
+    ))
     return {"ok": not failed, "changed": changed, "failed": failed,
             "message": f"已修改 {changed} 项权限为 {body.mode}"
                        + (f"，{len(failed)} 项失败" if failed else "")}
+
+
+# ---------------------------------------------------------------- 回收站（1.4.0）
+
+
+@router.get("/trash")
+async def trash_list(_session: dict = Depends(require_internal)):
+    """回收站列表（覆盖写/删除的自动备份）。"""
+    entries = await asyncio.to_thread(trash.list)
+    usage = await asyncio.to_thread(trash.usage)
+    return {"entries": entries, "usage": usage}
+
+
+class TrashIdBody(BaseModel):
+    id: str
+
+
+@router.post("/trash/restore")
+async def trash_restore(body: TrashIdBody, request: Request):
+    try:
+        original = await asyncio.to_thread(trash.restore, body.id)
+    except KeyError:
+        raise HTTPException(404, "回收站条目不存在")
+    except FileNotFoundError:
+        raise HTTPException(410, "条目对应的文件已不在回收站（可能已被清理）")
+    except FileExistsError:
+        raise HTTPException(409, "原始路径已存在同名文件，请先处理后再还原")
+    except OSError as exc:
+        raise HTTPException(500, f"还原失败: {exc}")
+    audit.record(AuditEvent(action="trash_restore", target=original,
+                            summary=f"entry={body.id}", source="web",
+                            ip=client_ip(request)))
+    return {"ok": True, "message": f"已还原到 {original}", "original": original}
+
+
+@router.post("/trash/purge")
+async def trash_purge(body: TrashIdBody, request: Request):
+    try:
+        await asyncio.to_thread(trash.purge, body.id)
+    except KeyError:
+        raise HTTPException(404, "回收站条目不存在")
+    audit.record(AuditEvent(action="trash_purge", target=body.id, source="web",
+                            ip=client_ip(request)))
+    return {"ok": True, "message": "已彻底删除该条目"}
+
+
+@router.post("/trash/purge-all")
+async def trash_purge_all(request: Request):
+    count = await asyncio.to_thread(trash.purge_all)
+    audit.record(AuditEvent(action="trash_purge_all", target="-",
+                            summary=f"清除 {count} 项", source="web",
+                            ip=client_ip(request)))
+    return {"ok": True, "message": f"回收站已清空（{count} 项）"}

@@ -2,45 +2,47 @@
 
 内置任务清单见 ``app/tasks.py``（声明式模板 + 参数正则校验）。任务整体要求内网模式，
 与 ``/api/terminal/exec`` 同级——它本来就是"包装好的命令执行"，门禁不能比终端更松。
+
+1.4.0 起执行记录改走统一审计管道（``app/audit.py``）：落盘、重启不丢、
+可全类型追溯；本模块的 ``recent_runs`` 只是审计数据的任务视图。
 """
 
 from __future__ import annotations
 
 import time
-from collections import deque
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from .. import shell
-from ..auth import require_internal
+from ..audit import AuditEvent, audit
+from ..auth import client_ip, require_internal
 from ..tasks import public_tasks, render, task_by_id
 
 router = APIRouter(prefix="/api/panel/tasks", tags=["panel-tasks"])
-
-RECORD_LIMIT = 30
-_records: deque[dict] = deque(maxlen=RECORD_LIMIT)
 
 
 class RunBody(BaseModel):
     params: dict[str, str] = {}
 
 
-def recent_runs() -> list[dict]:
-    return list(_records)
+def recent_runs(limit: int = 30) -> list[dict]:
+    """最近任务执行记录（读审计管道）。"""
+    return audit.query(action="task_run", limit=max(1, min(limit, 100)))
 
 
-def _record(task_id: str, title: str, params: dict, code: int, duration: float,
-            command: str) -> None:
-    _records.appendleft({
-        "time": int(time.time()),
-        "task_id": task_id,
-        "title": title,
-        "params": params,
-        "code": code,
-        "duration": round(duration, 2),
-        "command": command[:500],
-    })
+def _record(task_id: str, title: str, params: dict, result, duration: float,
+            command: str, ip: str) -> None:
+    audit.record(AuditEvent(
+        action="task_run",
+        target=title or task_id,
+        summary=f"id={task_id} params={params} cmd={command[:800]}",
+        source="web",
+        ip=ip,
+        ok=result.code == 0,
+        code=result.code,
+        duration=duration,
+    ))
 
 
 @router.get("")
@@ -49,8 +51,8 @@ async def list_tasks(_session: dict = Depends(require_internal)):
 
 
 @router.post("/{task_id}/run")
-async def run_task(task_id: str, body: RunBody | None = None,
-                   _session: dict = Depends(require_internal)):
+async def run_task(task_id: str, request: Request, body: RunBody | None = None,
+                   session: dict = Depends(require_internal)):
     task = task_by_id(task_id)
     if task is None:
         raise HTTPException(404, "任务不存在")
@@ -66,7 +68,8 @@ async def run_task(task_id: str, body: RunBody | None = None,
     started = time.time()
     result = await shell.run(command, timeout=task.timeout, shell=True)
     duration = time.time() - started
-    _record(task.id, task.title, values, result.code, duration, command)
+    _record(task.id, task.title, values, result, duration, command,
+            client_ip(request))
     return {
         "ok": result.code == 0,
         "code": result.code,
@@ -85,5 +88,5 @@ async def recent(_session: dict = Depends(require_internal)):
 
 @router.delete("/recent")
 async def clear_recent(_session: dict = Depends(require_internal)):
-    _records.clear()
-    return {"ok": True, "message": "执行记录已清空"}
+    # 审计记录不可删（可追溯性优先）：仅提示已归档
+    return {"ok": True, "message": "执行记录已归档到审计日志（安全审计不可删除）"}

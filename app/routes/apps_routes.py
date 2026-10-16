@@ -2,6 +2,8 @@
 
 路径统一挂在 ``/api/panel/apps`` 下——``/api/apps`` 已被「应用与端口」发现占用
 （那是只读的端口扫描，本模块是写操作的进程托管），前缀分开可以避免两套语义混淆。
+
+1.4.0 起操作审计改走统一管道（``app/audit.py``），落盘可追溯。
 """
 
 from __future__ import annotations
@@ -10,19 +12,16 @@ import asyncio
 import contextlib
 import os
 import time
-from collections import deque
 
 import psutil
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from ..apps import AppError, a_name, normalize_definition, probe, supervisor
+from ..audit import AuditEvent, audit
 from ..auth import require_internal
 
 router = APIRouter(prefix="/api/panel/apps", tags=["panel-apps"])
-
-AUDIT_LIMIT = 40
-_audit: deque[dict] = deque(maxlen=AUDIT_LIMIT)
 
 
 class AppBody(BaseModel):
@@ -53,19 +52,33 @@ class ProbeBody(BaseModel):
     seconds: float = 5.0
 
 
-def recent_audit() -> list[dict]:
-    return list(_audit)
+def recent_audit(limit: int = 40) -> list[dict]:
+    """常驻应用操作记录（读统一审计管道，保持旧字段形状供设置页消费）。"""
+    items = []
+    for item in audit.query(days=30, limit=500):
+        if not str(item.get("action", "")).startswith("app_"):
+            continue
+        items.append({
+            "time": item.get("time", 0),
+            "kind": "apps",
+            "action": str(item["action"])[4:],
+            "app_id": item.get("app_id", ""),
+            "app": item.get("app", item.get("target", "")),
+            "detail": (item.get("detail") or item.get("summary") or "")[:300],
+        })
+        if len(items) >= limit:
+            break
+    return items
 
 
 def record_audit(action: str, app_id: str, name: str, detail: str = "") -> None:
-    _audit.appendleft({
-        "time": int(time.time()),
-        "kind": "panel",
-        "action": action,
-        "app_id": app_id,
-        "app": name,
-        "detail": detail[:300],
-    })
+    audit.record(AuditEvent(
+        action=f"app_{action}",
+        target=name,
+        summary=detail[:300],
+        source="web",
+        extra={"app_id": app_id, "app": name, "detail": detail[:300]},
+    ))
 
 
 def _guard(fn, *args, **kwargs):

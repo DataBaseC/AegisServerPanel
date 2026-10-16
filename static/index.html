@@ -32,12 +32,21 @@
         <input class="input" type="password" id="login-confirm" autocomplete="new-password"
                placeholder="请再次输入密码">
       </label>
+      <label class="field hidden" id="totp-field">
+        <span>二次验证码</span>
+        <input class="input" type="text" id="login-totp" inputmode="numeric"
+               autocomplete="one-time-code" placeholder="6 位动态码，或恢复码" maxlength="24">
+      </label>
       <div class="login-error" id="login-error"></div>
       <button class="btn primary" type="submit" id="login-submit">登录</button>
     </form>
     <div class="login-hint" id="login-hint">
       密码通过 PBKDF2 加盐哈希后保存在本机配置文件中，
       登录后可获得该主机的完整控制权限。
+    </div>
+    <div class="login-hint hidden" id="totp-hint">
+      已启用二次认证（TOTP）：请输入 authenticator App 中的 6 位动态码；
+      遗失设备时可使用一次性恢复码登录。
     </div>
   </div>
 </div>

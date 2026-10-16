@@ -2,6 +2,10 @@
 
 必须在导入 app 之前设置 SERVERPANEL_CONFIG，让配置单例落在临时文件上，
 避免污染真实配置；SERVERPANEL_APPS_DIR 把常驻应用注册表与日志也隔离到临时目录。
+
+注意：配置必须放在**每进程独立的临时目录**里。sessions.json / failures.json
+等状态文件紧邻配置文件存放，若用裸 mktemp 落在 /tmp 根下，这些文件会跨
+pytest 运行共享累积（1.4.0 起它们都是落盘的），导致用例间状态污染。
 """
 
 from __future__ import annotations
@@ -13,8 +17,27 @@ import warnings
 
 import pytest
 
-os.environ["SERVERPANEL_CONFIG"] = tempfile.mktemp(suffix=".json")
+_STATE_DIR = tempfile.mkdtemp(prefix="serverpanel-test-")
+os.environ["SERVERPANEL_CONFIG"] = os.path.join(_STATE_DIR, "config.json")
 os.environ["SERVERPANEL_APPS_DIR"] = tempfile.mkdtemp(prefix="serverpanel-apps-")
+
+
+@pytest.fixture(autouse=True)
+def _reset_failure_tracker():
+    """每个用例前重置登录失败计数。
+
+    失败计数是进程级单例且落盘（1.4.0 起重启不清零），不加这道隔离，
+    防爆破用例触发的锁定会污染后续所有用例。持久化行为由专门用例覆盖。
+    """
+    from app.auth import failures
+
+    failures._ips = {}
+    failures._global = []
+    try:
+        failures._file().unlink(missing_ok=True)
+    except OSError:
+        pass
+    yield
 
 
 @pytest.fixture(autouse=True)

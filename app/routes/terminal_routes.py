@@ -7,12 +7,12 @@ import json
 import os
 import signal
 import time
-from collections import deque
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket
 from pydantic import BaseModel
 
 from .. import shell
+from ..audit import AuditEvent, audit
 from ..auth import authenticate_ws, require_exec_auth, require_internal, sessions
 from ..config import MODE_INTERNAL, config
 from ..utils import is_root
@@ -32,13 +32,13 @@ try:
 except ImportError:  # pragma: no cover - Windows 开发环境
     HAS_PTY = False
 
-# 命令执行审计：保留最近若干条，供「Agent 接入」页面查看。
-AUDIT_LIMIT = 40
-_audit: deque[dict] = deque(maxlen=AUDIT_LIMIT)
 
+def recent_execs(limit: int = 40) -> list[dict]:
+    """最近命令执行记录（面板「Agent 接入」页速览）。
 
-def recent_execs() -> list[dict]:
-    return list(_audit)
+    1.4.0 起改读统一审计管道：重启不丢、可追溯全类型操作。
+    """
+    return audit.query(action="exec", limit=max(1, min(limit, 100)))
 
 
 class ExecBody(BaseModel):
@@ -95,6 +95,8 @@ async def exec_command(body: ExecBody, auth: dict = Depends(require_exec_auth)):
     """执行单条命令并返回输出。
 
     面板会话与 Agent 令牌都可以调用，用于非交互场景（脚本 / AI Agent 接管）。
+    1.4.0 起 Agent 令牌按作用域校验命令（readonly / custom 前缀白名单），
+    见 ``app/scopes.py``。
     """
     if not body.command.strip():
         raise HTTPException(400, "命令不能为空")
@@ -104,6 +106,25 @@ async def exec_command(body: ExecBody, auth: dict = Depends(require_exec_auth)):
     # 而 body.timeout <= 0 or body.timeout > 600 这种写法会让 NaN 溜过去
     if not (1 <= body.timeout <= 600):
         raise HTTPException(400, "timeout 需在 1~600 秒之间")
+    # 令牌作用域校验（面板会话不限制）
+    if auth.get("kind") == "agent":
+        from ..scopes import command_allowed
+
+        if not command_allowed(auth.get("scope", "full"),
+                               auth.get("prefixes") or [], body.command):
+            audit.record(AuditEvent(
+                action="exec_denied",
+                target=body.command,
+                summary=f"令牌 {auth.get('token_name', '')} 作用域不足",
+                source="agent",
+                ip=auth.get("ip", ""),
+                ok=False,
+            ))
+            scope = auth.get("scope", "full")
+            detail = ("该令牌为只读作用域，仅允许执行查询类命令"
+                      if scope == "readonly"
+                      else f"该令牌仅允许执行以指定前缀开头的命令（{', '.join(auth.get('prefixes') or [])}）")
+            raise HTTPException(403, detail)
     started = time.time()
     result = await shell.run(
         body.command,
@@ -111,14 +132,18 @@ async def exec_command(body: ExecBody, auth: dict = Depends(require_exec_auth)):
         shell=True,
         cwd=body.cwd if body.cwd and os.path.isdir(body.cwd) else None,
     )
-    _audit.appendleft({
-        "time": int(started),
-        "kind": auth.get("kind", "session"),
-        "ip": auth.get("ip", ""),
-        "command": body.command[:2000],  # 审计只留摘要，防超长命令撑爆内存
-        "code": result.code,
-        "duration": round(time.time() - started, 2),
-    })
+    # 统一审计管道：落盘可追溯（面板会话与 Agent 令牌共用同一通道）
+    audit.record(AuditEvent(
+        action="exec",
+        target=body.command,  # AuditEvent 内部统一截断到 2000 字符
+        summary=f"cwd={body.cwd or '-'} timeout={body.timeout:g}s",
+        source="agent" if auth.get("kind") == "agent" else "web",
+        ip=auth.get("ip", ""),
+        actor=auth.get("token_name", ""),
+        ok=result.code == 0,
+        code=result.code,
+        duration=time.time() - started,
+    ))
     return {"code": result.code, "stdout": result.out, "stderr": result.err}
 
 

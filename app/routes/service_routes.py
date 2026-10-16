@@ -5,11 +5,12 @@ from __future__ import annotations
 import os
 import re
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from .. import shell
-from ..auth import require_auth, require_internal
+from ..audit import AuditEvent, audit
+from ..auth import client_ip, require_auth, require_internal
 
 router = APIRouter(prefix="/api/services", tags=["services"], dependencies=[Depends(require_auth)])
 
@@ -111,7 +112,7 @@ async def service_detail(name: str):
 
 
 @router.post("/{name}/action", dependencies=[Depends(require_internal)])
-async def service_action(name: str, body: ActionBody):
+async def service_action(name: str, body: ActionBody, request: Request):
     _require_systemd()
     unit = _validate_unit(name)
     if body.action not in ACTIONS:
@@ -120,6 +121,9 @@ async def service_action(name: str, body: ActionBody):
     if not result.ok:
         detail = (result.err or result.out).strip().splitlines()
         raise HTTPException(500, detail[-1] if detail else "操作失败")
+    audit.record(AuditEvent(action="service_action", target=unit,
+                            summary=ACTIONS[body.action], source="web",
+                            ip=client_ip(request)))
     return {"ok": True, "message": f"{unit} {ACTIONS[body.action]}成功"}
 
 

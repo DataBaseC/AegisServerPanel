@@ -422,6 +422,7 @@ const NAV = [
   { id: 'apps-port', label: '应用与端口', icon: '⧉', internalOnly: true },
   { id: 'files', label: '文件管理', icon: '🗀', internalOnly: true },
   { id: 'agent', label: 'Agent 接入', icon: '⌘', internalOnly: true },
+  { id: 'security', label: '安全中心', icon: '🛡', internalOnly: true },
   { id: 'settings', label: '设置', icon: '⚒' },
 ];
 
@@ -606,15 +607,19 @@ function showLogin(expired = false) {
   $('#login-submit').textContent = initialized ? '登录' : '设置密码并登录';
   $('#confirm-field').classList.toggle('hidden', initialized);
   $('#login-password').setAttribute('autocomplete', initialized ? 'current-password' : 'new-password');
+  // 二次认证（1.4.0）：仅在已启用 TOTP 且是登录（非首次设置）时要求动态码
+  const needTotp = initialized && !!authState.totp_enabled;
+  $('#totp-field').classList.toggle('hidden', !needTotp);
+  $('#totp-hint').classList.toggle('hidden', !needTotp);
   $('#login-error').textContent = expired ? '会话已过期，请重新登录' : '';
   const modeNote = authState.mode === 'internal'
     ? '<span class="badge mode-badge internal">内网模式 · 完全控制</span>'
     : '<span class="badge mode-badge public">公网模式 · 只读监控</span>';
   $('#login-hint').innerHTML = (initialized
     ? '密码通过 PBKDF2 加盐哈希后保存在本机配置文件中。忘记密码可在服务器上执行：<span class="mono">serverpanel --set-password 新密码</span>'
-    : '首次使用，请设置访问密码（至少 8 位）。密码只保存在本机，用于登录本控制台。')
+    : '首次使用，请设置访问密码（至少 12 位）。密码只保存在本机，用于登录本控制台。')
     + `<div style="margin-top:10px">${modeNote}</div>`;
-  setTimeout(() => $('#login-password').focus(), 50);
+  setTimeout(() => (needTotp ? $('#login-totp') : $('#login-password')).focus(), 50);
 }
 
 async function submitLogin(event) {
@@ -630,10 +635,21 @@ async function submitLogin(event) {
       if (password !== confirm) throw new ApiError('两次输入的密码不一致', 0);
     }
     const url = authState.initialized ? '/api/auth/login' : '/api/auth/setup';
-    await api.post(url, { password });
+    const code = ($('#login-totp').value || '').trim();
+    await api.post(url, { password, code });
     $('#login-form').reset();
     await startApp();
   } catch (err) {
+    // 服务端提示「需要二次验证码」：密码已通过，展开动态码输入框引导补登
+    if (err.status === 401 && /二次验证码/.test(err.message || '')) {
+      authState.totp_enabled = true;
+      $('#totp-field').classList.remove('hidden');
+      $('#totp-hint').classList.remove('hidden');
+      errorEl.textContent = '请输入二次验证码后继续';
+      $('#login-totp').focus();
+      button.disabled = false;
+      return;
+    }
     errorEl.textContent = err.message;
     button.disabled = false;
   }
@@ -1836,6 +1852,7 @@ registerView('files', {
           <button class="btn sm" data-act="upload">上传文件</button>
           <button class="btn sm" data-act="upload-dir">上传文件夹</button>
           <button class="btn sm" data-act="fetch-url">从 URL 拉取</button>
+          <button class="btn sm" data-act="trash">回收站</button>
           <input type="file" id="file-input" multiple class="hidden">
           <input type="file" id="dir-input" webkitdirectory multiple class="hidden">
           <label class="dim" style="font-size:12px;display:flex;align-items:center;gap:4px">
@@ -2152,6 +2169,81 @@ registerView('files', {
       };
     }
 
+    /** 回收站（1.4.0）：覆盖写 / 删除 / 上传覆盖前的自动备份，可还原或彻底删除。 */
+    async function openTrash() {
+      let modal = null;
+      async function paintTrash() {
+        try {
+          const data = await api.get('/api/files/trash');
+          const { entries, usage } = data;
+          const reasonLabel = {
+            delete: '<span class="badge warn">删除</span>',
+            overwrite: '<span class="badge info">覆盖写</span>',
+            'upload-overwrite': '<span class="badge info">上传覆盖</span>',
+          };
+          const body = modal.body;
+          body.innerHTML = `
+            <div class="dim" style="font-size:12px;line-height:1.7;margin-bottom:10px">
+              共 ${usage.count} 项，占用 ${bytes(usage.bytes)}，保留 ${usage.retention_days} 天后自动清理。
+              还原时若原始路径已存在同名文件会被拒绝，请先处理原文件。
+            </div>
+            <div class="row" style="margin-bottom:10px">
+              <button class="btn sm ghost" id="trash-refresh">刷新</button>
+              <button class="btn sm danger" id="trash-purge-all" ${entries.length ? '' : 'disabled'}>清空回收站</button>
+            </div>
+            <div class="table-wrap"><table class="data"><thead><tr>
+              <th>名称</th><th>原路径</th><th class="num">大小</th><th>来源</th><th>删除时间</th><th></th></tr></thead>
+              <tbody>${entries.length ? entries.map((e) => `<tr>
+                <td class="cell-main">${e.is_dir ? '🗀' : '📄'} ${esc(e.name)}</td>
+                <td class="cell-sub mono" title="${esc(e.original)}">${esc(e.original)}</td>
+                <td class="num">${bytes(e.size)}</td>
+                <td>${reasonLabel[e.reason] || esc(e.reason || '-')}</td>
+                <td class="cell-sub">${datetime(e.time)}</td>
+                <td>
+                  <button class="btn sm ghost" data-trash-restore="${esc(e.id)}">还原</button>
+                  <button class="btn sm danger" data-trash-purge="${esc(e.id)}">彻底删除</button>
+                </td>
+              </tr>`).join('') : '<tr><td colspan="6"><div class="empty">回收站为空</div></td></tr>'}</tbody></table></div>`;
+          $('#trash-refresh', body).onclick = () => paintTrash();
+          $('#trash-purge-all', body).onclick = async () => {
+            const ok = await confirmDialog({
+              title: '清空回收站', danger: true, confirmText: '全部删除', phrase: 'EMPTY',
+              message: '回收站内所有条目将被<b>永久删除</b>，无法恢复。',
+            });
+            if (!ok) return;
+            try {
+              await api.post('/api/files/trash/purge-all', {});
+              toast('回收站已清空', 'ok');
+              paintTrash();
+            } catch (err) { toast(err.message, 'err'); }
+          };
+          $$('[data-trash-restore]', body).forEach((btn) => btn.onclick = async () => {
+            try {
+              const res = await api.post('/api/files/trash/restore', { id: btn.dataset.trashRestore });
+              toast(res.message, 'ok');
+              paintTrash(); load(cwd);
+            } catch (err) { toast(err.message, 'err'); }
+          });
+          $$('[data-trash-purge]', body).forEach((btn) => btn.onclick = async () => {
+            const ok = await confirmDialog({
+              title: '彻底删除', danger: true, confirmText: '删除',
+              message: '该条目将被<b>永久删除</b>，无法恢复。',
+            });
+            if (!ok) return;
+            try {
+              await api.post('/api/files/trash/purge', { id: btn.dataset.trashPurge });
+              toast('已彻底删除', 'ok');
+              paintTrash();
+            } catch (err) { toast(err.message, 'err'); }
+          });
+        } catch (err) {
+          if (modal) modal.body.innerHTML = `<div class="empty">读取失败：${esc(err.message)}</div>`;
+        }
+      }
+      modal = openModal({ title: '回收站', body: '<div class="empty">加载中…</div>', size: 'wide' });
+      paintTrash();
+    }
+
     async function doFetchUrl() {
       const url = await promptDialog({
         title: '从 URL 拉取文件', label: '文件直链（http/https，下载到当前目录）',
@@ -2170,8 +2262,8 @@ registerView('files', {
       const paths = [...selected];
       const preview = paths.slice(0, 4).map((p) => esc(p)).join('<br>');
       const ok = await confirmDialog({
-        title: '批量删除', danger: true, confirmText: `删除 ${paths.length} 项`,
-        message: `将<b>永久删除</b>以下 ${paths.length} 项（含目录内容）：<br><span class="mono" style="font-size:12px">${preview}${paths.length > 4 ? '<br>…' : ''}</span>`,
+        title: '批量删除', danger: true, confirmText: `移入回收站 ${paths.length} 项`,
+        message: `将以下 ${paths.length} 项（含目录内容）<b>移入回收站</b>，可在工具栏「回收站」中还原或彻底删除：<br><span class="mono" style="font-size:12px">${preview}${paths.length > 4 ? '<br>…' : ''}</span>`,
       });
       if (!ok) return;
       try {
@@ -2212,6 +2304,7 @@ registerView('files', {
       if (action === 'preview' && entry) openPreview(entry);
       if (action === 'chmod' && entry) doChmod(entry);
       if (action === 'fetch-url') doFetchUrl();
+      if (action === 'trash') openTrash();
       if (action === 'batch-delete') doBatchDelete();
       if (action === 'batch-clear') { selected.clear(); paintBatch(); renderTable(); }
       if (action === 'mkdir') {
@@ -2262,8 +2355,9 @@ registerView('files', {
       }
       if (action === 'delete' && entry) {
         const ok = await confirmDialog({
-          title: '删除确认', danger: true, confirmText: '删除',
-          message: `确定要删除 <b class="mono">${esc(entry.path)}</b> 吗？${entry.is_dir ? '目录及其内容将<b>永久删除</b>。' : ''}`,
+          title: '删除确认', danger: true, confirmText: '移入回收站',
+          message: `确定要删除 <b class="mono">${esc(entry.path)}</b> 吗？<br>
+            <span class="dim">将移入回收站（可在工具栏「回收站」中还原或彻底删除），并非立即抹除。</span>`,
         });
         if (!ok) return;
         try {
@@ -3080,27 +3174,474 @@ registerView('apps', {
   },
 });
 
+/* ============================ 视图：安全中心（1.4.0） ============================ */
+
+const SCOPE_LABEL = { full: '完整权限', readonly: '只读命令', custom: '自定义白名单' };
+
+registerView('security', {
+  title: '安全中心',
+  async render(root) {
+    let summary = null;
+    let totp = null;
+    let tokens = [];
+    let sessions = [];
+    let auditDays = 7;
+    let auditSource = '';
+    let auditQ = '';
+
+    async function loadAll() {
+      const [s, t, tk, ss] = await Promise.all([
+        api.get('/api/panel/security'),
+        api.get('/api/auth/totp/status'),
+        api.get('/api/agent/tokens'),
+        api.get('/api/panel/sessions'),
+      ]);
+      summary = s; totp = t; tokens = tk.tokens; sessions = ss.sessions;
+    }
+
+    // ---------------- TOTP ----------------
+
+    async function openTotpSetup() {
+      const setup = await api.post('/api/auth/totp/setup', {});
+      const body = document.createElement('div');
+      body.innerHTML = `
+        <div style="line-height:1.8;font-size:13px">
+          <p style="margin-top:0">用 authenticator App（Microsoft / Google Authenticator、
+            1Password、Bitwarden 等）<b>手动添加密钥</b>，或粘贴下方配置链接：</p>
+          <div class="token-box"><code id="totp-secret">${esc(setup.secret)}</code></div>
+          <div class="row" style="margin:8px 0 12px">
+            <button class="btn sm ghost" id="totp-copy-secret">复制密钥</button>
+            <button class="btn sm ghost" id="totp-copy-uri">复制配置链接</button>
+          </div>
+          <div class="log-output" style="padding:10px;white-space:pre-wrap;word-break:break-all">${esc(setup.uri)}</div>
+          <label class="field" style="margin-top:12px"><span>输入 App 显示的 6 位动态码</span>
+            <input class="input" id="totp-code" inputmode="numeric" autocomplete="one-time-code"
+                   placeholder="000000" maxlength="6" style="letter-spacing:4px"></label>
+          <div class="dim" style="font-size:12px">启用后每次登录都需要动态码；请确认设备时间与服务器同步。</div>
+        </div>`;
+      const foot = document.createElement('div');
+      foot.className = 'row';
+      foot.innerHTML = `<button class="btn" data-cancel>取消</button>
+        <button class="btn primary" data-ok>校验并启用</button>`;
+      const modal = openModal({ title: '启用二次认证（TOTP）', body, footer: foot, size: 'wide' });
+      $('#totp-copy-secret', body).onclick = () => copyText(setup.secret, '密钥已复制');
+      $('#totp-copy-uri', body).onclick = () => copyText(setup.uri, '配置链接已复制');
+      $('[data-cancel]', foot).onclick = () => modal.close();
+      $('[data-ok]', foot).onclick = async () => {
+        const code = ($('#totp-code', body).value || '').trim();
+        if (!/^\d{6}$/.test(code)) { toast('请输入 6 位数字动态码', 'err'); return; }
+        try {
+          const res = await api.post('/api/auth/totp/enable', { code });
+          modal.close();
+          showRecoveryCodes(res.recovery_codes, '二次认证已启用');
+          await loadAll(); paint();
+        } catch (err) { toast(err.message, 'err'); }
+      };
+      setTimeout(() => $('#totp-code', body).focus(), 40);
+    }
+
+    function showRecoveryCodes(codes, title) {
+      const body = document.createElement('div');
+      body.innerHTML = `
+        <div style="line-height:1.8;font-size:13px">
+          <p style="margin-top:0">以下是 <b>10 个一次性恢复码</b>，每个只能使用一次。
+            遗失验证设备时，可输其中任意一个代替动态码登录。</p>
+          <div class="log-output" style="padding:12px;white-space:pre;font-size:14px;letter-spacing:1px">${codes.map(esc).join('\n')}</div>
+          <div class="dim" style="font-size:12px;margin-top:8px">恢复码仅此一次展示，关闭后无法再次查看；请立即保存到密码管理器。</div>
+        </div>`;
+      const foot = document.createElement('div');
+      foot.className = 'row';
+      foot.innerHTML = `<button class="btn" data-cancel>关闭</button>
+        <button class="btn primary" data-ok>复制全部</button>`;
+      const modal = openModal({ title, body, footer: foot, size: 'narrow' });
+      $('[data-cancel]', foot).onclick = () => modal.close();
+      $('[data-ok]', foot).onclick = async () => {
+        await copyText(codes.join('\n'), '恢复码已复制');
+        modal.close();
+      };
+    }
+
+    async function totpDisable() {
+      const password = await promptDialog({
+        title: '关闭二次认证', label: '请输入当前面板密码以确认', confirmText: '验证并关闭',
+      });
+      if (!password) return;
+      try {
+        const res = await api.post('/api/auth/totp/disable', { password });
+        toast(res.message, 'ok');
+        await loadAll(); paint();
+      } catch (err) { toast(err.message, 'err'); }
+    }
+
+    async function totpRegenerate() {
+      const code = await promptDialog({
+        title: '重新生成恢复码', label: '请输入当前 6 位动态码', confirmText: '验证并重新生成',
+      });
+      if (!code) return;
+      try {
+        const res = await api.post('/api/auth/totp/recovery-codes', { code: code.trim() });
+        showRecoveryCodes(res.recovery_codes, '恢复码已重新生成');
+        await loadAll(); paint();
+      } catch (err) { toast(err.message, 'err'); }
+    }
+
+    // ---------------- Agent 令牌 ----------------
+
+    async function openTokenCreate() {
+      const body = document.createElement('div');
+      body.innerHTML = `
+        <label class="field"><span>名称</span>
+          <input class="input" id="tk-name" value="未命名令牌" maxlength="60" autocomplete="off"></label>
+        <label class="field"><span>作用域</span>
+          <select class="input" id="tk-scope">
+            <option value="full">完整权限（等价 root shell）</option>
+            <option value="readonly">只读命令（白名单内的查看类命令）</option>
+            <option value="custom">自定义前缀白名单</option>
+          </select></label>
+        <label class="field hidden" id="tk-prefixes-field"><span>允许的命令前缀（每行一个，如 <code>systemctl restart nginx</code>）</span>
+          <textarea class="input" id="tk-prefixes" rows="3" style="font-family:ui-monospace,monospace"></textarea></label>
+        <label class="field"><span>过期天数（0 = 永不过期）</span>
+          <input class="input" id="tk-expires" type="number" value="0" min="0" max="3650"></label>
+        <label class="field"><span>备注（用途说明，可选）</span>
+          <input class="input" id="tk-note" maxlength="120" autocomplete="off"></label>`;
+      const foot = document.createElement('div');
+      foot.className = 'row';
+      foot.innerHTML = `<button class="btn" data-cancel>取消</button>
+        <button class="btn primary" data-ok>创建令牌</button>`;
+      const modal = openModal({ title: '创建 Agent 令牌', body, footer: foot });
+      $('#tk-scope', body).onchange = (event) => {
+        $('#tk-prefixes-field', body).classList.toggle('hidden', event.target.value !== 'custom');
+      };
+      $('[data-cancel]', foot).onclick = () => modal.close();
+      $('[data-ok]', foot).onclick = async () => {
+        const scope = $('#tk-scope', body).value;
+        const prefixes = scope === 'custom'
+          ? ($('#tk-prefixes', body).value || '').split('\n').map((line) => line.trim()).filter(Boolean)
+          : [];
+        const payload = {
+          name: ($('#tk-name', body).value || '').trim() || '未命名令牌',
+          scope,
+          prefixes,
+          expires_days: Number($('#tk-expires', body).value || 0),
+          note: ($('#tk-note', body).value || '').trim(),
+        };
+        try {
+          const res = await api.post('/api/agent/tokens', payload);
+          modal.close();
+          showTokenPlain(res.token, payload.name);
+          await loadAll(); paint();
+        } catch (err) { toast(err.message, 'err'); }
+      };
+    }
+
+    function showTokenPlain(token, name) {
+      const body = document.createElement('div');
+      body.innerHTML = `
+        <div style="line-height:1.8;font-size:13px">
+          <p style="margin-top:0">令牌 <b>${esc(name)}</b> 已创建。明文仅此一次展示，关闭后无法找回；磁盘上只保存哈希。</p>
+          <div class="token-box"><code>${esc(token)}</code></div>
+          <div class="row" style="margin-top:10px">
+            <button class="btn sm ghost" id="tk-copy">复制令牌</button>
+          </div>
+        </div>`;
+      const foot = document.createElement('div');
+      foot.className = 'row';
+      foot.innerHTML = `<button class="btn primary" data-ok>我已保存</button>`;
+      const modal = openModal({ title: '令牌已创建', body, footer: foot, size: 'narrow' });
+      $('#tk-copy', body).onclick = () => copyText(token, '令牌已复制');
+      $('[data-ok]', foot).onclick = () => modal.close();
+    }
+
+    async function tokenRevoke(item) {
+      const ok = await confirmDialog({
+        title: '吊销令牌', danger: true, confirmText: '吊销',
+        message: `令牌 <b class="mono">${esc(item.name)}</b> 将立即失效，使用该令牌的脚本会收到 401。`,
+      });
+      if (!ok) return;
+      try {
+        await api.del(`/api/agent/tokens/${encodeURIComponent(item.id)}`);
+        toast('令牌已吊销', 'ok');
+        await loadAll(); paint();
+      } catch (err) { toast(err.message, 'err'); }
+    }
+
+    async function tokensRevokeAll() {
+      const ok = await confirmDialog({
+        title: '吊销全部令牌', danger: true, confirmText: '全部吊销', phrase: 'REVOKE',
+        message: '所有 Agent 令牌将立即失效，正在使用令牌的自动化会全部中断。',
+      });
+      if (!ok) return;
+      try {
+        const res = await api.del('/api/agent/tokens');
+        toast(res.message, 'ok');
+        await loadAll(); paint();
+      } catch (err) { toast(err.message, 'err'); }
+    }
+
+    // ---------------- 会话 ----------------
+
+    async function sessionRevoke(item) {
+      const ok = await confirmDialog({
+        title: '踢出会话', danger: true, confirmText: '踢出',
+        message: `将强制下线来自 <b class="mono">${esc(item.ip || '未知 IP')}</b> 的会话（${datetime(item.created)} 创建）。`,
+      });
+      if (!ok) return;
+      try {
+        await api.post('/api/panel/sessions/revoke', { id: item.id });
+        toast('会话已踢出', 'ok');
+        await loadAll(); paint();
+      } catch (err) { toast(err.message, 'err'); }
+    }
+
+    async function sessionsRevokeOthers() {
+      const ok = await confirmDialog({
+        title: '踢出其他会话', danger: true, confirmText: '全部踢出',
+        message: '除当前会话外的所有登录会话将立即失效，其他设备需要重新登录。',
+      });
+      if (!ok) return;
+      try {
+        const res = await api.post('/api/panel/sessions/revoke-others', {});
+        toast(res.message, 'ok');
+        await loadAll(); paint();
+      } catch (err) { toast(err.message, 'err'); }
+    }
+
+    // ---------------- 审计日志 ----------------
+
+    function auditTable(events) {
+      if (!events.length) return '<div class="empty">没有匹配的审计记录</div>';
+      return `<div class="table-wrap"><table class="data"><thead><tr>
+        <th>时间</th><th>操作</th><th>对象 / 摘要</th><th>来源</th>
+        <th>来源 IP</th><th class="num">结果</th><th class="num">耗时</th></tr></thead>
+        <tbody>${events.map((e) => `<tr>
+          <td class="cell-sub">${datetime(e.time)}</td>
+          <td><span class="badge ${e.ok ? 'info' : 'danger'}">${esc(e.action)}</span></td>
+          <td class="cell-main" title="${esc(e.summary || '')}">${esc(e.target || '-')}
+            ${e.summary ? `<span class="cell-sub">${esc(S(e.summary).slice(0, 60))}</span>` : ''}</td>
+          <td>${e.source === 'agent' ? '<span class="badge warn">Agent</span>'
+            : e.source === 'cli' ? '<span class="badge">CLI</span>'
+            : e.source === 'system' ? '<span class="badge">系统</span>'
+            : '<span class="badge info">面板</span>'}
+            ${e.actor ? `<span class="cell-sub">${esc(e.actor)}</span>` : ''}</td>
+          <td class="cell-sub">${esc(e.ip || '-')}</td>
+          <td class="num"><span class="badge ${e.ok ? 'ok' : 'danger'}">${e.ok ? '成功' : '失败'}</span></td>
+          <td class="num">${e.duration == null ? '-' : `${e.duration}s`}</td>
+        </tr>`).join('')}</tbody></table></div>`;
+    }
+
+    async function loadAudit() {
+      const box = $('#sec-audit-body');
+      if (!box) return;
+      box.innerHTML = '<div class="empty">加载中…</div>';
+      try {
+        const params = new URLSearchParams({ days: S(auditDays), limit: '300' });
+        if (auditSource) params.set('source', auditSource);
+        if (auditQ) params.set('q', auditQ);
+        const data = await api.get(`/api/panel/audit/log?${params.toString()}`);
+        box.innerHTML = auditTable(data.events);
+      } catch (err) {
+        box.innerHTML = `<div class="empty">读取失败：${esc(err.message)}</div>`;
+      }
+    }
+
+    // ---------------- 渲染 ----------------
+
+    function paint() {
+      const lock = summary?.lockout || {};
+      root.innerHTML = `
+        <div class="grid c4" style="margin-bottom:14px">
+          <div class="card">
+            <div class="metric-label">二次认证（TOTP）</div>
+            <div class="metric-value" style="font-size:20px">
+              ${totp?.enabled ? '<span class="badge ok">已启用</span>' : '<span class="badge danger">未启用</span>'}</div>
+            <div class="metric-sub">剩余恢复码 ${totp?.recovery_left ?? 0} 个</div>
+          </div>
+          <div class="card">
+            <div class="metric-label">登录防爆破</div>
+            <div class="metric-value" style="font-size:20px">${lock.ip_failures ?? 0} 次失败</div>
+            <div class="metric-sub">${lock.locked_seconds > 0
+              ? `<span class="badge danger">锁定中 · 剩余 ${lock.locked_seconds}s</span>`
+              : `当前 IP 未锁定 · 全局 ${lock.global_failures ?? 0} 次`}</div>
+          </div>
+          <div class="card">
+            <div class="metric-label">活跃会话 / Agent 令牌</div>
+            <div class="metric-value" style="font-size:20px">${summary?.sessions?.active ?? 0} / ${summary?.tokens?.total ?? 0}</div>
+            <div class="metric-sub">完整权限令牌 ${summary?.tokens?.full ?? 0} 个</div>
+          </div>
+          <div class="card">
+            <div class="metric-label">回收站</div>
+            <div class="metric-value" style="font-size:20px">${summary?.trash?.count ?? 0} 项</div>
+            <div class="metric-sub">占用 ${bytes(summary?.trash?.bytes || 0)} · 保留 ${summary?.trash?.retention_days ?? 0} 天</div>
+          </div>
+        </div>
+
+        <div class="grid c2">
+          <div class="card">
+            <h2>二次认证</h2>
+            <div class="dim" style="font-size:12px;line-height:1.7;margin:4px 0 10px">
+              启用后登录需要「密码 + 6 位动态码」，动态码错误同样计入失败锁定；
+              恢复码可在遗失设备时兜底登录（一次性）。
+            </div>
+            <div class="row">
+              ${totp?.enabled
+                ? `<button class="btn sm ghost" id="sec-totp-recovery">重新生成恢复码</button>
+                   <button class="btn sm danger" id="sec-totp-disable">关闭二次认证</button>`
+                : `<button class="btn sm primary" id="sec-totp-enable">启用二次认证</button>`}
+            </div>
+            ${totp?.enabled && totp.enabled_at
+              ? `<div class="dim" style="font-size:12px;margin-top:8px">启用时间 ${datetime(totp.enabled_at)}</div>` : ''}
+          </div>
+
+          <div class="card">
+            <h2>活跃会话</h2>
+            <div class="dim" style="font-size:12px;margin:4px 0 10px">登录态保存在服务器本机（哈希存储），重启面板不失效。</div>
+            <div class="row" style="margin-bottom:10px">
+              <button class="btn sm ghost" id="sec-session-refresh">刷新</button>
+              <button class="btn sm danger" id="sec-session-revoke-others">踢出其他会话</button>
+            </div>
+            <div class="table-wrap"><table class="data"><thead><tr>
+              <th>会话</th><th>来源 IP</th><th>创建时间</th><th>过期时间</th><th></th></tr></thead>
+              <tbody>${sessions.length ? sessions.map((it) => `<tr>
+                <td class="cell-main">${it.current ? '<span class="badge ok">当前会话</span>' : `<span class="mono">${esc(it.id)}…</span>`}
+                  ${it.label ? `<span class="cell-sub">${esc(it.label)}</span>` : ''}</td>
+                <td class="cell-sub">${esc(it.ip || '-')}</td>
+                <td class="cell-sub">${datetime(it.created)}</td>
+                <td class="cell-sub">${datetime(it.expires)}</td>
+                <td><button class="btn sm ghost" data-session-revoke="${esc(it.id)}" ${it.current ? 'disabled' : ''}>踢出</button></td>
+              </tr>`).join('') : '<tr><td colspan="5"><div class="empty">暂无活跃会话</div></td></tr>'}</tbody></table></div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:14px">
+          <h2>Agent 令牌</h2>
+          <div class="dim" style="font-size:12px;margin:4px 0 10px">
+            令牌按「名称 + 作用域」管理：只读令牌只能执行查看类命令，自定义令牌按前缀白名单放行。
+            令牌仅在内网模式下生效，磁盘上只存 SHA-256 哈希。
+          </div>
+          <div class="row" style="margin-bottom:10px">
+            <button class="btn sm primary" id="sec-token-create">创建令牌</button>
+            <button class="btn sm danger" id="sec-token-revoke-all" ${tokens.length ? '' : 'disabled'}>吊销全部</button>
+          </div>
+          <div class="table-wrap"><table class="data"><thead><tr>
+            <th>名称</th><th>作用域</th><th>创建时间</th><th>最近使用</th><th>过期</th><th></th></tr></thead>
+            <tbody>${tokens.length ? tokens.map((t) => `<tr>
+              <td class="cell-main">${esc(t.name)}
+                ${t.note ? `<span class="cell-sub">${esc(t.note)}</span>` : ''}
+                ${t.prefixes?.length ? `<span class="cell-sub mono">${t.prefixes.map(esc).join(' · ')}</span>` : ''}</td>
+              <td><span class="badge ${t.scope === 'full' ? 'warn' : 'info'}">${esc(SCOPE_LABEL[t.scope] || t.scope)}</span></td>
+              <td class="cell-sub">${t.created_at ? datetime(t.created_at) : '-'}</td>
+              <td class="cell-sub">${t.last_used_at ? datetime(t.last_used_at) : '未使用'}</td>
+              <td>${t.expires_at
+                ? (t.expired ? '<span class="badge danger">已过期</span>' : `<span class="cell-sub">${datetime(t.expires_at)}</span>`)
+                : '<span class="badge">永久</span>'}</td>
+              <td><button class="btn sm ghost" data-token-revoke="${esc(t.id)}">吊销</button></td>
+            </tr>`).join('') : '<tr><td colspan="6"><div class="empty">尚未创建令牌</div></td></tr>'}</tbody></table></div>
+        </div>
+
+        <div class="card" style="margin-top:14px">
+          <h2>审计日志</h2>
+          <div class="dim" style="font-size:12px;margin:4px 0 10px">
+            所有敏感操作（登录、命令执行、文件变更、令牌与会话管理）统一记录，按天滚动、保留 90 天，不可删除。
+          </div>
+          <div class="toolbar" style="margin-bottom:10px">
+            <select class="input" id="sec-audit-days" style="width:110px">
+              <option value="1" ${auditDays === 1 ? 'selected' : ''}>最近 1 天</option>
+              <option value="7" ${auditDays === 7 ? 'selected' : ''}>最近 7 天</option>
+              <option value="30" ${auditDays === 30 ? 'selected' : ''}>最近 30 天</option>
+            </select>
+            <select class="input" id="sec-audit-source" style="width:110px">
+              <option value="" ${auditSource === '' ? 'selected' : ''}>全部来源</option>
+              <option value="web" ${auditSource === 'web' ? 'selected' : ''}>面板</option>
+              <option value="agent" ${auditSource === 'agent' ? 'selected' : ''}>Agent</option>
+              <option value="cli" ${auditSource === 'cli' ? 'selected' : ''}>CLI</option>
+              <option value="system" ${auditSource === 'system' ? 'selected' : ''}>系统</option>
+            </select>
+            <input class="input" id="sec-audit-q" placeholder="搜索对象 / 摘要…" value="${esc(auditQ)}" style="width:200px">
+            <button class="btn sm" id="sec-audit-search">查询</button>
+          </div>
+          <div id="sec-audit-body"><div class="empty">加载中…</div></div>
+        </div>`;
+
+      $('#sec-totp-enable')?.addEventListener('click', () => {
+        openTotpSetup().catch((err) => toast(err.message, 'err'));
+      });
+      $('#sec-totp-disable')?.addEventListener('click', () => totpDisable());
+      $('#sec-totp-recovery')?.addEventListener('click', () => totpRegenerate());
+      $('#sec-token-create')?.addEventListener('click', () => openTokenCreate());
+      $('#sec-token-revoke-all')?.addEventListener('click', () => tokensRevokeAll());
+      $('#sec-session-refresh')?.addEventListener('click', async () => {
+        try { await loadAll(); paint(); } catch (err) { toast(err.message, 'err'); }
+      });
+      $('#sec-session-revoke-others')?.addEventListener('click', () => sessionsRevokeOthers());
+      $('#sec-audit-search')?.addEventListener('click', () => {
+        auditDays = Number($('#sec-audit-days').value || 7);
+        auditSource = $('#sec-audit-source').value;
+        auditQ = ($('#sec-audit-q').value || '').trim();
+        loadAudit();
+      });
+      $('#sec-audit-q')?.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') $('#sec-audit-search').click();
+      });
+      $$('[data-token-revoke]', root).forEach((btn) => btn.addEventListener('click', () => {
+        const item = tokens.find((t) => t.id === btn.dataset.tokenRevoke);
+        if (item) tokenRevoke(item);
+      }));
+      $$('[data-session-revoke]', root).forEach((btn) => btn.addEventListener('click', () => {
+        const item = sessions.find((s) => s.id === btn.dataset.sessionRevoke);
+        if (item) sessionRevoke(item);
+      }));
+      loadAudit();
+    }
+
+    try {
+      await loadAll();
+    } catch (err) {
+      root.innerHTML = `<div class="card"><div class="empty">安全中心加载失败：${esc(err.message)}</div></div>`;
+      return;
+    }
+    paint();
+  },
+});
+
 /* ============================ 视图：设置 ============================ */
+
+/** 探测面板版本端点（需登录）。返回 { up, version, build, relogin }。
+ *  up=false 表示面板还在重启（网络不可达）；relogin=true 表示面板已恢复但会话失效
+ *  （升级耗时超过会话时长时会走到这里，交给上层重新登录）。 */
+async function probeVersion(url = '/api/system/version') {
+  try {
+    const r = await fetch(url, { cache: 'no-store' });
+    if (r.status === 401) return { up: true, relogin: true, version: '', build: '' };
+    if (!r.ok) return { up: false, version: '', build: '' };
+    const data = await r.json().catch(() => ({}));
+    return { up: true, version: data.version || '', build: data.build || '' };
+  } catch (err) {
+    return { up: false, version: '', build: '' };
+  }
+}
 
 /** 等待面板重启完成（升级 / 改监听地址后都会用），返回是否成功恢复。 */
 function waitForPanelRestart({ before = '', expected = null, timeoutMs = 180000,
-                              onProgress = null, probeUrl = '/healthz' } = {}) {
+                              onProgress = null, probeUrl = '/api/system/version' } = {}) {
   return new Promise((resolve) => {
     const deadline = Date.now() + timeoutMs;
     const timer = every(2500, async () => {  // every：切后台暂停探测，回前台继续
-      try {
-        const data = await fetch(probeUrl, { cache: 'no-store' }).then((r) => r.json());
-        const stamp = data.build || data.version || '';
-        const hit = expected ? (data.version === expected || stamp === expected)
-          : (stamp && stamp !== before);
+      const probe = await probeVersion(probeUrl);
+      if (probe.up) {
+        // 401（会话失效）时没有版本信息可比：面板已经恢复，直接放行让上层处理登录
+        const stamp = probe.build || probe.version || '';
+        const hit = probe.relogin
+          ? true
+          : (expected ? (probe.version === expected || stamp === expected)
+                      : (stamp && stamp !== before));
         if (hit) {
           clearInterval(timer);
-          resolve({ ok: true, health: data });
+          resolve({ ok: true, health: probe, relogin: !!probe.relogin });
           return;
         }
         if (onProgress) onProgress('面板已响应，等待新版本生效…');
-      } catch (err) {
-        if (onProgress) onProgress('面板重启中，等待恢复…');
+      } else if (onProgress) {
+        onProgress('面板重启中，等待恢复…');
       }
       if (Date.now() > deadline) {
         clearInterval(timer);
@@ -3117,7 +3658,7 @@ registerView('settings', {
     let tab = localStorage.getItem('sp-settings-tab') === 'quick' && canQuick ? 'quick' : 'general';
     const caps = live.capabilities || {};
     const info = await api.get('/api/system/info').catch(() => ({}));
-    const hz = await fetch('/healthz').then((r) => r.json()).catch(() => null);
+    const hz = await api.get('/api/system/version').catch(() => null);
 
     // ---- 快捷设置状态 ----
     let prefsFields = [];
@@ -3367,7 +3908,7 @@ registerView('settings', {
           <form id="pwd-form" style="display:flex;flex-direction:column;gap:12px;max-width:360px">
             <label class="field"><span>当前密码</span>
               <input class="input" type="password" id="pwd-current" autocomplete="current-password" required></label>
-            <label class="field"><span>新密码（至少 8 位）</span>
+            <label class="field"><span>新密码（至少 12 位）</span>
               <input class="input" type="password" id="pwd-new" autocomplete="new-password" required></label>
             <label class="field"><span>确认新密码</span>
               <input class="input" type="password" id="pwd-confirm" autocomplete="new-password" required></label>
@@ -3377,6 +3918,15 @@ registerView('settings', {
             修改成功后，其他已登录设备会被强制退出。忘记密码时可在服务器执行
             <span class="mono">serverpanel --set-password 新密码</span>。
           </div>
+        </div>
+
+        <div class="card">
+          <h2>安全中心</h2>
+          <div class="dim" style="font-size:12px;line-height:1.7;margin:4px 0 12px">
+            二次认证（TOTP）、Agent 令牌作用域、活跃会话管理与统一审计日志，
+            集中在一个页面。需要内网模式。
+          </div>
+          <button class="btn" data-act="goto-security">打开安全中心</button>
         </div>
 
         <div class="card">
@@ -3517,7 +4067,11 @@ serverpanel --show-mode          # 查看当前模式</div>
           before, onProgress: (text) => { btn.textContent = text; },
         });
         if (result.ok) {
-          toast(`升级完成：${result.health.version}（${result.health.build || ''}）`, 'ok');
+          if (result.relogin) {
+            toast('面板已恢复，但登录态已过期，请重新登录', 'warn', 6000);
+          } else {
+            toast(`升级完成：${result.health.version}（${result.health.build || '无部署标记'}）`, 'ok');
+          }
           setTimeout(() => location.reload(), 1200);
         } else {
           toast('升级未在预期时间内完成，请通过终端查看 panel.log', 'err');
@@ -3750,7 +4304,7 @@ serverpanel --show-mode          # 查看当前模式</div>
       }
       if (!res.changed) { toast(res.message); return true; }
       toast(`正在切换到 ${res.host}:${res.port}，等待面板恢复…`, 'warn');
-      const target = `http://${location.hostname}:${res.port}/healthz`;
+      const target = `http://${location.hostname}:${res.port}/api/system/version`;
       const result = await waitForPanelRestart({ before, probeUrl: target, timeoutMs: 120000 });
       if (result.ok) {
         toast('新地址已就绪，正在跳转…', 'ok');
@@ -3797,6 +4351,7 @@ serverpanel --show-mode          # 查看当前模式</div>
       if (!action) return;
       if (action === 'mode-help') { showModeHelp(); return; }
       if (action === 'terminal') { navigate('terminal'); return; }
+      if (action === 'goto-security') { navigate('security'); return; }
       if (action === 'logout') { await api.post('/api/auth/logout', {}); location.reload(); return; }
       if (action === 'copy-termux') { copyText(bootInfo.termux_script, '已复制'); return; }
       if (action === 'reboot' || action === 'shutdown') {

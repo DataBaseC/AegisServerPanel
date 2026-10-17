@@ -6,7 +6,7 @@ annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
 click==8.5.0
-fastapi==0.142.2
+fastapi==0.143.1
 h11==0.16.0
 httptools==0.8.0
 idna==3.20

@@ -15,6 +15,10 @@
 用法：
     python3 tools/gen_sha256sums.py           # 重新生成 SHA256SUMS
     python3 tools/gen_sha256sums.py --check   # 校验仓库内容是否与清单一致
+
+注意：有 git 元数据时校验的是**索引（暂存区）**里的内容，即「将要提交的内容」，
+不是工作树上的未暂存改动。所以本地改完要先 ``git add`` 再 ``--check``，
+否则会出现"改了但没报错"的错觉；CI 是干净检出，索引与工作树一致，不受影响。
 """
 
 from __future__ import annotations
@@ -112,6 +116,40 @@ def render() -> str:
     return "\n".join(lines) + "\n"
 
 
+def _manifest_map(text: str) -> dict[str, str]:
+    """把清单文本解析成 path -> hash（格式：``<sha256>  <path>``）。"""
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        digest, _, path = line.partition("  ")
+        if path:
+            out[path] = digest
+    return out
+
+
+def _diagnose(current: str, content: str) -> list[str]:
+    """指出清单与仓库内容的具体差异。
+
+    CI 上只看得到"不一致"这一行时没法定位，所以这里把差异类型和文件名都打出来
+    （最多 8 条，避免刷屏）。
+    """
+    old, new = _manifest_map(current), _manifest_map(content)
+    notes: list[str] = []
+    missing = sorted(new.keys() - old.keys())      # 在树里、清单没登记
+    extra = sorted(old.keys() - new.keys())        # 清单有、树里没有
+    changed = sorted(p for p in new.keys() & old.keys() if new[p] != old[p])
+    if missing:
+        notes.append("清单缺少： " + ", ".join(missing))
+    if extra:
+        notes.append("清单多余： " + ", ".join(extra))
+    if changed:
+        notes.append("内容已改： " + ", ".join(changed))
+    if not notes and current != content:
+        notes.append("条目与哈希都一致，但顺序或行尾不同（应按路径排序、LF 结尾）")
+    return notes[:8]
+
+
 def main() -> int:
     content = render()
     if "--check" in sys.argv:
@@ -121,7 +159,9 @@ def main() -> int:
             print("SHA256SUMS 不存在，请运行 python3 tools/gen_sha256sums.py", file=sys.stderr)
             return 1
         if current != content:
-            print("SHA256SUMS 与仓库内容不一致，请重新生成后提交。", file=sys.stderr)
+            print("SHA256SUMS 与仓库内容不一致，请重新生成后提交：", file=sys.stderr)
+            for note in _diagnose(current, content):
+                print("  " + note, file=sys.stderr)
             return 1
         print(f"SHA256SUMS 校验通过（{content.count(chr(10))} 个文件）")
         return 0

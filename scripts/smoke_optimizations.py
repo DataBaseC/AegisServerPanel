@@ -56,7 +56,6 @@ def save_cookie(resp_headers):
 def main():
     import http.client
     os.makedirs(WORK, exist_ok=True)
-    cfg = os.path.join(WORK, "config.json")
     import shutil
     for f in os.listdir(WORK):
         p = os.path.join(WORK, f)
@@ -64,6 +63,15 @@ def main():
             shutil.rmtree(p, ignore_errors=True)
         else:
             os.unlink(p)
+    # 2.0 起文件管理对"面板自身配置目录/代码目录"是**固定禁区**（写进去等于 root）。
+    # 本脚本的临时配置就放在 WORK 里，若文件用例也写 WORK 就会被 403 挡住——
+    # 那是产品语义生效，不是缺陷。所以配置放 WORK/conf，文件操作放 WORK/files。
+    conf_dir = os.path.join(WORK, "conf")
+    files_dir = os.path.join(WORK, "files")
+    os.makedirs(conf_dir, exist_ok=True)
+    os.makedirs(files_dir, exist_ok=True)
+    FILES = files_dir
+    cfg = os.path.join(conf_dir, "config.json")
     env = dict(os.environ, SERVERPANEL_CONFIG=cfg)
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "app.main:app", "--port", str(PORT), "--host", "127.0.0.1"],
@@ -78,7 +86,7 @@ def main():
             except Exception:
                 continue
 
-        def call(method, path, body=None, raw_body=None, ctype=None):
+        def call(method, path, body=None, raw_body=None, ctype=None, extra_headers=None):
             conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=30)
             headers = {"Content-Type": ctype or "application/json"}
             token = None
@@ -86,6 +94,8 @@ def main():
                 token = open(COOKIE).read().strip()
             if token:
                 headers["Cookie"] = f"sp_session={token}"
+            if extra_headers:
+                headers.update(extra_headers)
             if raw_body is not None:
                 payload = raw_body
             else:
@@ -121,16 +131,16 @@ def main():
         check("4. 重复 setup 被拒（防抢注）", st == 400, f"status={st}")
 
         # dirsize：空子目录场景（原 bug：entries 为空时 IndexError 500）
-        os.makedirs(f"{WORK}/empty-dir", exist_ok=True)
-        st, d = call("GET", "/api/storage/dirsize?path=" + f"{WORK}/empty-dir")
+        os.makedirs(f"{FILES}/empty-dir", exist_ok=True)
+        st, d = call("GET", "/api/storage/dirsize?path=" + f"{FILES}/empty-dir")
         check("5. dirsize 空目录不再 500（total=目录自身占用）", st == 200 and isinstance(d.get("total"), int),
               f"status={st} total={d.get('total')}")
 
         # dirsize：有子项时 total 应为目录总占用（原来恒为 None）
-        os.makedirs(f"{WORK}/data/sub", exist_ok=True)
-        with open(f"{WORK}/data/sub/f.bin", "wb") as fh:
+        os.makedirs(f"{FILES}/data/sub", exist_ok=True)
+        with open(f"{FILES}/data/sub/f.bin", "wb") as fh:
             fh.write(b"x" * 4096)
-        st, d = call("GET", "/api/storage/dirsize?path=" + f"{WORK}/data")
+        st, d = call("GET", "/api/storage/dirsize?path=" + f"{FILES}/data")
         check("6. dirsize total 有值（du 自身行）", st == 200 and isinstance(d.get("total"), int) and d["total"] >= 4096,
               f"status={st} total={d.get('total')}")
 
@@ -141,7 +151,7 @@ def main():
               f"status={st} keys={sorted(d)[:8]}")
 
         # 公网模式：文件接口应 403
-        st, d = call("POST", "/api/files/write", {"path": f"{WORK}/x.txt", "content": "hi"})
+        st, d = call("POST", "/api/files/write", {"path": f"{FILES}/x.txt", "content": "hi"})
         check("8. 公网模式文件写入被拒", st == 403, f"status={st}")
 
         # 切内网模式：直接改配置文件验证热加载。**不 os.utime 强制改 mtime** ——
@@ -172,33 +182,33 @@ def main():
         # 内网：files/read 的 max_bytes 超大参数必须被钳制。
         # 这一条是**真的**在测钳制：没有钳制时 max_bytes=1e12 会让 size>max_bytes 不成立，
         # 于是接口会去读整个 3MB（乃至 1TB）而不是 413。
-        with open(f"{WORK}/big.txt", "w") as fh:
+        with open(f"{FILES}/big.txt", "w") as fh:
             fh.write("y" * (3 * 1024 * 1024))  # 3MB > EDIT_LIMIT 2MB
-        st, d = call("GET", f"/api/files/read?path={WORK}/big.txt&max_bytes=999999999999")
+        st, d = call("GET", f"/api/files/read?path={FILES}/big.txt&max_bytes=999999999999")
         check("10. max_bytes 超大参数被钳制（413 拒绝大文件）", st == 413, f"status={st} {d.get('detail','')[:60]}")
 
         # 内网：乐观锁纳秒精度 + 秒级客户端兼容（1.3.0 新增）
-        with open(f"{WORK}/edit.txt", "w") as fh:
+        with open(f"{FILES}/edit.txt", "w") as fh:
             fh.write("v1")
-        st, d = call("GET", f"/api/files/read?path={WORK}/edit.txt")
+        st, d = call("GET", f"/api/files/read?path={FILES}/edit.txt")
         mtime_ns = d.get("mtime", 0)
         check("11. read 返回纳秒 mtime", st == 200 and mtime_ns > 10**15, f"mtime={mtime_ns}")
-        st, d = call("POST", "/api/files/write", {"path": f"{WORK}/edit.txt", "content": "v2", "expected_mtime": mtime_ns})
+        st, d = call("POST", "/api/files/write", {"path": f"{FILES}/edit.txt", "content": "v2", "expected_mtime": mtime_ns})
         check("12. 乐观锁正确放行（未改过）", st == 200, f"status={st}")
         # 秒级兼容：必须拿**写完之后**的 mtime 再折算成秒，否则跨秒就会变成"真的改了"
-        st, d = call("GET", f"/api/files/read?path={WORK}/edit.txt")
+        st, d = call("GET", f"/api/files/read?path={FILES}/edit.txt")
         fresh_s = d.get("mtime", 0) // 10**9
         st, d = call("POST", "/api/files/write",
-                     {"path": f"{WORK}/edit.txt", "content": "v2b", "expected_mtime": fresh_s})
+                     {"path": f"{FILES}/edit.txt", "content": "v2b", "expected_mtime": fresh_s})
         check("12b. 秒级 expected_mtime 仍被接受（旧客户端兼容）", st == 200,
               f"status={st} expected_s={fresh_s} {d.get('detail','')[:60]}")
         st, d = call("POST", "/api/files/write",
-                     {"path": f"{WORK}/edit.txt", "content": "v2c", "expected_mtime": fresh_s - 120})
+                     {"path": f"{FILES}/edit.txt", "content": "v2c", "expected_mtime": fresh_s - 120})
         check("12c. 过期的秒级 expected_mtime 仍被拒（409）", st == 409,
               f"status={st} {d.get('detail','')[:60]}")
-        with open(f"{WORK}/edit.txt", "w") as fh:
+        with open(f"{FILES}/edit.txt", "w") as fh:
             fh.write("v3-external")
-        st, d = call("POST", "/api/files/write", {"path": f"{WORK}/edit.txt", "content": "v4", "expected_mtime": mtime_ns})
+        st, d = call("POST", "/api/files/write", {"path": f"{FILES}/edit.txt", "content": "v4", "expected_mtime": mtime_ns})
         check("13. 乐观锁检测到外部修改（409）", st == 409, f"status={st}")
 
         # exec timeout：null 由 pydantic 拦；Infinity 走代码里的校验链
@@ -209,7 +219,7 @@ def main():
 
         # 解压逃逸：恶意 tar（符号链接指针逃逸）应被拦截
         import tarfile, io
-        evil = f"{WORK}/evil.tar"
+        evil = f"{FILES}/evil.tar"
         with tarfile.open(evil, "w") as tf:
             info = tarfile.TarInfo("link")
             info.type = tarfile.SYMTYPE
@@ -225,7 +235,7 @@ def main():
         # 但必须验证"确实没有符号链接落地"，只看状态码不算数。
         check("15. 恶意 tar 符号链接逃逸被拦", st in (200, 400),
               f"status={st}（400=整包拒绝 / 200=跳过越界条目）")
-        link_path = os.path.join(WORK, "evil", "link")
+        link_path = os.path.join(FILES, "evil", "link")
         link_is_symlink = os.path.islink(link_path)
         check("16. 解出的 link 不是符号链接（已丢弃）", not link_is_symlink,
               f"link is symlink={link_is_symlink}")
@@ -249,9 +259,16 @@ def main():
               'Content-Disposition: form-data; name="file"; filename="cfg.zip"\r\n'
               "Content-Type: application/zip\r\n\r\n").encode() + buf.getvalue() + \
              f"\r\n--{boundary}--\r\n".encode()
+        # 2.0：配置导入属高危动作，必须先申请确认令牌；不带令牌的 400 是
+        # "没确认"，不是"白名单被拒"——那是假通过，所以这里显式取令牌。
+        st, d = call("POST", "/api/panel/confirm", {"action": "config"})
+        ctok = (d or {}).get("token") or ""
+        check("18a. 高危动作可申请确认令牌", st == 200 and bool(ctok), f"status={st}")
         st, d = call("POST", "/api/panel/config/import", raw_body=mp,
-                     ctype=f"multipart/form-data; boundary={boundary}")
-        check("18. 配置导入不能把敏感/隐藏目录写进日志白名单", st == 400,
+                     ctype=f"multipart/form-data; boundary={boundary}",
+                     extra_headers={"X-Confirm-Token": ctok})
+        ok18 = st == 400 and "确认令牌" not in (d.get("detail") or "")
+        check("18. 配置导入不能把敏感/隐藏目录写进日志白名单", ok18,
               f"status={st} {d.get('detail','')[:80]}")
 
     finally:

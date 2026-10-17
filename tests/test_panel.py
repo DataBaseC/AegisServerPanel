@@ -823,6 +823,11 @@ def test_boot_probe_reports_chain(authed, internal_mode, monkeypatch, tmp_path):
     })
     monkeypatch.setattr(boot_mod, "cron_status",
                         lambda: {"available": False, "configured": False, "lines": [], "total_lines": 0})
+    # 守护这一截的判定也钉死：不等宿主机"恰好没有 systemd"。
+    # GitHub 的 ubuntu runner 上 _systemd_available() 为真，守护链路会判 ok，
+    # 整体 verdict 就从 broken 变 warn（本用例只想验证"缺守护 = broken"）。
+    from app import manage as manage_mod
+    monkeypatch.setattr(manage_mod, "_systemd_available", lambda: False)
     fake_dir = tmp_path / "deployed"
     fake_dir.mkdir()
     (fake_dir / boot_mod.SUPERVISOR_NAME).write_text("#!/bin/sh\necho fake\n", "utf-8")
@@ -1054,14 +1059,25 @@ def test_lockout_params_from_prefs(authed, internal_mode):
 
 
 def test_timezone_endpoints_are_safe(authed, internal_mode):
-    """时区状态只读可用；非法/不存在的时区在写入前被拒（跨平台安全，不真改机器）。"""
+    """时区状态只读可用；非法/不存在的时区在写入前被拒（跨平台安全，不真改机器）。
+
+    POSIX 非 root 时端点先按权限拒绝（403：要写 /etc/timezone 与 /etc/localtime），
+    这一步在参数校验之前——属预期行为，所以断言随权限走：非 root 断言 403，
+    其余（root / 非 POSIX）断言非法时区被 400 拒绝。
+    """
+    from app.utils import is_root
+
     status = authed.get("/api/panel/timezone").json()
     assert "current" in status
     assert isinstance(status.get("common"), list) and status["common"]
 
+    needs_root = os.name == "posix" and not is_root()
+    expected = 403 if needs_root else 400
     for bad in ("not a zone!", "Nowhere/Nowhere"):
         r = authed.post("/api/panel/timezone", json={"zone": bad})
-        assert r.status_code == 400, bad
+        assert r.status_code == expected, f"{bad} -> {r.status_code}"
+        if needs_root:
+            assert "root" in r.json().get("detail", ""), "非 root 时应说明需要 root 权限"
 
 
 # ---------- 快捷设置：D 组 导出 / 导入 / 审计 ----------

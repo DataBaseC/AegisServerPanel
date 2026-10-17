@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-import time
 
 import psutil
 from fastapi import APIRouter, Depends, HTTPException
@@ -199,7 +198,8 @@ async def probe_app(app_id: str, body: ProbeBody | None = None,
 @router.get("/{app_id}/logs")
 async def app_logs(app_id: str, offset: int = 0, limit: int = 262144, lines: int = 0,
                    _session: dict = Depends(require_internal)):
-    return _guard(supervisor.log_of, app_id, offset, limit, lines)
+    # 读盘/截断是同步 IO（前端通常 1 秒轮询一次），下线程池避免阻塞事件循环
+    return await asyncio.to_thread(_guard, supervisor.log_of, app_id, offset, limit, lines)
 
 
 @router.delete("/{app_id}/logs")
@@ -216,7 +216,8 @@ async def check_port(app_id: str, port: int, _session: dict = Depends(require_in
     app = _guard(supervisor.registry.get, app_id)
     occupied: list[dict] = []
     try:
-        for conn in psutil.net_connections(kind="inet"):
+        conns = await asyncio.to_thread(lambda: psutil.net_connections(kind="inet"))
+        for conn in conns:
             if conn.status != psutil.CONN_LISTEN or not conn.laddr or conn.laddr.port != port:
                 continue
             row = {"pid": conn.pid, "name": "-", "user": "-"}

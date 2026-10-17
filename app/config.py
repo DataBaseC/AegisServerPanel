@@ -10,10 +10,13 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import threading
 import time
 from pathlib import Path
+
+from .utils import password_is_weak
 
 PBKDF2_ITERATIONS = 600_000  # OWASP 2023 对 PBKDF2-HMAC-SHA256 的推荐值
 SESSION_TTL = 12 * 3600
@@ -31,6 +34,42 @@ WEAK_PASSWORDS = frozenset({
     "serverpanel", "serverpanel1", "server", "panel", "ubuntu", "debian",
     "changeme", "test123", "666666", "888888", "aaaaaaaa", "qwerty12",
 })
+
+
+def hash_password(password: str) -> str:
+    """生成密码哈希串（PBKDF2-HMAC-SHA256 + 随机盐）。
+
+    2.0 M4 起多用户与单密码共用同一种哈希格式，便于把既有
+    ``password_hash`` 原样迁移成 ``username=admin`` 的用户记录。
+    """
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_ITERATIONS)
+    return f"pbkdf2_sha256${PBKDF2_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+
+def verify_password_hash(stored: str, password: str) -> bool:
+    """校验密码与哈希串是否匹配（常量时间比较）。"""
+    if not stored:
+        return False
+    try:
+        _algo, iterations, salt_hex, hash_hex = str(stored).split("$")
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), bytes.fromhex(salt_hex), int(iterations)
+        )
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(digest.hex(), hash_hex)
+
+
+# 多用户 / RBAC（2.0 M4）
+# 用户名只允许字母数字与 _ . -，长度 3~32：既方便 URL/日志里辨认，也避免
+# 与 shell、文件名构造冲突。角色是三档固定枚举，顺序即权限高低。
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
+ROLE_VIEWER = "viewer"
+ROLE_OPERATOR = "operator"
+ROLE_ADMIN = "admin"
+ROLES = (ROLE_VIEWER, ROLE_OPERATOR, ROLE_ADMIN)
+LEGACY_ADMIN_NAME = "admin"
 
 
 def _validate_password_strength(password: str) -> None:
@@ -73,6 +112,9 @@ class Config:
         self._lock = threading.RLock()
         self._fingerprint: tuple[int, int, int] = (0, 0, 0)
         self.data: dict = {}
+        # 最近一次加载失败的原因（None = 正常）。用于区分「从未初始化」与
+        # 「配置文件坏了」——前者允许首次设密码，后者必须拒绝。
+        self.load_error: str | None = None
         self.load()
 
     def _stat_fingerprint(self) -> tuple[int, int, int]:
@@ -94,11 +136,37 @@ class Config:
             self._load_unlocked()
 
     def _load_unlocked(self) -> None:
-        if self.path.exists():
-            try:
-                self.data = json.loads(self.path.read_text("utf-8"))
-            except (OSError, json.JSONDecodeError):
-                self.data = {}
+        """从磁盘加载配置。
+
+        读取失败或 JSON 损坏时**保留内存里的旧数据**，只记录 ``load_error``：
+        如果把 ``data`` 清空，下一个请求会把面板当成「未初始化」（``/api/auth/setup``
+        无需鉴权即可设置新密码），随后任意一次 ``save()`` 还会把空配置写回磁盘，
+        永久抹掉密码哈希与 Agent 令牌。指纹照常更新，避免每个请求都重复读坏文件；
+        文件被修好后指纹变化会自然重试。
+        """
+        if not self.path.exists():
+            # 已经初始化过的部署，配置文件突然消失（误删、挂载点抖动、NFS 短暂
+            # 不可见）不能当成「首次安装」：否则任何人打开页面都能重新设密码接管。
+            if self.data.get("password_hash") or self.data.get("users"):
+                self.load_error = "配置文件不存在（内存中保留已初始化的配置）"
+                self._fingerprint = self._stat_fingerprint()
+                return
+            self.data = {}
+            self.load_error = None
+            self._fingerprint = self._stat_fingerprint()
+            return
+        try:
+            data = json.loads(self.path.read_text("utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("配置文件顶层必须是 JSON 对象")
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            # 首次安装时 data 为空但 load_error 有值：此时的「未初始化」不可信，
+            # set_password 会拒绝重新初始化，用户修好文件后即可恢复。
+            self.load_error = f"{type(exc).__name__}: {exc}"
+            self._fingerprint = self._stat_fingerprint()
+            return
+        self.data = data
+        self.load_error = None
         self._fingerprint = self._stat_fingerprint()
 
     def reload_if_changed(self) -> bool:
@@ -223,17 +291,22 @@ class Config:
 
     def create_agent_token(self, name: str, scope: str = "full",
                            prefixes: list[str] | None = None,
-                           expires_days: int = 0, note: str = "") -> str:
-        """创建令牌，返回明文（仅此一次）。"""
+                           expires_days: int = 0, note: str = "",
+                           token: str | None = None) -> str:
+        """创建令牌，返回明文（仅此一次）。
+
+        ``token`` 允许调用方指定自定义令牌（面板「自定义令牌」入口）；
+        为 None/空时生成随机令牌。磁盘上只存哈希。
+        """
         if scope not in ("full", "readonly", "custom"):
             raise ValueError(f"不支持的作用域: {scope}")
         if scope == "custom" and not prefixes:
             raise ValueError("custom 作用域必须提供命令前缀白名单")
-        token = secrets.token_urlsafe(32)
+        secret = (token or "").strip() or secrets.token_urlsafe(32)
         record = {
             "id": secrets.token_hex(4),
             "name": (name or "未命名令牌").strip()[:60],
-            "hash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+            "hash": hashlib.sha256(secret.encode("utf-8")).hexdigest(),
             "scope": scope,
             "prefixes": [p.strip() for p in (prefixes or []) if p.strip()][:50],
             "expires_at": int(time.time() + expires_days * 86400) if expires_days else 0,
@@ -247,7 +320,7 @@ class Config:
             tokens.append(record)
             self.data["agent_tokens"] = tokens
             self.save()
-        return token
+        return secret
 
     def revoke_agent_token(self, token_id: str) -> bool:
         with self._lock:
@@ -336,6 +409,15 @@ class Config:
         return bool(self.data.get("password_hash"))
 
     @property
+    def password_weak(self) -> bool:
+        """当前密码是否被判为弱（1.6.0 U1）。
+
+        旧配置没有该字段时按 False 处理；下次登录验证成功会补记（见
+        :meth:`verify_password`），无需用户重新设置密码。
+        """
+        return bool(self.data.get("password_weak"))
+
+    @property
     def hostname_label(self) -> str:
         return self.data.get("label") or "ServerPanel"
 
@@ -402,30 +484,225 @@ class Config:
     def set_password(self, password: str, only_if_uninitialized: bool = False) -> None:
         # 长度下限与弱口令黑名单见 _validate_password_strength（1.4.0 起强化）
         _validate_password_strength(password)
-        salt = secrets.token_bytes(16)
-        digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_ITERATIONS)
         with self._lock:
             self.reload_if_changed()  # 外部命令改过配置时以磁盘为准，防止旧内存态覆盖
+            if only_if_uninitialized and self.load_error:
+                # 配置文件存在但读不出来：不能把它当成「首次安装」而允许重新设密码，
+                # 否则坏文件 = 一键接管面板。
+                raise ValueError("配置文件无法读取或解析，请先修复配置文件再初始化")
             if only_if_uninitialized and self.data.get("password_hash"):
                 raise ValueError("面板已初始化")
-            self.data["password_hash"] = (
-                f"pbkdf2_sha256${PBKDF2_ITERATIONS}${salt.hex()}${digest.hex()}"
-            )
+            self.data["password_hash"] = hash_password(password)
+            # 只存派生出的布尔标记（非敏感），供安全巡检判断"密码强度偏弱"
+            self.data["password_weak"] = password_is_weak(password)
             self.data["updated_at"] = int(time.time())
+            self._sync_admin_user_unlocked(password)
             self.save()
 
     def verify_password(self, password: str) -> bool:
         stored = self.data.get("password_hash")
+        if not verify_password_hash(stored, password):
+            return False
+        if "password_weak" not in self.data:
+            # 旧配置升级：登录时能拿到明文，顺手补记强度，避免巡检永远看不到这一项
+            self.data["password_weak"] = password_is_weak(password)
+            self.save()
+        return True
+
+    # ---- 多用户与 RBAC（2.0 M4）----
+    # ``users`` 是可选列表：不存在/为空时面板完全走原有的单密码逻辑
+    # （单密码视为 admin），所有既有部署与测试行为不变。一旦通过
+    # POST /api/panel/users 创建第一个用户，历史单密码会被迁移成
+    # ``username=admin`` 的一条记录，仍可用原密码登录。
+    @property
+    def users(self) -> list[dict]:
+        self.reload_if_changed()
+        users = self.data.get("users")
+        if not isinstance(users, list):
+            return []
+        return [u for u in users if isinstance(u, dict) and u.get("username")]
+
+    @property
+    def has_users(self) -> bool:
+        """是否已进入多用户模式（RBAC 只在为真时生效）。"""
+        return bool(self.users)
+
+    def find_user(self, username: str) -> dict | None:
+        target = str(username or "").strip()
+        if not target:
+            return None
+        for user in self.users:
+            if user.get("username") == target:
+                return dict(user)
+        return None
+
+    def user_by_id(self, user_id: str) -> dict | None:
+        for user in self.users:
+            if user.get("id") == user_id:
+                return dict(user)
+        return None
+
+    def admin_count(self) -> int:
+        return len([u for u in self.users if u.get("role") == ROLE_ADMIN and not u.get("disabled")])
+
+    def create_user(self, username: str, password: str, role: str = ROLE_VIEWER) -> dict:
+        """创建用户；首个用户创建前把历史单密码迁移成 admin 记录。"""
+        name = str(username or "").strip()
+        if not USERNAME_RE.match(name):
+            raise ValueError("用户名只能用字母、数字、下划线、点、连字符，长度 3~32")
+        if role not in ROLES:
+            raise ValueError(f"角色只能是：{', '.join(ROLES)}")
+        _validate_password_strength(password)
+        with self._lock:
+            self.reload_if_changed()
+            users = list(self.data.get("users") or [])
+            self._seed_admin_unlocked(users)
+            if any(u.get("username") == name for u in users if isinstance(u, dict)):
+                raise ValueError(f"用户名已存在：{name}")
+            now = int(time.time())
+            record = {
+                "id": secrets.token_hex(8),
+                "username": name,
+                "role": role,
+                "password_hash": hash_password(password),
+                "totp_secret": "",
+                "totp_enabled": False,
+                "recovery_hashes": [],
+                "created_at": now,
+                "disabled": False,
+            }
+            users.append(record)
+            self.data["users"] = users
+            self.save()
+            return dict(record)
+
+    def update_user(self, user_id: str, patch: dict) -> dict:
+        """修改角色 / 禁用状态 / 重置密码；不允许把最后一个管理员降级或禁用。"""
+        with self._lock:
+            self.reload_if_changed()
+            users = list(self.data.get("users") or [])
+            index = next((i for i, u in enumerate(users)
+                          if isinstance(u, dict) and u.get("id") == user_id), None)
+            if index is None:
+                raise ValueError("用户不存在")
+            user = dict(users[index])
+            role = patch.get("role")
+            if role is not None:
+                if role not in ROLES:
+                    raise ValueError(f"角色只能是：{', '.join(ROLES)}")
+                user["role"] = role
+            if patch.get("disabled") is not None:
+                user["disabled"] = bool(patch["disabled"])
+            password = patch.get("password")
+            if password:
+                _validate_password_strength(password)
+                user["password_hash"] = hash_password(password)
+            if self._would_drop_last_admin(users, user):
+                raise ValueError("不能移除最后一个管理员：请先把其他用户提升为 admin")
+            users[index] = user
+            self.data["users"] = users
+            self.save()
+            return dict(user)
+
+    def delete_user(self, user_id: str) -> dict:
+        with self._lock:
+            self.reload_if_changed()
+            users = list(self.data.get("users") or [])
+            target = next((u for u in users
+                           if isinstance(u, dict) and u.get("id") == user_id), None)
+            if target is None:
+                raise ValueError("用户不存在")
+            if self._would_drop_last_admin(users, None, removed_id=user_id):
+                raise ValueError("不能删除最后一个管理员")
+            self.data["users"] = [u for u in users
+                                  if not (isinstance(u, dict) and u.get("id") == user_id)]
+            self.save()
+            return dict(target)
+
+    def verify_user_password(self, user: dict, password: str) -> bool:
+        return verify_password_hash(str((user or {}).get("password_hash") or ""), password)
+
+    def set_user_password(self, user_id: str, password: str) -> None:
+        self.update_user(user_id, {"password": password})
+
+    def consume_user_recovery_code(self, user_id: str, code: str) -> bool:
+        """核销某个用户的一次性恢复码（用后即焚）。"""
+        from . import totp as totp_mod
+
+        with self._lock:
+            self.reload_if_changed()
+            users = list(self.data.get("users") or [])
+            index = next((i for i, u in enumerate(users)
+                          if isinstance(u, dict) and u.get("id") == user_id), None)
+            if index is None:
+                return False
+            hashes = [h for h in (users[index].get("recovery_hashes") or []) if isinstance(h, str)]
+            hit = totp_mod.consume_recovery(code, hashes)
+            if hit is None:
+                return False
+            hashes.pop(hit)
+            users[index]["recovery_hashes"] = hashes
+            self.data["users"] = users
+            self.save()
+            return True
+
+    def set_user_totp(self, user_id: str, **patch) -> dict:
+        """更新某个用户的 TOTP 字段（secret / enabled / recovery_hashes）。"""
+        with self._lock:
+            self.reload_if_changed()
+            users = list(self.data.get("users") or [])
+            index = next((i for i, u in enumerate(users)
+                          if isinstance(u, dict) and u.get("id") == user_id), None)
+            if index is None:
+                raise ValueError("用户不存在")
+            users[index] = {**users[index], **patch}
+            self.data["users"] = users
+            self.save()
+            return dict(users[index])
+
+    def _would_drop_last_admin(self, users: list[dict], candidate: dict | None = None,
+                               removed_id: str = "") -> bool:
+        """改完/删完之后是否一个可用管理员都不剩。"""
+        admins = 0
+        for user in users:
+            if not isinstance(user, dict):
+                continue
+            if removed_id and user.get("id") == removed_id:
+                continue
+            effective = candidate if (candidate and user.get("id") == candidate.get("id")) else user
+            if effective.get("role") == ROLE_ADMIN and not effective.get("disabled"):
+                admins += 1
+        return admins == 0
+
+    def _seed_admin_unlocked(self, users: list[dict]) -> None:
+        """把历史单密码迁移成 admin 用户（仅在列表里还没有任何用户时）。"""
+        if any(isinstance(u, dict) and u.get("username") for u in users):
+            return
+        stored = self.data.get("password_hash")
         if not stored:
-            return False
-        try:
-            _algo, iterations, salt_hex, hash_hex = stored.split("$")
-            digest = hashlib.pbkdf2_hmac(
-                "sha256", password.encode(), bytes.fromhex(salt_hex), int(iterations)
-            )
-        except (ValueError, TypeError):
-            return False
-        return hmac.compare_digest(digest.hex(), hash_hex)
+            return
+        users.append({
+            "id": secrets.token_hex(8),
+            "username": LEGACY_ADMIN_NAME,
+            "role": ROLE_ADMIN,
+            "password_hash": stored,
+            "totp_secret": self.data.get("totp_secret") or "",
+            "totp_enabled": bool(self.data.get("totp_enabled")),
+            "recovery_hashes": list(self.data.get("totp_recovery_hashes") or []),
+            "created_at": int(self.data.get("updated_at") or time.time()),
+            "disabled": False,
+            "note": "迁移自单密码模式",
+        })
+
+    def _sync_admin_user_unlocked(self, password: str) -> None:
+        """单密码被 CLI / 改密接口更新时，同步 admin 用户（保住救援通道）。"""
+        users = self.data.get("users")
+        if not isinstance(users, list) or not users:
+            return
+        for user in users:
+            if isinstance(user, dict) and user.get("username") == LEGACY_ADMIN_NAME:
+                user["password_hash"] = hash_password(password)
+                return
 
 
 config = Config()

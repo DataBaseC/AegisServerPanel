@@ -11,8 +11,11 @@
 - **快捷设置**：开机自启体检、运行参数调整、配置备份迁移，全部在面板里完成
 - **重度优化**：慢操作全部下线程池（单个慢请求不再冻结面板）、后台标签页停止轮询、断网有提示、大目录不卡界面
 - **工业战术风界面**（1.5.0）：碳黑基底 + 单一点缀色 + 切角几何 + 等宽数据排版，纯 CSS 纹理，零外部资源，可离线打开
+- **平台化**（2.0）：可选多用户 RBAC、应用市场、PWA 可安装、中英双语、命令面板（`Ctrl / ⌘ + K`）、自诊断包、自包含 API 文档（`/api/docs`）
+- **运维扩展**（2.0）：定时任务、备份（本地 + rclone 远程）、系统更新、Docker、防火墙、反代 / 证书、数据库只读、SSH 公钥、网络工具，全部调用宿主机 CLI，**不新增任何 Python 运行时依赖**
+- **低能耗**（2.0）：指标落 SQLite（1h / 1d / 30d / 365d）、阈值告警、低功耗模式（采样 2s → 10s）、RAPL 功耗读数、后台标签页零重绘
 
-当前版本 `1.5.0`。
+当前版本 `2.0`（内容 = 外包 2.0.1：1.6.0 + 2.0.0 + 2.0.1 累积；版本号按本仓库口径归一为 `2.0`）。
 
 ---
 
@@ -137,6 +140,27 @@ AI Agent 与本地脚本接入时反复要用的代码一次给全，并**按当
 
 ### 设置
 修改面板密码、查看当前模式、Agent 令牌状态与运行环境信息。
+
+### 运维（2.0 · 「运维」页）
+- **定时任务**：读写 crontab，面板管理的行放在独立标记区块里（写前备份、去重、读回校验）
+- **备份**：本地 `tar.gz`（可指定目录与排除规则），远程通过 `rclone` 上传（先列已配远端 → 上传 → 回读校验）；本地文件可下载 / 删除
+- **系统更新**：列出 apt 可升级包与安全更新数量，一键升级（需确认令牌）
+- **Docker**：容器 / 镜像列表、容器日志、启停重启、删除（删除需确认令牌）
+- **防火墙**：`ufw` / `iptables` 状态与规则只读展示；放开 / 收紧端口需确认令牌
+- **反代 / 证书**：识别 nginx / caddy / apache 站点与证书到期天数，配置测试后重载
+- **数据库**：只读探测（sqlite / mysql / postgres 的版本、库列表、大小），**不提供任意 SQL 执行**
+- **SSH 公钥**：`authorized_keys` 增删，严格校验公钥格式，原子写回
+- **网络工具**：`ping` / `traceroute` / `dig` / `curl -I`，目标白名单校验、超时受控
+- **会话录制**：可选开启，终端输出与人机输入写成 asciinema v2（JSONL），面板内按时间回放，也能 `asciinema play`；文件 `0600`、单文件体积上限、文件名严格校验
+
+### 平台化（2.0 · 「平台」页）
+- **多用户 RBAC（可选）**：`users` 为空时保持「单密码 = admin」的兼容模式；建用户后按 `admin / operator / viewer` 三档限制写操作
+- **应用市场**：`app/market.json` 内置常用服务模板，一键带出常驻应用注册表单
+- **PWA**：`manifest.webmanifest` + `sw.js`，可安装到桌面 / 手机
+- **多语言**：`static/i18n/*.json`，中英切换（`ui.locale` 落 prefs）
+- **命令面板**：`Ctrl / ⌘ + K` 模糊搜索页面与操作
+- **自诊断包**：`GET /api/panel/diagnostics` 汇总版本、能力探测与最近错误（脱敏）
+- **API 文档**：`/api/docs` 自包含页面 + `/api/openapi.json`，不依赖任何 CDN
 
 ---
 
@@ -306,6 +330,21 @@ sudo SERVERPANEL_HOST=0.0.0.0 SERVERPANEL_PORT=9000 bash install.sh
 ```bash
 ./run.sh --port 8787
 ```
+
+### 外部命令依赖（2.0 起可选）
+
+2.0 的运维扩展**没有新增任何 Python 依赖**：能力来自宿主机命令，探测不到就隐藏对应面板，其余功能不受影响。
+
+| 能力 | 需要的命令 | 缺失时 |
+|---|---|---|
+| 定时任务 | `crontab` | 定时任务面板提示不可用 |
+| 备份 | `tar`；远程备份另需 `rclone` | 远程备份入口隐藏 |
+| 系统更新 | `apt-get` / `apt` | 仅 Debian / Ubuntu 可用，其他发行版隐藏 |
+| Docker | `docker` | 面板隐藏 |
+| 防火墙 | `ufw` / `iptables` / `nft` | 只展示探测到的那个 |
+| 反代 / 证书 | `nginx`、`caddy`、`apachectl`、`openssl` | 隐藏对应站点 / 证书信息 |
+| 数据库 | `sqlite3`、`mysql`、`psql` | 隐藏对应类型的探测 |
+| 网络工具 | `ping`、`traceroute`、`dig`、`curl` | 缺哪个就隐藏哪个按钮 |
 
 ### 离线安装（无网络环境）
 
@@ -582,7 +621,7 @@ sp systemctl status nginx
 | 服务 | `POST /api/services/{name}/action` 🔒 | 启停 / 自启 / mask |
 | 日志 | `GET /api/logs/sources`、`/journal`、`/dmesg`、`/tail`、`/file` | 日志读取 |
 | 文件 | `GET /api/files/roots`、`/list`、`/stat`、`/read`、`/download`、`/search`、`/usage` 🔒 | 浏览、读取、下载 |
-| 文件 | `POST /api/files/write`、`/mkdir`、`/rename`、`/copy`、`/delete`、`/upload` 🔒 | 写入与变更 |
+| 文件 | `POST /api/files/write`、`/mkdir`、`/rename`、`/copy`、`/delete`、`/upload`、`/move`、`/archive` 🔒 | 写入与变更（含批量移动 / 打包） |
 | 终端 | `GET /api/terminal/info` 🔒 | 终端与运行环境信息 |
 | 终端 | `POST /api/terminal/exec` 🔒 | 一次性命令执行（面板会话或 Agent 令牌） |
 | 终端 | `WS /api/terminal/ws` 🔒 | 交互式 PTY 终端 |
@@ -595,7 +634,7 @@ sp systemctl status nginx
 | 常驻应用 | `GET /api/panel/apps/{id}/check-port` 🔒 | 端口占用提示（仅提示，不阻断） |
 | 常用操作 | `GET /api/panel/tasks` 🔒 | 内置任务清单 + 最近执行记录 |
 | 常用操作 | `POST /api/panel/tasks/{id}/run` 🔒 | 执行任务（参数白名单校验） |
-| 安全中心 | `GET /api/panel/security`、`/audit/log`、`/sessions`、`POST /sessions/revoke`、`/sessions/revoke-others` 🔒 | 安全摘要、审计查询、会话管理 |
+| 安全中心 | `GET /api/panel/security`、`/security/checkup`、`/audit/log`、`/sessions`、`POST /audit/export`、`/sessions/revoke`、`/sessions/revoke-others` 🔒 | 安全摘要、一键巡检、审计查询/导出、会话管理 |
 | 安全中心 | `GET/POST/DELETE /api/agent/tokens` 🔒 | Agent 多令牌管理（作用域 / 过期） |
 | 安全中心 | `GET /api/auth/totp/status`、`POST /api/auth/totp/setup\|enable\|disable\|recovery-codes` | TOTP 二次认证（登录态） |
 | 文件 | `GET /api/files/trash`、`POST /trash/restore\|purge\|purge-all` 🔒 | 回收站（覆盖写 / 删除的自动备份） |
@@ -612,6 +651,20 @@ sp systemctl status nginx
 | 快捷设置 | `GET /api/panel/audit` 🔒 | 设置类、常驻应用与常用操作的合并审计时间线 |
 | Agent | `GET /api/agent/info` 🔒 | 令牌状态、接入信息、执行审计 |
 | Agent | `POST /api/agent/token`、`DELETE /api/agent/token` 🔒 | 生成 / 轮换、吊销令牌 |
+| 运维 · 定时任务 | `GET/POST /api/panel/maintenance/cron` 🔒 | 读 / 写面板管理的 crontab 区块 |
+| 运维 · 备份 | `GET/POST /api/panel/maintenance/backups`、`GET …/remotes`、`POST …/{name}/upload`、`DELETE …/{name}` 🔒 | 本地备份、远端列表、rclone 上传、删除 |
+| 运维 · 系统更新 | `GET /api/panel/maintenance/updates`、`POST …/updates/apply` 🔒 | 可升级包列表 / 执行升级（需确认令牌） |
+| 运维 · Docker | `GET /api/panel/infra/docker/containers`、`/images`、`/containers/{cid}/logs`、`POST …/action`、`DELETE /containers/{cid}` 🔒 | 列表、日志、生命周期（删除需确认令牌） |
+| 运维 · 防火墙 | `GET /api/panel/infra/firewall`、`POST /firewall/{action}` 🔒 | 规则只读 / 放开收紧（需确认令牌） |
+| 运维 · 反代 | `GET /api/panel/infra/proxy`、`/proxy/certificates`、`POST /proxy/reload` 🔒 | 站点、证书到期、测试并重载 |
+| 运维 · 数据库 | `GET /api/panel/infra/databases`、`POST /databases/probe` 🔒 | 只读探测 |
+| 运维 · SSH | `GET/POST/DELETE /api/panel/infra/ssh/keys` 🔒 | 公钥增删 |
+| 运维 · 网络工具 | `POST /api/panel/infra/net/tool` 🔒 | ping / traceroute / dig / curl -I |
+| 会话录制 | `GET /api/panel/recordings`、`GET/DELETE /api/panel/recordings/{name}` 🔒 | 列表、回放数据、删除 |
+| 平台 · 用户 | `GET/POST /api/panel/users`、`PUT/DELETE /api/panel/users/{id}` 🔒 | 多用户 RBAC（admin） |
+| 平台 · 市场 | `GET /api/panel/market`、`POST /market/{id}/install` 🔒 | 模板列表 / 安装（生成常驻应用） |
+| 平台 · 诊断 | `GET /api/panel/diagnostics` 🔒 | 自诊断包 |
+| 平台 · 文档 | `GET /api/docs`、`GET /api/openapi.json` 🔒 | 自包含 API 文档 |
 
 ---
 
@@ -634,8 +687,25 @@ sp systemctl status nginx
       "security": {
         "max_failures": 5, "lockout_seconds": 60,         // 防爆破
         "trust_proxy": false, "allowed_origins": [],      // 同时写回顶层同名键
-        "log_dirs": ["/var/log"]
+        "log_dirs": ["/var/log"],
+        "trash_max_bytes": 1073741824                    // 回收站水位（64MiB–10GiB）
       },
+      "notify": {
+        "webhook_url": "",                                // http/https，留空关闭
+        "on_task_fail": false, "on_lockout": false        // 任务失败 / 登录锁定推送
+      },
+      "power": { "save_mode": false },                     // 低功耗：指标采样 2s → 10s
+      "alerts": {                                          // M2 阈值告警（超阈值推 Webhook）
+        "enabled": false, "cpu_percent": 90, "mem_percent": 90, "disk_percent": 90,
+        "temp_c": 85, "load1": 8.0,                        // 0 = 关闭该项
+        "for_seconds": 60, "silence_minutes": 30           // 持续多久才告警 / 告警后静默
+      },
+      "terminal": {
+        "idle_timeout_minutes": 30,                        // 0 = 不限制
+        "record_sessions": false, "record_max_mb": 50      // asciinema v2 会话录制
+      },
+      "backup": { "dir": "" },                             // 运维备份目录，空 = 配置目录下 backups/
+      "ui": { "locale": "zh-CN" },                         // zh-CN / en-US
       "listen": { "host": "0.0.0.0", "port": 8787 }       // 以 install.json 为准，需重启生效
     }
   }
@@ -657,12 +727,20 @@ serverpanel --host 0.0.0.0 --port 8787 --ssl-certfile /path/cert.pem --ssl-keyfi
 这个面板等价于把 root shell 挂到网络上，请务必只在可信网络中使用。
 
 - **不要暴露到公网**。默认监听 `0.0.0.0:8787` 且使用 HTTP；如需外网访问，请放在反向代理 + HTTPS + 鉴权之后（反向代理后请在配置文件设置 `"trust_proxy": true`，同时通过 `allowed_origins` 放行代理域名，否则日志页与终端的来源判定会失真）
+- **确认令牌（2.0）**：重启 / 关机、删除容器、防火墙写、反代重载、系统升级、配置导入、常驻应用删除等破坏性操作要求一次性 `X-Confirm-Token`（2 分钟有效、动作绑定、进程级密钥），误点或跨站构造的请求不会直接生效
+- **写盘符号链接防护（2.0）**：文件写入用 `O_NOFOLLOW` 打开，拒绝经由符号链接写到保护目录之外
+- **升级完整性（2.0）**：`SHA256SUMS` 覆盖全部发布文件；升级前校验，`python3 tools/gen_sha256sums.py --check` 可在 CI 或本地复核
+- **会话录制（2.0）**：文件权限 `0600`、目录 `0700`，默认关闭；API 只接受 `YYYYmmdd-HHMMSS-xxxxxx.cast` 形式的文件名，不能穿越目录
+- **依赖审计（2.0）**：CI 执行 `pip-audit`，Dependabot 每周检查 Python 与 GitHub Actions 依赖
 - **限制来源**，例如只放行内网网段：
   ```bash
   ufw allow from 192.168.0.0/16 to any port 8787 proto tcp
   ```
 - **用完就关**：内网模式是临时授权，操作完执行 `serverpanel --disable-internal`
 - **妥善保管 Agent 令牌**，不要提交进版本库或粘贴到公开场合；1.4.0 起令牌按「名称 + 作用域」管理，请按最小权限签发（只读令牌只能执行查看类命令），可疑令牌在「安全中心」单独吊销，不必全场轮换
+- **custom 作用域不支持 shell 元字符**：创建「自定义前缀白名单」令牌时请注意，命令中若含 `$()`、反引号、`>`、`>>`、`<`、`*`、`?`、单个 `&`、换行等元字符会被直接拒绝（返回 403）。这是有意的收紧（元字符会改变命令结构，静态分析不出真实语义），不是故障；含元字符的命令请改用 full 作用域令牌或改写成不含元字符的形式
+- **事件通知是可选的外发通道**：配置 `notify.webhook_url` 后，任务失败 / 登录锁定会把事件 POST 到该地址。地址必须是 http/https，并与「从 URL 拉取」共用同一套 SSRF 校验（默认拒绝回环/私网；内网 Webhook 需显式设置 `fetch_allow_private`）。发送失败只写审计 `notify_failed`，不影响正常操作
+- **回收站水位可调**：`security.trash_max_bytes` 默认 1GiB（范围 64MiB–10GiB），超过后在安全中心与概览页提示清理
 - **开启二次认证**：公网部署建议在「安全中心」启用 TOTP（密码 + 6 位动态码），并妥善保管恢复码
 - **从 1.3.1 及更早版本升级**：会话令牌改为哈希存储，**浏览器需要重新登录一次**；既有 Agent 令牌会被自动迁移为一条 full 作用域的「默认令牌（迁移自旧版）」，无需重签（迁移后 `serverpanel --show-agent-token` 只能看到元数据，看不到明文）
 - **配置备份不含凭据**：密码哈希、Agent 令牌、TOTP 密钥与 2FA 启用状态都不在导出包里（`include_secrets=1` 也只带本机既有的那部分）。换机恢复后需要重新签发令牌、重新绑定二次认证
@@ -675,6 +753,48 @@ serverpanel --host 0.0.0.0 --port 8787 --ssl-certfile /path/cert.pem --ssl-keyfi
 ---
 
 ## 十、更新记录
+
+### 2.0（本仓库合入版：外包 1.6.0 + 2.0.0 + 2.0.1）
+
+- **合入外包平台化三条线**：1.6.0（安全巡检 + 通知出口 + 文件批量操作）、2.0.0（监控备份 / 运维扩展 / 多用户 RBAC / 平台化 / 会话录制）、2.0.1（operator 权限收口补丁），一次性并到本仓库
+- **保留本仓库自己的东西**：1.5.0 的工业战术风界面（碳黑 + 单一点缀色 + 切角几何）与前端视图资源回收修复、1.4.1 的四个验收修复，全部原样保留（逐条已核对：`makeViewResources` 块逐字节相同，1.4.1 的 10 个回归测试函数名一个不少）
+- **版本号归一**：内容等同外包 `2.0.1`，但本仓库版本号记为 `2.0`（便于和外包的 2.0.1 区分来源）；下方 2.0.1 / 2.0.0 / 1.6.0 小节是外包方的原始记录，保留作来源说明
+- **零新增运行时依赖**：`requirements.txt` / `constraints.txt` 与 1.5.0 逐字节相同，离线 wheel 包无需重做
+- **已知问题（开多用户前必须修）**：多用户模式下 RBAC 仍有 4 条「等同 root」的直通路径（WebSocket 终端不过 RBAC、`/api/files` 无根白名单、`/api/panel/apps` 任意命令、`/api/panel/infra/ssh/keys` 写 root `authorized_keys`）；多用户 2FA 的展示与巡检仍读全局开关。当前部署是单密码模式（`users` 为空时 RBAC 完全旁路），不受影响；修复版记 `2.1.0`
+
+### 2.0.1（operator 权限收口补丁）
+
+- **operator 禁止访问等同 root 的能力**：修复多用户模式下 operator 角色可经网页终端拿到 root shell 的缺口——`/api/terminal`（`info` / `exec` / `ws`）、`/api/panel/maintenance/cron`（写 crontab = root 计划任务）、`/api/panel/maintenance/updates`（apt 应用更新 = 任意新代码以 root 落地）整体纳入 `OPERATOR_FORBIDDEN_PREFIXES`，与电源 / 自更新 / 用户管理同级，仅 admin 可达；备份管理仍归 operator
+- **前端同步隐藏**：终端导航项与两处「打开终端」快捷按钮增加 `adminOnly` 过滤（沿用既有 NAV 机制），命令面板随 `visibleNav()` 一并过滤；action 层加兜底判断，operator 直达调用也不再进入终端视图
+- **回归测试**：`test_operator_scope` 覆盖终端 / crontab / 更新的 operator 403 与 admin 可达；备份路径断言不受影响
+- **升级注意**：仅改动 `app/auth.py`、`static/app.js`、`tests/test_platform.py`、版本号与文档，配置结构零变化，直接覆盖 `app/` 与 `static/` 即可；`SHA256SUMS` 已同步重新生成
+
+### 2.0.0（安全收口 + 监控备份 + 运维扩展 + 平台化）
+
+**零新增运行时依赖**：`requirements.txt` 与 1.6.0 完全一致；Docker / 防火墙 / 备份 / 数据库等能力全部调用宿主机 CLI，缺命令就降级隐藏。
+
+- **安全收口**（M1）：破坏性操作一次性确认令牌（`X-Confirm-Token`，动作绑定 + 2 分钟时效）、文件写入 `O_NOFOLLOW` 符号链接防护、升级校验 `SHA256SUMS`、`SECURITY.md`、Dependabot、CI `pip-audit`、终端空闲超时（`terminal.idle_timeout_minutes`）
+- **可观测与能耗**（M2）：指标落 SQLite（1h / 1d / 30d / 365d，内存保留最近 2 分钟）、阈值告警（CPU / 内存 / 磁盘 / 温度 / 负载，持续时长 + 静默窗口，走 Webhook）、低功耗模式（采样 2s → 10s）、RAPL 功耗读数、日志实时跟随 WS（`tail -F`，前端跟随开关）
+- **运维扩展**（M3）：定时任务、备份（本地 tar.gz + rclone 远程）、apt 系统更新、Docker、防火墙、反代 / 证书、数据库只读探测、SSH 公钥、网络工具；「运维」页统一承载，能力探测失败即隐藏
+- **平台化**（M4）：可选多用户 RBAC（兼容模式：`users` 为空时单密码 = admin）、应用市场（`app/market.json`）、PWA（manifest + service worker）、i18n（zh-CN / en-US，`ui.locale`）、命令面板（`Ctrl / ⌘ + K`）、自诊断包、自包含 API 文档（`/api/docs`）
+- **会话录制**（M5）：asciinema v2（JSONL）录制终端输入与输出，面板内按时间回放、可删除；默认关闭（`terminal.record_sessions`），单文件上限 `terminal.record_max_mb`，录制目录自动保留 30 天 / 总计 2GB（超出按最旧优先清理）
+- **审查修复**（2.0.0 发布前）：配置损坏不再降级为「未初始化」（保留旧配置并拒绝重新设密）；终端大段粘贴不再因 PTY 缓冲满断开会话（含输出反压）；`shell.run` 超时改为整组清理并限制输出内存（防 `find /` / `cat` 大文件打爆面板）；目录列举/日志读取/配置导入/解压增加体积与条数上限并移出事件循环；SSRF 拦截 IPv4-mapped IPv6；确认令牌改为一次性并绑定会话；登录 PBKDF2 与用户写入下线程池；crontab 环境变量行（`PATH=` / `MAILTO=`）可正常保存；录制目录自动清理；Service Worker 改 network-first（升级后不再固化旧前端）
+- **质量**：`pytest` 198 用例通过（0 失败）；`pylama` 无新增规则（历史 E501 / C901 计数未恶化）；`node --check static/app.js` 通过；`tools/gen_sha256sums.py --check` 与发布清单一致
+
+### 1.6.0（安全巡检 + 通知出口 + 文件批量操作）
+
+- **只读作用域白名单补充**（S1）：新增 `pwd`、`readlink`、`realpath`、`basename`、`dirname`、`arch`、`nproc`、`lsb_release`、`getconf`、`which`；`env` / `printenv` / `set` / `history` 明确不收（输出可能含敏感环境变量或命令历史）
+- **文件类命令敏感路径排除**（S2）：`wc` / `stat` / `file` / `du` 的位置参数统一过敏感名单（`shadow`、`gshadow`、`sudoers`、私钥、`.ssh` 等），与 `cat` 共用同一套归一化判定（`/etc/ssh_config` 这类同前缀名不会被误伤）；`ls` 保持放行
+- **短选项粘连写法兼容**（S3）：`ping -c1`、`lsof -i:80`、`top -bn1` 与带空格写法等价；未登记选项与双连字符长选项仍拒绝
+- **custom 作用域提示**（S4）：创建令牌时在自定义前缀输入框下方明示不支持的 shell 元字符（后端 403 语义不变）
+- **一键安全巡检**（U1）：新增 `GET /api/panel/security/checkup` 与安全中心顶部「安全巡检」卡片，汇总 2FA 未启用、密码强度偏弱、完整权限/闲置令牌、回收站超水位、当前 IP 锁定等待办，点击条目跳到对应卡片
+- **审计日志导出 CSV**（U2）：导出当前筛选结果（时间/动作/来源/IP/执行者/目标/摘要/结果/退出码/耗时），以 `= + - @`、TAB、CR 开头的单元格前置单引号防公式注入；导出动作记 `audit_export`
+- **回收站水位告警**（U3）：新配置项 `security.trash_max_bytes`（默认 1GiB，范围 64MiB–10GiB，热加载）；`/api/panel/security` 增加 `trash.over_limit`，安全中心与概览页超限显示徽章
+- **事件通知 Webhook**（F1）：新配置项 `notify.webhook_url` / `notify.on_task_fail` / `notify.on_lockout`；任务失败与登录锁定触发 POST（5 秒超时），失败只记 `notify_failed`、不影响主流程；SSRF 判定抽到 `app/ssrf.py`，与文件远程拉取共用同一套校验
+- **文件批量移动 / 打包**（F2）：`POST /api/files/move`（部分成功语义，逐条明细）、`POST /api/files/archive`（zip，单次 1GiB 上限、不跟随符号链接、系统关键目录拒绝）；批量操作栏新增「移动到…」「打包下载」
+- **最近登录卡片**（F3）：安全中心展示最近 7 天成功/失败登录（复用审计查询，30 秒刷新，定时器按 `res.own()` 登记）
+- **CI**（E2）：新增 `.github/workflows/ci.yml`（Ubuntu + Python 3.11，`pytest -q` 与 `node --check`；Playwright 冒烟依赖真实浏览器，不进 CI）
+- **质量**：全量 pytest 通过（0 失败）；S1–S3 与 Webhook SSRF 均附绕过向量用例；`pylama` 零新增告警
 
 ### 1.5.0（界面重构 + 前端视图资源回收修复）
 

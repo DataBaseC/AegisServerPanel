@@ -14,6 +14,24 @@ def is_root() -> bool:
     return hasattr(os, "geteuid") and os.geteuid() == 0
 
 
+def password_is_weak(password: str) -> bool:
+    """密码强度评估（1.6.0 U1）：长度 < 12 或字符类别少于 3 类记弱。
+
+    纯函数，便于单测。与 ``config._validate_password_strength`` 的"准入门槛"
+    互补：那道门槛只拦长度下限、常见弱口令与键盘序；这里给出可写进巡检报告的
+    强度判断（例如 12 位纯小写能通过门槛，但只有 1 类字符，仍算弱）。
+    字符类别：大写 / 小写 / 数字 / 符号（非字母数字）。
+    """
+    text = password or ""
+    classes = sum((
+        any(ch.islower() for ch in text),
+        any(ch.isupper() for ch in text),
+        any(ch.isdigit() for ch in text),
+        any(not ch.isalnum() for ch in text),
+    ))
+    return len(text) < 12 or classes < 3
+
+
 # 日志白名单永远不能落的敏感目录：与这些目录存在任意包含关系都拒绝。
 SENSITIVE_LOG_DIRS = (
     "/etc", "/root", "/proc", "/sys", "/dev", "/run", "/boot",

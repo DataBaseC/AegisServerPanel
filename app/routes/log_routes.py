@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, WebSocket
 
 from .. import shell
-from ..auth import require_auth
+from ..auth import authenticate_ws, require_auth
 from ..config import config
 from ..utils import log_dir_reason
 
 router = APIRouter(prefix="/api/logs", tags=["logs"], dependencies=[Depends(require_auth)])
+# WebSocket 不能走 require_auth（它需要 Request 对象），单独挂一个无依赖路由，
+# 在 WS 内部用 authenticate_ws 校验会话。
+stream_router = APIRouter(prefix="/api/logs", tags=["logs"])
 
 PRIORITIES = ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"]
 TEXT_HINT = (".log", ".txt", ".out", ".err", ".conf", "syslog", "messages", "auth.log", "kern.log")
@@ -133,7 +137,9 @@ async def read_log(path: str, max_bytes: int = 256 * 1024):
                 raise HTTPException(403, "文件在校验后被替换为白名单外的链接，已拒绝读取")
             if size > limit:
                 fh.seek(-limit, os.SEEK_END)
-            return fh.read()
+            # 限长读：size 是 seek 之前的旧值，正在高速追加的日志在 seek 与 read
+            # 之间可能已经涨到几百 MB，read() 到 EOF 会直接把内存打满
+            return fh.read(limit)
 
     data = await asyncio.to_thread(_read)  # 大日志读盘不阻塞事件循环
     return {
@@ -142,3 +148,86 @@ async def read_log(path: str, max_bytes: int = 256 * 1024):
         "truncated": size > limit,
         "content": data.decode("utf-8", "replace"),
     }
+
+
+async def _run_log_stream(websocket: WebSocket, process) -> None:
+    """把 tail 子进程的输出泵到 WS，直到任一方断开，并确保 tail 被回收。"""
+
+    async def pump() -> None:
+        assert process.stdout is not None
+        while True:
+            raw = await process.stdout.readline()
+            if not raw:
+                break
+            await websocket.send_text(raw.decode("utf-8", "replace").rstrip("\n"))
+
+    async def watch() -> None:
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
+
+    pump_task = asyncio.create_task(pump())
+    watch_task = asyncio.create_task(watch())
+    try:
+        await asyncio.wait({pump_task, watch_task}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in (pump_task, watch_task):
+            task.cancel()
+        # 取消后必须收回：否则 3.12 会报 "Task exception was never retrieved"，
+        # 且被取消的 readline 可能多挂一个事件循环周期
+        with contextlib.suppress(Exception):
+            await asyncio.gather(pump_task, watch_task, return_exceptions=True)
+        if process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=3)
+            except asyncio.TimeoutError:
+                # 忽略 SIGTERM 的 tail 必须补 kill，否则每次跟随都残留一个进程
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    process.kill()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(process.wait(), timeout=2)
+        with contextlib.suppress(Exception):
+            await websocket.close()
+
+
+@stream_router.websocket("/ws")
+async def log_stream(websocket: WebSocket):
+    """实时跟随日志文件（2.0 M2）：``tail -F`` + WebSocket 推送。
+
+    仅支持白名单内的普通文件；路径校验与 /file 完全相同（realpath + 白名单），
+    ``tail`` 以参数列表调用，不经过 shell。
+    """
+    if not await authenticate_ws(websocket, internal_only=False):
+        return
+    await websocket.accept()
+    path = websocket.query_params.get("path", "")
+    try:
+        lines = max(10, min(int(websocket.query_params.get("lines", "100")), 2000))
+    except (TypeError, ValueError):
+        lines = 100
+    try:
+        full = _check_readable(path)
+    except HTTPException as exc:
+        await websocket.send_text(f"[error] {exc.detail}")
+        await websocket.close()
+        return
+    if not shell.available("tail"):
+        await websocket.send_text("[error] 本机缺少 tail，无法实时跟随")
+        await websocket.close()
+        return
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "tail", "-n", str(lines), "-F", full,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        await websocket.send_text(f"[error] 无法启动 tail: {exc}")
+        await websocket.close()
+        return
+
+    await _run_log_stream(websocket, process)

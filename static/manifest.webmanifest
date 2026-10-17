@@ -1,0 +1,20 @@
+{
+  "name": "ServerPanel · 系统控制台",
+  "short_name": "ServerPanel",
+  "description": "单文件部署的 Linux 服务器控制台：监控、终端、文件与运维。",
+  "lang": "zh-CN",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#12151a",
+  "theme_color": "#12151a",
+  "icons": [
+    {
+      "src": "/static/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import shutil
@@ -151,8 +152,9 @@ WantedBy=multi-user.target
 def write_supervisor(target_dir: Path, host: str, port: int, log_limit: int | None = None) -> Path:
     """无 systemd 环境的守护脚本：崩溃拉起 + flock 单实例 + 日志轮转。
 
-    日志上限通过环境变量 SERVERPANEL_LOG_MAX_BYTES 注入（默认读「快捷设置」里的
-    panel_max_bytes）；改上限不需要重新生成脚本，重启面板即可生效。
+    日志上限取「快捷设置」里的 panel_max_bytes 并**写进脚本字面量**（同时保留
+    SERVERPANEL_LOG_MAX_BYTES 环境变量覆盖）。改上限后需要重新执行
+    ``serverpanel --install`` / ``--restart`` 生成脚本才生效。
     """
     limit = int(log_limit if log_limit else prefs.panel_log_limit())
     script = f"""#!/usr/bin/env bash
@@ -173,7 +175,9 @@ echo $$ > "{target_dir}/{PID_NAME}"
 
 rotate_log() {{
   [ -f "$LOG" ] || return 0
-  size=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
+  # wc -c 在 BusyBox / BSD / Alpine 上都可用；stat -c 是 GNU 专有，
+  # 在容器/PRoot 上会永远返回 0，导致日志永不轮转（无界增长）
+  size=$(wc -c < "$LOG" 2>/dev/null || echo 0)
   [ "$size" -gt "$LOG_MAX_BYTES" ] && mv -f "$LOG" "$LOG.1"
   return 0
 }}
@@ -259,7 +263,9 @@ def _stop_supervisor(target_dir: Path) -> bool:
     作为面板被强杀（来不及优雅退出）时的兜底。
     """
     pid = _read_pidfile(target_dir)
-    if pid is None or not _pid_alive(pid):
+    # 除存活外还要核对 cmdline：守护被杀/机器重启后 pidfile 可能残留，
+    # PID 被内核回收给无关进程时贸然 killpg 会误杀数据库等关键服务
+    if pid is None or not _pid_alive(pid) or not _supervisor_running(target_dir):
         (target_dir / PID_NAME).unlink(missing_ok=True)
         return False
     _kill_process_group(pid, signal.SIGTERM)
@@ -843,7 +849,7 @@ def cmd_update(target_dir: Path, ref: str, force: bool) -> int:
         return guard
     if not (target_dir / ".git").exists():
         return fail("当前是 zip/快照安装（无 .git），无法增量升级。\n"
-                    f"    请参照 README 迁移为 git 部署：克隆新目录 → 复用配置 → 停旧起新。")
+                    "    请参照 README 迁移为 git 部署：克隆新目录 → 复用配置 → 停旧起新。")
     meta = _load_metadata()
     port = int(meta.get("port") or 8787)
     host = str(meta.get("host") or "0.0.0.0")
@@ -855,24 +861,94 @@ def cmd_update(target_dir: Path, ref: str, force: bool) -> int:
         return fail(str(exc))
 
 
+def _manifest_problem(target_dir: Path, line: str) -> str | None:
+    """校验清单中的一行；返回问题描述，正常返回 None。"""
+    digest, _, name = line.partition("  ")
+    if not name or name.startswith("/") or ".." in Path(name).parts:
+        return f"非法条目: {line[:80]}"
+    path = target_dir / name
+    if not path.is_file():
+        return f"文件缺失: {name}"
+    try:
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        return f"读取失败: {name}（{exc}）"
+    if actual != digest:
+        return f"哈希不符: {name}"
+    return None
+
+
+def _verify_manifest(target_dir: Path) -> bool:
+    """按 SHA256SUMS 校验工作树（2.0 M1 / P1-8）。
+
+    清单缺失时**放行但明确提示**（兼容旧版本/非 git 发行包）；存在则逐条校验，
+    缺失文件、路径逃逸、哈希不符都算失败。
+    """
+    manifest = target_dir / "SHA256SUMS"
+    if not manifest.exists():
+        print("==> 未提供 SHA256SUMS，跳过完整性校验")
+        return True
+    try:
+        lines = manifest.read_text("utf-8").splitlines()
+    except OSError as exc:
+        print(f"读取 SHA256SUMS 失败: {exc}", file=sys.stderr)
+        return False
+    bad: list[str] = []
+    total = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        total += 1
+        problem = _manifest_problem(target_dir, line)
+        if problem:
+            bad.append(problem)
+    if bad:
+        print("代码完整性校验失败：", file=sys.stderr)
+        for item in bad[:10]:
+            print(f"  {item}", file=sys.stderr)
+        if len(bad) > 10:
+            print(f"  …共 {len(bad)} 项", file=sys.stderr)
+        return False
+    print(f"==> 完整性校验通过（{total} 个文件）")
+    return True
+
+
+def _guard_dirty(target_dir: Path, force: bool) -> str | None:
+    """工作树有本地改动时中止或自动 stash；返回错误信息（None = 可继续）。"""
+    dirty = _git(target_dir, "status", "--porcelain")
+    if dirty.returncode != 0:
+        return "git status 失败，仓库状态异常"
+    # update.lock 是升级流程自己的锁文件，不算用户改动
+    dirty_lines = [ln for ln in dirty.stdout.splitlines() if not ln.endswith("update.lock")]
+    if not dirty_lines:
+        return None
+    if not force:
+        return ("仓库存在本地改动，为避免丢失已中止。确认丢弃/保留后可 "
+                "加 --force（改动会先自动 stash）。改动列表:\n" + "\n".join(dirty_lines))
+    stash = _git(target_dir, "stash", "push", "-u", "-m", "serverpanel update autostash")
+    if stash.returncode != 0:
+        return f"stash 失败: {stash.stderr.strip()}"
+    print("本地改动已自动 stash")
+    return None
+
+
+def _verify_or_rollback(target_dir: Path, current) -> bool:
+    """校验失败时回退到升级前提交；返回是否通过。"""
+    if _verify_manifest(target_dir):
+        return True
+    _git(target_dir, "checkout", current.stdout.strip())
+    return False
+
+
 def _do_update(target_dir: Path, ref: str, force: bool, host: str, port: int) -> int:
     current = _git(target_dir, "rev-parse", "HEAD")
     if current.returncode != 0:
         return fail(f"读取当前版本失败: {current.stderr.strip()}")
 
-    dirty = _git(target_dir, "status", "--porcelain")
-    if dirty.returncode != 0:
-        return fail("git status 失败，仓库状态异常")
-    # update.lock 是升级流程自己的锁文件，不算用户改动（否则一次遗留会挡住以后所有升级）
-    dirty_lines = [ln for ln in dirty.stdout.splitlines() if not ln.endswith("update.lock")]
-    if dirty_lines:
-        if not force:
-            return fail("仓库存在本地改动，为避免丢失已中止。确认丢弃/保留后可 "
-                        "加 --force（改动会先自动 stash）。改动列表:\n" + "\n".join(dirty_lines))
-        stash = _git(target_dir, "stash", "push", "-u", "-m", "serverpanel update autostash")
-        if stash.returncode != 0:
-            return fail(f"stash 失败: {stash.stderr.strip()}")
-        print("本地改动已自动 stash")
+    blocked = _guard_dirty(target_dir, force)
+    if blocked:
+        return fail(blocked)
 
     # 配置备份：update 原则上不碰配置，这是最后防线
     backup = config.path.with_name(f"{config.path.name}.bak.{time.strftime('%Y%m%d%H%M%S')}")
@@ -896,6 +972,10 @@ def _do_update(target_dir: Path, ref: str, force: bool, host: str, port: int) ->
     checkout = _git(target_dir, "checkout", target.stdout.strip())
     if checkout.returncode != 0:
         return fail(f"git checkout 失败: {checkout.stderr.strip()}")
+
+    # 2.0 M1 / P1-8：切换后先校验代码完整性，再装依赖/重启
+    if not _verify_or_rollback(target_dir, current):
+        return fail("代码完整性校验失败，已回退（服务未重启，仍在运行旧版本）")
 
     print("==> 安装依赖")
     if _pip_install(target_dir) != 0:

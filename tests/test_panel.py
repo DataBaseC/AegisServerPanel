@@ -23,6 +23,12 @@ from app.main import app
 PASSWORD = "test-password-123"
 
 
+def _confirm(client, action: str) -> dict:
+    """高危操作确认令牌（2.0 M1）：先申请再带 X-Confirm-Token。"""
+    token = client.post("/api/panel/confirm", json={"action": action}).json()["token"]
+    return {"X-Confirm-Token": token}
+
+
 @pytest.fixture(scope="module")
 def client():
     with TestClient(app) as c:
@@ -340,12 +346,13 @@ def test_self_update_blocked_in_public_mode(authed, monkeypatch):
     # 内网模式
     config_mod.config.set_mode(config_mod.MODE_INTERNAL)
     try:
-        r = authed.post("/api/system/self-update", json={})
+        r = authed.post("/api/system/self-update", json={}, headers=_confirm(authed, "update"))
         assert r.status_code == 200
         assert "start_new_session" in captured["kwargs"]
         assert "--update" in captured["cmd"]
         # 自定义 ref 透传
-        authed.post("/api/system/self-update", json={"ref": "origin/dev"})
+        authed.post("/api/system/self-update", json={"ref": "origin/dev"},
+                    headers=_confirm(authed, "update"))
         assert "origin/dev" in captured["cmd"]
         # 更新进程必须以生命周期标志运行，确保 _panel_pids 不会把它误杀
         assert any(a.startswith("--") for a in captured["cmd"])
@@ -499,7 +506,7 @@ def test_app_lifecycle_and_logs(authed, internal_mode, tmp_path):
     assert row["runtime"]["pid"] == pid
 
     # 运行中不允许直接删除
-    r = authed.delete(f"/api/panel/apps/{app_id}")
+    r = authed.delete(f"/api/panel/apps/{app_id}", headers=_confirm(authed, "apps"))
     assert r.status_code == 400, r.text
 
     # PID 1 之类的保护不适用于这里，但停止必须真正结束进程
@@ -514,7 +521,8 @@ def test_app_lifecycle_and_logs(authed, internal_mode, tmp_path):
     # 清空日志 + 删除
     assert authed.delete(f"/api/panel/apps/{app_id}/logs").status_code == 200
     assert authed.get(f"/api/panel/apps/{app_id}/logs").json()["content"] == ""
-    assert authed.delete(f"/api/panel/apps/{app_id}").status_code == 200
+    assert authed.delete(f"/api/panel/apps/{app_id}",
+                         headers=_confirm(authed, "apps")).status_code == 200
     assert authed.get(f"/api/panel/apps/{app_id}").status_code == 400  # 已不存在
 
 
@@ -533,7 +541,7 @@ def test_managed_process_is_isolated_from_panel_group(authed, internal_mode, tmp
         assert os.getpgid(pid) != os.getpgid(os.getpid()), "托管进程不能与面板同组"
     finally:
         authed.post(f"/api/panel/apps/{app_id}/stop", json={})
-        authed.delete(f"/api/panel/apps/{app_id}")
+        authed.delete(f"/api/panel/apps/{app_id}", headers=_confirm(authed, "apps"))
 
 
 def test_registry_file_is_atomic_and_private(authed, internal_mode, tmp_path):
@@ -555,7 +563,7 @@ def test_registry_file_is_atomic_and_private(authed, internal_mode, tmp_path):
         leftovers = list(path.parent.glob(f"{path.name}.*.tmp"))
         assert leftovers == [], f"残留临时文件：{leftovers}"
     finally:
-        authed.delete(f"/api/panel/apps/{app_id}")
+        authed.delete(f"/api/panel/apps/{app_id}", headers=_confirm(authed, "apps"))
 
 
 # ---------- 常用操作（P1） ----------
@@ -1106,7 +1114,8 @@ def test_config_import_merges_and_keeps_local_secrets(authed, internal_mode):
         buffer.seek(0)
 
         r = authed.post("/api/panel/config/import",
-                        files={"file": ("export.zip", buffer.read(), "application/zip")})
+                        files={"file": ("export.zip", buffer.read(), "application/zip")},
+                        headers=_confirm(authed, "config"))
         assert r.status_code == 200, r.text
         result = r.json()
         assert "password_hash" in result["kept_secrets"], "本机已有的凭据必须保留"
@@ -1125,14 +1134,16 @@ def test_config_import_merges_and_keeps_local_secrets(authed, internal_mode):
         bad_install.seek(0)
         before = json.dumps(config_mod.config.data, sort_keys=True)
         r = authed.post("/api/panel/config/import",
-                        files={"file": ("export.zip", bad_install.read(), "application/zip")})
+                        files={"file": ("export.zip", bad_install.read(), "application/zip")},
+                        headers=_confirm(authed, "config"))
         assert r.status_code == 400
         assert json.dumps(config_mod.config.data, sort_keys=True) == before
 
         # 坏 zip：400 且配置不变
         before = json.dumps(config_mod.config.data, sort_keys=True)
         bad = authed.post("/api/panel/config/import",
-                          files={"file": ("bad.zip", b"not a zip", "application/zip")})
+                          files={"file": ("bad.zip", b"not a zip", "application/zip")},
+                          headers=_confirm(authed, "config"))
         assert bad.status_code == 400
         assert json.dumps(config_mod.config.data, sort_keys=True) == before
         assert prefs.get("session.ttl_hours") == 3, "拒绝导入时不能动现有配置"
@@ -1454,7 +1465,8 @@ def test_import_config_cannot_inject_sensitive_log_dirs(authed, internal_mode, t
         with zipfile.ZipFile(buf, "w") as z:
             z.writestr("config.json", json.dumps(payload, ensure_ascii=False))
         return authed.post("/api/panel/config/import",
-                           files={"file": ("cfg.zip", buf.getvalue(), "application/zip")})
+                           files={"file": ("cfg.zip", buf.getvalue(), "application/zip")},
+                           headers=_confirm(authed, "config"))
 
     before = list(config_mod.config.log_dirs)
     try:

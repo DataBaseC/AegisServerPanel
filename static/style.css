@@ -269,7 +269,9 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 13px; 
 }
 
 /* ---------- 主框架 ---------- */
-.app { display: flex; height: 100vh; overflow: hidden; }
+/* 100dvh：iOS Safari 的 100vh 含地址栏高度，会把底栏与视图底部顶出可视区
+   （旧浏览器不认识 dvh 会自动沿用上一行） */
+.app { display: flex; height: 100vh; height: 100dvh; overflow: hidden; }
 
 .sidebar {
   width: 216px;
@@ -558,6 +560,9 @@ table.data th {
 }
 table.data td { padding: 7px 12px; border-bottom: 1px solid var(--border-soft); vertical-align: middle; }
 table.data tbody tr:hover { background: rgba(255, 216, 2, .04); }
+/* 目录条目多时（最多 5000 行）只布局视口内的行：不支持 content-visibility
+   的浏览器会自动忽略，行为与原来一致 */
+table.data tbody tr { content-visibility: auto; contain-intrinsic-size: 30px; }
 table.data td.num { font-family: var(--mono); text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
 table.data td.actions { text-align: right; white-space: nowrap; }
 table.data td.actions .btn { margin-left: 4px; }
@@ -582,6 +587,7 @@ table.data th.sortable:hover { color: var(--tx-0); }
   white-space: pre-wrap;
   word-break: break-word;
   max-height: calc(100vh - 260px);
+  max-height: calc(100dvh - 260px);
   min-height: 240px;
   color: var(--term-tx);
 }
@@ -1017,4 +1023,115 @@ table.data th.sortable:hover { color: var(--tx-0); }
 /* ---------- 降级：尊重系统的减弱动效偏好（契约 §3） ---------- */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+
+/* ============================================================================
+   2.0 M4 平台化：命令面板 / 账号徽标 / 应用市场
+   ========================================================================== */
+
+/* ---------- 顶栏账号徽标 ---------- */
+.user-badge {
+  font-family: var(--mono);
+  letter-spacing: .3px;
+  white-space: nowrap;
+}
+.user-badge.admin { color: var(--tx-1); }
+.user-badge.operator { color: var(--acc-cold); }
+.user-badge.viewer { color: var(--tx-2); }
+
+/* ---------- 命令面板（Ctrl / ⌘ + K）---------- */
+.palette-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  background: rgba(6, 8, 10, .72);
+  backdrop-filter: blur(2px);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 12vh 16px 16px;
+}
+
+.palette {
+  width: min(640px, 100%);
+  background: var(--bg-1);
+  border: 1px solid var(--line-1);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, .55);
+  display: flex;
+  flex-direction: column;
+  max-height: 62vh;
+}
+
+.palette-input {
+  border: none;
+  border-bottom: 1px solid var(--line-1);
+  background: var(--bg-2);
+  padding: 14px 16px;
+  font-size: 14px;
+}
+
+.palette-input:focus { outline: none; border-bottom-color: var(--acc-hi); }
+
+.palette-list {
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  padding: 6px;
+  gap: 2px;
+}
+
+.palette-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  text-align: left;
+  padding: 9px 10px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--tx-0);
+  font: inherit;
+  cursor: pointer;
+}
+
+.palette-item .dim { font-size: 11.5px; }
+
+.palette-item:hover { background: var(--bg-2); }
+
+.palette-item.active {
+  background: var(--bg-2);
+  border-color: var(--line-2);
+  box-shadow: inset 2px 0 0 var(--acc-hi);
+}
+
+.palette-hint {
+  padding: 9px 14px;
+  border-top: 1px solid var(--line-1);
+  font-size: 11.5px;
+  font-family: var(--mono);
+}
+
+/* ---------- 应用市场卡片 ---------- */
+.market-card { display: flex; flex-direction: column; }
+.market-card h2 { font-size: 15px; letter-spacing: .3px; }
+
+.market-cmd {
+  background: var(--term-bg);
+  border: 1px solid var(--border-soft);
+  border-left: 2px solid var(--acc-hi);
+  padding: 9px 10px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--term-tx);
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.market-card .btn { text-decoration: none; }
+
+@media (max-width: 640px) {
+  .palette-overlay { padding-top: 8vh; }
+  .palette { max-height: 72vh; }
+  #user-badge { display: none; }
 }

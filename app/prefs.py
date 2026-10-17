@@ -19,6 +19,7 @@ import ipaddress
 import os
 import re
 import time
+import urllib.parse
 from typing import Any, Callable
 
 from .config import config
@@ -36,6 +37,10 @@ LOG_EXT_HINT = (".log", ".txt", ".out", ".err")
 MIN_LOG_BYTES = 256 * 1024
 MAX_LOG_BYTES = 256 * 1024 * 1024
 
+# 回收站水位默认阈值（1.6.0 U3）：1 GiB。U1 的安全巡检也读这个值，
+# 因此放在模块级常量里，避免两处各写一个魔数后漂移。
+TRASH_MAX_BYTES_DEFAULT = 1024 ** 3
+
 
 class PrefsError(ValueError):
     """参数不合法或不被允许。"""
@@ -49,6 +54,20 @@ def _int_range(low: int, high: int, unit: str = "") -> Callable[[Any], int]:
             raise PrefsError(f"必须是整数{'（单位：' + unit + '）' if unit else ''}")
         if not low <= number <= high:
             raise PrefsError(f"需要在 {low} ~ {high} 之间{'（单位：' + unit + '）' if unit else ''}")
+        return number
+
+    return check
+
+
+def _float_range(low: float, high: float, unit: str = "") -> Callable[[Any], float]:
+    def check(value: Any) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise PrefsError(f"必须是数字{'（单位：' + unit + '）' if unit else ''}")
+        if not low <= number <= high:
+            raise PrefsError(f"需要在 {low} ~ {high} 之间"
+                             f"{'（单位：' + unit + '）' if unit else ''}")
         return number
 
     return check
@@ -111,6 +130,34 @@ def _log_dirs(value: Any) -> list[str]:
     return result
 
 
+def _webhook_url(value: Any) -> str:
+    """Webhook 地址：留空表示关闭；否则必须是 http/https 且带主机名。"""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parsed = urllib.parse.urlparse(text)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise PrefsError("需要是 http/https 地址（带主机名），留空表示关闭")
+    return text
+
+
+def _dir_path(value: Any) -> str:
+    """目录型参数：留空表示用调用方默认值；否则必须是绝对路径且已存在或可创建。"""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if not os.path.isabs(text):
+        raise PrefsError(f"必须是绝对路径：{text}")
+    normalized = os.path.realpath(os.path.abspath(text))
+    if normalized == os.path.dirname(normalized):
+        raise PrefsError("不能使用文件系统根目录")
+    if os.path.isdir(normalized):
+        return normalized
+    if not os.path.isdir(os.path.dirname(normalized)):
+        raise PrefsError(f"目录不存在，且父目录也不存在：{text}")
+    return normalized
+
+
 def _host(value: Any) -> str:
     text = str(value or "").strip()
     if text in ("0.0.0.0", "::"):
@@ -119,6 +166,17 @@ def _host(value: Any) -> str:
         ipaddress.ip_address(text)
     except ValueError:
         raise PrefsError(f"不是合法 IP 地址：{text}（不支持域名，避免启动时解析失败）")
+    return text
+
+
+UI_LOCALES = ("zh-CN", "en-US")
+
+
+def _locale(value: Any) -> str:
+    """界面语言（2.0 M4 i18n）：只接受受支持的 locale 标识。"""
+    text = str(value or "").strip()
+    if text not in UI_LOCALES:
+        raise PrefsError("界面语言只能是：%s" % " / ".join(UI_LOCALES))
     return text
 
 
@@ -160,6 +218,65 @@ FIELDS: dict[str, tuple[Any, Callable[[Any], Any], str, str]] = {
         ["/var/log"], _log_dirs, EFFECT_IMMEDIATE,
         "日志接口允许读取的目录白名单",
     ),
+    "security.trash_max_bytes": (
+        TRASH_MAX_BYTES_DEFAULT,
+        _int_range(64 * 1024 * 1024, 10 * 1024 ** 3, "字节"),
+        EFFECT_IMMEDIATE,
+        "回收站占用超过该值后，在安全中心与概览页显示告警",
+    ),
+    "notify.webhook_url": (
+        "", _webhook_url, EFFECT_IMMEDIATE,
+        "事件通知 Webhook 地址（http/https，留空关闭）",
+    ),
+    "notify.on_task_fail": (
+        False, _bool, EFFECT_IMMEDIATE,
+        "常用任务执行失败时推送通知",
+    ),
+    "notify.on_lockout": (
+        False, _bool, EFFECT_IMMEDIATE,
+        "登录失败触发锁定时推送通知",
+    ),
+    "terminal.idle_timeout_minutes": (
+        30, _int_range(0, 1440, "分钟"), EFFECT_IMMEDIATE,
+        "终端无输入多少分钟后自动断开（0 = 不限制）",
+    ),
+    "terminal.record_sessions": (
+        False, _bool, EFFECT_IMMEDIATE,
+        "录制终端会话（asciinema v2 JSONL，可在「运维 → 会话录制」回放）",
+    ),
+    "terminal.record_max_mb": (
+        50, _int_range(1, 1024, "MB"), EFFECT_IMMEDIATE,
+        "单个会话录制的体积上限，超过后停止录制",
+    ),
+    "power.save_mode": (
+        False, _bool, EFFECT_IMMEDIATE,
+        "低功耗模式：性能采样间隔由 2 秒放宽到 10 秒（历史精度相应降低）",
+    ),
+    "alerts.enabled": (
+        False, _bool, EFFECT_IMMEDIATE,
+        "阈值告警总开关（需先在通知设置里配置 Webhook）",
+    ),
+    "alerts.cpu_percent": (
+        90, _int_range(0, 100, "%"), EFFECT_IMMEDIATE, "CPU 使用率告警阈值（0 = 关闭）",
+    ),
+    "alerts.mem_percent": (
+        90, _int_range(0, 100, "%"), EFFECT_IMMEDIATE, "内存使用率告警阈值（0 = 关闭）",
+    ),
+    "alerts.disk_percent": (
+        90, _int_range(0, 100, "%"), EFFECT_IMMEDIATE, "磁盘使用率告警阈值（0 = 关闭）",
+    ),
+    "alerts.temp_c": (
+        85, _int_range(0, 150, "°C"), EFFECT_IMMEDIATE, "温度告警阈值（0 = 关闭）",
+    ),
+    "alerts.load1": (
+        8.0, _float_range(0, 1000), EFFECT_IMMEDIATE, "1 分钟负载告警阈值（0 = 关闭）",
+    ),
+    "alerts.for_seconds": (
+        60, _int_range(0, 3600, "秒"), EFFECT_IMMEDIATE, "超过阈值持续多少秒才告警",
+    ),
+    "alerts.silence_minutes": (
+        30, _int_range(1, 1440, "分钟"), EFFECT_IMMEDIATE, "同一指标告警后的静默时长",
+    ),
     "listen.host": (
         "0.0.0.0", _host, EFFECT_RESTART,
         "面板监听地址（重启生效）",
@@ -167,6 +284,14 @@ FIELDS: dict[str, tuple[Any, Callable[[Any], Any], str, str]] = {
     "listen.port": (
         8787, _int_range(1024, 65535, "端口"), EFFECT_RESTART,
         "面板监听端口（重启生效）",
+    ),
+    "backup.dir": (
+        "", _dir_path, EFFECT_IMMEDIATE,
+        "运维备份目录（绝对路径；留空表示 <配置目录>/backups）",
+    ),
+    "ui.locale": (
+        "zh-CN", _locale, EFFECT_IMMEDIATE,
+        "界面语言（zh-CN 简体中文 / en-US English）；未翻译的文案回退中文",
     ),
 }
 
@@ -341,6 +466,10 @@ class Prefs:
 
     def max_failures(self) -> int:
         return int(self.get("security.max_failures"))
+
+    def backup_dir(self, default_dir: str) -> str:
+        """备份目录：``backup.dir`` 有值就用它，否则用调用方给的默认目录。"""
+        return str(self.get("backup.dir") or "") or default_dir
 
     def lockout_seconds(self) -> int:
         return int(self.get("security.lockout_seconds"))

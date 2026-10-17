@@ -97,20 +97,38 @@ class AuditLog:
 
     def __init__(self, directory: Path | None = None) -> None:
         self._dir = Path(directory) if directory else self._default_dir()
-        self._queue: queue.Queue[AuditEvent | None] = queue.Queue()
+        # 有界队列：磁盘卡住/写满时落盘线程会变慢，无界队列会把内存吃光。
+        # 满了就丢事件并计数（业务绝不能因为审计写不进去而阻塞）。
+        self._queue: queue.Queue[AuditEvent | None] = queue.Queue(maxsize=20000)
+        self.dropped = 0
         # RLock：_append 持锁期间 _recent_lock_guard 会重入同一把锁
         self._lock = threading.RLock()
         self._recent: list[dict] = []
         self._stopped = False
+        self._thread: threading.Thread | None = None
         try:
             self._dir.mkdir(parents=True, exist_ok=True)
             os.chmod(self._dir, 0o700)
         except OSError:
             # 目录建不了（只读文件系统等）：退化纯内存模式，不拖垮服务
             pass
-        self._thread = threading.Thread(target=self._writer, name="audit-writer", daemon=True)
-        self._thread.start()
-        self._cleanup_old()
+        self.start()
+        # 清理历史文件是同步 IO（可能扫上千个文件），不能放在 import 阶段：
+        # 由 lifespan 在启动后调用一次，并周期复跑（见 main._sampler）
+
+    def start(self) -> None:
+        """启动（或重启）落盘线程。
+
+        同一进程里可能多次进出 lifespan（测试、嵌入运行）：``close`` 之后
+        再次 ``start`` 必须能继续记录，而不是永久静默。
+        """
+        with self._lock:
+            if not self._stopped and self._thread is not None and self._thread.is_alive():
+                return
+            self._stopped = False
+            self._thread = threading.Thread(target=self._writer, name="audit-writer",
+                                            daemon=True)
+            self._thread.start()
 
     # ------------------------------------------------------------ 基础设施
     @staticmethod
@@ -161,7 +179,12 @@ class AuditLog:
         """记录一条事件（异步落盘，立即返回）。"""
         if self._stopped:
             return
-        self._queue.put(event)
+        try:
+            self._queue.put_nowait(event)
+        except queue.Full:
+            # 磁盘慢/满导致积压：丢弃最不重要的效果是少一条审计，绝不能反压业务
+            with self._lock:
+                self.dropped += 1
 
     def record_cli(self, action: str, target: str = "", summary: str = "",
                    ok: bool = True) -> None:
@@ -276,7 +299,8 @@ class AuditLog:
         return counts
 
     # ------------------------------------------------------------ 维护
-    def _cleanup_old(self) -> None:
+    def cleanup_old(self) -> None:
+        """按保留天数清理历史审计文件（启动后与每日各跑一次）。"""
         retention = _retention_days()
         cutoff = time.time() - retention * 86400
         try:
@@ -294,7 +318,7 @@ class AuditLog:
             return
         self._stopped = True
         self._queue.put(None)
-        if self._thread.is_alive():
+        if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=2)
 
 

@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from .. import shell
 from ..audit import AuditEvent, audit
 from ..auth import client_ip, require_internal
+from ..prefs import prefs
 from ..tasks import public_tasks, render, task_by_id
 
 router = APIRouter(prefix="/api/panel/tasks", tags=["panel-tasks"])
@@ -78,6 +79,14 @@ async def run_task(task_id: str, request: Request, body: RunBody | None = None,
     duration = time.time() - started
     _record(task.id, task.title, values, result, duration, command,
             client_ip(request))
+    # 1.6.0 F1：任务失败主动通知（通知故障不影响接口返回，见 app/notify.py）
+    if result.code != 0 and prefs.get("notify.on_task_fail"):
+        from ..notify import notify
+
+        await asyncio.to_thread(
+            notify, "task_fail",
+            f"任务「{task.title}」执行失败（退出码 {result.code}）",
+        )
     return {
         "ok": result.code == 0,
         "code": result.code,

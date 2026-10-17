@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 
 import psutil
@@ -61,7 +62,9 @@ def _port_entry(conn, lan: list[str]) -> dict:
 async def list_apps(_session: dict = Depends(require_internal)):
     """按进程聚合所有 TCP 监听端口，并给出可点击的访问地址。"""
     try:
-        conns = psutil.net_connections(kind="inet")
+        # net_connections 要遍历 /proc/net/tcp* 并对每个 socket 反查进程 fd，
+        # 进程多时单次可达数百毫秒到数秒：绝不能跑在事件循环上
+        conns = await asyncio.to_thread(lambda: psutil.net_connections(kind="inet"))
     except psutil.AccessDenied:
         raise HTTPException(403, "需要 root 权限才能枚举监听端口")
     except (psutil.Error, OSError) as exc:

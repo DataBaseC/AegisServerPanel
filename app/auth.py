@@ -178,9 +178,10 @@ class FailureTracker:
           限流 60 秒——防"每个 IP 只试一两次"的分布式慢速爆破。
           正常使用下全局失败很难攒到这个量级，误伤可控。
         """
-        self._prune()
         now = time.time()
         with self._lock:
+            # 只在锁内清理：锁外遍历 _ips 时另一个线程 setdefault 新 IP
+            # 会抛 "dictionary changed size during iteration"，让登录接口 500
             self._prune()
             deadline = max(self._locked_until.get(ip, 0.0), self._global_locked_until)
             if deadline <= now:
@@ -293,14 +294,22 @@ class SessionStore:
             except OSError:
                 pass
 
-    def create(self, ip: str, label: str = "") -> str:
-        """签发会话。返回明文令牌（只此一次），磁盘上只存哈希。"""
+    def create(self, ip: str, label: str = "", username: str = "",
+               role: str = "admin", user_id: str = "") -> str:
+        """签发会话。返回明文令牌（只此一次），磁盘上只存哈希。
+
+        2.0 M4 起会话可携带 ``username`` / ``role`` / ``user_id``：
+        多用户模式下 RBAC 依据它们判定权限；单密码模式保持原有行为
+        （username 为空、role=admin），既有会话文件不带这些字段时
+        一律按 admin 处理。
+        """
         token = secrets.token_urlsafe(32)
         digest = token_digest(token)
         now = time.time()
         with self._lock:
             self._sessions[digest] = {"ip": ip, "created": now, "expires": now + self.ttl,
-                                      "label": label}
+                                      "label": label, "username": username,
+                                      "role": role, "user_id": user_id}
             self._prune()
             self._persist(force=True)
         return token
@@ -344,6 +353,30 @@ class SessionStore:
             self._sessions.clear()
             self._persist(force=True)
 
+    def revoke_user(self, username: str) -> int:
+        """吊销某个用户的全部会话（多用户改密 / 禁用时用）。返回吊销条数。"""
+        if not username:
+            return 0
+        with self._lock:
+            targets = [d for d, s in self._sessions.items()
+                       if s.get("username") == username]
+            for digest in targets:
+                self._sessions.pop(digest, None)
+            if targets:
+                self._persist(force=True)
+            return len(targets)
+
+    def revoke_others(self, token: str | None) -> int:
+        """吊销除当前令牌以外的全部会话（多用户改密时不影响自己）。"""
+        current = token_digest(token) if token else ""
+        with self._lock:
+            targets = [d for d in self._sessions if d != current]
+            for digest in targets:
+                self._sessions.pop(digest, None)
+            if targets:
+                self._persist(force=True)
+            return len(targets)
+
     def active_count(self) -> int:
         with self._lock:
             self._prune()
@@ -358,6 +391,8 @@ class SessionStore:
                     "id": digest[:12],       # 列表展示用短标识，踢出时传全量
                     "ip": s.get("ip", ""),
                     "label": s.get("label", ""),
+                    "username": s.get("username", ""),
+                    "role": s.get("role", "admin"),
                     "created": int(s.get("created", 0)),
                     "expires": int(s.get("expires", 0)),
                     "current": False,        # 由调用方标注当前会话
@@ -382,6 +417,132 @@ class SessionStore:
 
 
 sessions = SessionStore()
+
+# ---------------------------------------------------------------- RBAC（2.0 M4）
+# 三条硬约束：
+# 1. **仅启用后生效**：``config.users`` 为空时一切照旧（单密码 = admin），
+#    历史会话、历史测试与既有部署行为完全不变。
+# 2. **按路径而不是按端点**：新增端点自动继承规则，不会因为漏加依赖而裸奔。
+# 3. **会话内角色不可信**：每次请求都回查用户记录，降级/禁用立即生效。
+
+ROLE_VIEWER = "viewer"
+ROLE_OPERATOR = "operator"
+ROLE_ADMIN = "admin"
+ROLE_RANK = {ROLE_VIEWER: 1, ROLE_OPERATOR: 2, ROLE_ADMIN: 3}
+
+# 只读账号唯一放行的写操作：自己账号的密码 / TOTP / 退出登录
+VIEWER_WRITE_ALLOWED_PREFIXES = ("/api/auth/",)
+
+# operator 一律禁止的路径前缀（读也不行）：令牌、用户、配置导入导出、面板级参数
+# 以及三类「等同 root」的能力——网页终端（exec/PTY = 直接 shell）、
+# crontab 写入（= root 计划任务）、apt 应用更新（= 任意新代码以 root 落地）。
+OPERATOR_FORBIDDEN_PREFIXES = (
+    "/api/panel/users",
+    "/api/panel/config",
+    "/api/panel/prefs",
+    "/api/panel/listen",
+    "/api/panel/timezone",
+    "/api/panel/sessions",
+    "/api/panel/audit/export",
+    "/api/panel/logs/trim",
+    "/api/agent",
+    "/api/system/power",
+    "/api/system/self-update",
+    "/api/terminal",
+    "/api/panel/maintenance/cron",
+    "/api/panel/maintenance/updates",
+)
+
+# operator 禁止的“方法与路径正则”组合：Docker 删除、防火墙写、反代重载
+_OPERATOR_FORBIDDEN_ROUTES = (
+    (re.compile(r"^/api/panel/infra/docker/containers/[^/]+$"), ("DELETE",), "Docker 容器删除"),
+    (re.compile(r"^/api/panel/infra/firewall/[^/]+$"), ("POST",), "防火墙规则变更"),
+    (re.compile(r"^/api/panel/infra/proxy/reload$"), ("POST",), "反向代理重载"),
+)
+
+
+def session_username(session: dict | None) -> str:
+    """会话对应的用户名；单密码模式统一视为 admin。"""
+    return str((session or {}).get("username") or ROLE_ADMIN)
+
+
+def resolve_role(session: dict | None) -> str | None:
+    """解析会话的**当前**角色。None 表示账号已删除/禁用，会话应当作无效。"""
+    if session is None:
+        return None
+    if not config.has_users:
+        # 兼容模式：单密码即管理员（历史会话里没有 role 字段也按 admin 处理）
+        role = session.get("role") or ROLE_ADMIN
+        return role if role in ROLE_RANK else ROLE_ADMIN
+    user = config.find_user(session_username(session))
+    if user is None:
+        # users 里没有对应记录：只有内置 admin 保留救援通道（配置被手工改坏、
+        # 或 users 列表被外部工具重写时，仍能用原单密码进面板救场），
+        # 其他账号一律视为已删除。
+        return ROLE_ADMIN if session_username(session) == ROLE_ADMIN else None
+    if user.get("disabled"):
+        return None
+    role = user.get("role")
+    return role if role in ROLE_RANK else ROLE_VIEWER
+
+
+def _attach_role(session: dict) -> dict:
+    """给会话补上当前角色（保留原有字段，只做增量）。"""
+    result = dict(session)
+    result["role"] = resolve_role(session) or ROLE_VIEWER
+    result["username"] = session_username(session)
+    return result
+
+
+def rbac_denial(method: str, path: str, role: str) -> str:
+    """方法级权限判定。返回空串表示放行，否则返回给前端的拒绝原因。"""
+    if role == ROLE_ADMIN:
+        return ""
+    if role == ROLE_VIEWER:
+        if method in ("GET", "HEAD", "OPTIONS"):
+            return ""
+        if any(path.startswith(p) for p in VIEWER_WRITE_ALLOWED_PREFIXES):
+            return ""
+        return "只读账号（viewer）不能执行状态变更操作"
+    if role == ROLE_OPERATOR:
+        for prefix in OPERATOR_FORBIDDEN_PREFIXES:
+            if path == prefix or path.startswith(prefix + "/"):
+                return "该操作仅限管理员（admin）"
+        for pattern, methods, label in _OPERATOR_FORBIDDEN_ROUTES:
+            if method in methods and pattern.match(path):
+                return f"{label}仅限管理员（admin）"
+        return ""
+    return "未知角色，操作被拒绝"
+
+
+def request_denial(request: Request) -> str:
+    """请求级 RBAC 判定（供方法级中间件调用）。"""
+    if not config.has_users:
+        return ""  # 兼容模式：完全沿用单密码逻辑
+    session = sessions.validate(extract_token(request), renew=False)
+    if session is None:
+        return ""  # 未登录交给各端点自己回 401
+    role = resolve_role(session)
+    if role is None:
+        return "账号已被删除或禁用，请重新登录"
+    return rbac_denial(request.method, request.url.path, role)
+
+
+def require_role(min_role: str):
+    """FastAPI 依赖工厂：要求当前会话角色不低于 ``min_role``。"""
+    if min_role not in ROLE_RANK:
+        raise ValueError(f"未知角色：{min_role}")
+
+    async def checker(request: Request) -> dict:
+        session = await require_auth(request)
+        if ROLE_RANK.get(session.get("role"), ROLE_RANK[ROLE_ADMIN]) < ROLE_RANK[min_role]:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                f"该操作需要 {min_role} 及以上权限",
+            )
+        return session
+
+    return checker
 
 
 def client_ip(request: Request | WebSocket) -> str:
@@ -427,11 +588,18 @@ def extract_agent_token(request: Request) -> str | None:
 
 
 async def require_auth(request: Request) -> dict:
-    """FastAPI 依赖：要求已登录，否则 401。"""
+    """FastAPI 依赖：要求已登录，否则 401。
+
+    返回的字典保持既有字段不变（ip/created/expires/label），M4 起额外带
+    ``role`` / ``username``；多用户模式下若账号已被删除或禁用，会话立即失效。
+    """
     session = sessions.validate(extract_token(request))
     if session is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "未登录或会话已过期")
-    return session
+    if config.has_users and resolve_role(session) is None:
+        sessions.revoke(extract_token(request))
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "账号已被删除或禁用，请重新登录")
+    return _attach_role(session)
 
 
 def is_internal() -> bool:
@@ -440,9 +608,7 @@ def is_internal() -> bool:
 
 async def require_internal(request: Request) -> dict:
     """FastAPI 依赖：要求已登录，且当前处于内网模式。"""
-    session = sessions.validate(extract_token(request))
-    if session is None:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "未登录或会话已过期")
+    session = await require_auth(request)
     if config.mode != MODE_INTERNAL:
         raise HTTPException(status.HTTP_403_FORBIDDEN, INTERNAL_HINT)
     return session
@@ -465,7 +631,12 @@ async def require_exec_auth(request: Request) -> dict:
         raise HTTPException(status.HTTP_403_FORBIDDEN, INTERNAL_HINT)
     session = sessions.validate(extract_token(request))
     if session is not None:
-        return {"kind": "session", "ip": client_ip(request)}
+        if config.has_users and resolve_role(session) is None:
+            sessions.revoke(extract_token(request))
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "账号已被删除或禁用，请重新登录")
+        scoped = _attach_role(session)
+        return {"kind": "session", "ip": client_ip(request),
+                "role": scoped["role"], "username": scoped["username"]}
     provided = extract_agent_token(request)
     if provided:
         record = config.find_agent_token(provided)

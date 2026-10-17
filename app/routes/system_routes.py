@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from .. import shell
@@ -16,6 +17,7 @@ from ..audit import AuditEvent, audit
 from ..auth import client_ip, require_auth, require_internal
 from ..config import MODE_INTERNAL, config
 from ..metrics import basic_info, metrics, top_processes
+from ..prefs import prefs
 from ..utils import is_root
 
 router = APIRouter(prefix="/api/system", tags=["system"], dependencies=[Depends(require_auth)])
@@ -43,12 +45,22 @@ async def current_metrics():
     # 采样含 psutil 系统调用，PRoot 上单次可达数百毫秒，绝不能阻塞事件循环
     data = await asyncio.to_thread(metrics.sample)
     data["mode"] = config.mode  # 前端据此实时感知模式变化
+    data["sample_interval"] = 10 if prefs.get("power.save_mode") else 2
     return data
 
 
 @router.get("/history")
-async def history():
-    return {"points": metrics.history_list(), "interval": 2}
+async def history(period: str = "1h"):
+    """历史曲线（2.0 M2）：优先读 SQLite（支持 1h/1d/30d/365d），无数据回落内存。"""
+    from ..metrics_store import RANGES, store
+
+    if period not in RANGES:
+        period = "1h"
+    points = await asyncio.to_thread(store.query, period)
+    if points:
+        return {"points": points, "interval": RANGES[period][1],
+                "source": "sqlite", "range": period}
+    return {"points": metrics.history_list(), "interval": 2, "source": "memory"}
 
 
 @router.get("/processes")
@@ -139,7 +151,7 @@ async def power(body: PowerBody, request: Request):
 
 
 @router.post("/self-update", dependencies=[Depends(require_internal)])
-async def self_update(body: SelfUpdateBody | None = None):
+async def self_update(request: Request, body: SelfUpdateBody | None = None):
     """面板内一键升级。
 
     关键点：更新进程必须脱离本面板的进程组（setsid）——升级流程会重启面板，
@@ -149,8 +161,14 @@ async def self_update(body: SelfUpdateBody | None = None):
     update_cmd = [
         sys.executable, "-m", "app.main", "--update", "--app-dir", str(BASE_DIR),
     ]
+    ref = ""
     if body and body.ref:
-        update_cmd += ["--update-ref", body.ref]
+        ref = body.ref.strip()
+        # 原样进 argv：以 - 开头会被更新器当成选项解析（参数注入），
+        # 换行/空白/超长同样拒绝
+        if not re.fullmatch(r"(?!-)[A-Za-z0-9._/\-]{1,100}", ref):
+            raise HTTPException(400, "升级目标分支/标签名不合法")
+        update_cmd += ["--update-ref", ref]
 
     log_path = BASE_DIR / "panel.log"
     log_fh = open(log_path, "ab")  # O_APPEND，多进程并发写安全
@@ -166,6 +184,9 @@ async def self_update(body: SelfUpdateBody | None = None):
     finally:
         log_fh.close()  # 子进程持有自己的 fd 副本，父进程随即关闭
 
+    # 会改写代码并重启面板的高危动作，必须留审计（此前只有 power/file 类有记录）
+    audit.record(AuditEvent(action="self_update", target=ref or "origin/main",
+                            source="web", ip=client_ip(request)))
     return {
         "ok": True,
         "message": "升级已在后台启动：面板数秒内重启，登录态保持；"

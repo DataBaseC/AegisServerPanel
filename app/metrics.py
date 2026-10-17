@@ -17,13 +17,18 @@ class MetricsSampler:
     """周期性采样并维护一段历史，供前端图表初始化时回填。"""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        # RLock：sample() 串行化后内部还要写 history（同一把锁）
+        self._lock = threading.RLock()
         self._last: tuple[float, object, object] | None = None
         self._sample_count = 0
         self._cached_threads = 0
+        self._cached_processes = 0
+        self._cached_boot = 0.0
         # Android / PRoot 等环境可能屏蔽 /sys/block、/proc/net/dev，
         # 对应计数器读不到时降级为 0 并在快照里标记 io_limited
         self._io_limited = False
+        self._last_energy: tuple[float, float] | None = None
+        self._power_w: float | None = None
         self.history: deque[dict] = deque(maxlen=HISTORY_SIZE)
         # 首次调用只用于初始化基线
         psutil.cpu_percent(interval=None)
@@ -56,7 +61,60 @@ class MetricsSampler:
             rates["net_recv"] = max(0.0, (net.bytes_recv - last_net.bytes_recv) / delta)
         return rates
 
-    def sample(self) -> dict:
+    def _power_watts(self, now: float) -> float | None:
+        """读 Intel RAPL 能量计数器估算整机功耗（2.0 M2）；读不到返回 None。"""
+        try:
+            with open("/sys/class/powercap/intel-rapl:0/energy_uj", encoding="ascii") as fh:
+                micro = float(fh.read().strip())
+        except (OSError, ValueError):
+            return None
+        last = self._last_energy
+        self._last_energy = (now, micro)
+        if last is None:
+            return self._power_w
+        seconds = now - last[0]
+        delta = micro - last[1]
+        if seconds <= 0 or delta < 0:
+            return self._power_w          # 计数器回绕/抖动：保留上一次读数
+        self._power_w = round(delta / 1_000_000 / seconds, 1)
+        return self._power_w
+
+    def _refresh_slow(self) -> None:
+        """刷新代价高的系统级数据（进程表 / 线程数 / 开机时间）。
+
+        进程表遍历在 PRoot/Android 上每个 /proc 访问都是慢调用（实测数秒），
+        因此只在第一次和每 10 次采样时刷新；其余采样复用上次结果。
+        """
+        self._sample_count += 1
+        first = self._sample_count == 1
+        if not (first or self._sample_count % 10 == 1):
+            return
+        if self._io_limited and not first:
+            return
+        try:
+            self._cached_processes = len(psutil.pids())
+        except (OSError, psutil.Error):
+            pass
+        boot = self._safe(psutil.boot_time, None)
+        if boot:
+            self._cached_boot = boot      # 开机时间在进程生命周期内恒定，缓存即可
+        try:
+            self._cached_threads = sum(
+                p.info["num_threads"]
+                for p in psutil.process_iter(["num_threads"])
+                if p.info["num_threads"]
+            )
+        except (OSError, psutil.Error):
+            pass
+
+    def sample(self, persist: bool = False) -> dict:
+        # 采样线程与 HTTP 路由（to_thread）会并发调用：``_last`` 速率基线、
+        # psutil.cpu_percent 的进程级状态、能量计数器都会被同时改写，
+        # 表现为速率 0/翻倍、CPU 读数跳变。在 to_thread 里串行化成本可忽略。
+        with self._lock:
+            return self._sample_locked(persist)
+
+    def _sample_locked(self, persist: bool) -> dict:
         now = time.time()
         cpu_total = psutil.cpu_percent(interval=None)
         cpu_per_core = psutil.cpu_percent(interval=None, percpu=True)
@@ -67,16 +125,7 @@ class MetricsSampler:
         # 线程总数需要遍历整个进程表：在 PRoot 上每个 /proc 访问都是 ptrace 慢速
         # 调用，300 进程要数秒——io 受限（Android/PRoot）或首次采样直接跳过，
         # 否则采样线程会饿死整个事件循环（实测教训）。
-        self._sample_count += 1
-        if not self._io_limited and self._sample_count > 1 and self._sample_count % 10 == 1:
-            try:
-                self._cached_threads = sum(
-                    p.info["num_threads"]
-                    for p in psutil.process_iter(["num_threads"])
-                    if p.info["num_threads"]
-                )
-            except (OSError, psutil.Error):
-                pass
+        self._refresh_slow()
 
         try:
             load = list(psutil.getloadavg())
@@ -103,7 +152,7 @@ class MetricsSampler:
             temps = []
 
         disk_usage = self._safe(lambda: psutil.disk_usage("/"))
-        boot = self._safe(psutil.boot_time, 0.0)
+        boot = self._cached_boot          # 开机时间已缓存（见 _refresh_slow）
         snapshot = {
             "time": now,
             "io_limited": self._io_limited,
@@ -131,9 +180,10 @@ class MetricsSampler:
             "net": {k: round(v) for k, v in rates.items() if k.startswith("net")},
             "load": [round(v, 2) for v in load],
             "uptime": int(now - boot) if boot else 0,
-            "processes": len(self._safe(psutil.pids, [])),
+            "processes": self._cached_processes,
             "threads": self._cached_threads,
             "temps": temps,
+            "power_w": self._power_watts(now),
         }
         with self._lock:
             self.history.append({
@@ -145,6 +195,10 @@ class MetricsSampler:
                 "disk_read": snapshot["disk"]["disk_read"],
                 "disk_write": snapshot["disk"]["disk_write"],
             })
+        if persist:
+            from .metrics_store import store
+
+            store.append(snapshot)
         return snapshot
 
     def history_list(self) -> list[dict]:

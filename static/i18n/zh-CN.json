@@ -1,0 +1,64 @@
+{
+  "locale": "zh-CN",
+  "nav": {
+    "overview": "概览",
+    "performance": "性能监控",
+    "terminal": "网页终端",
+    "apps": "常驻应用",
+    "market": "应用市场",
+    "logs": "控制台 / 日志",
+    "storage": "存储空间",
+    "processes": "进程管理",
+    "services": "服务管理",
+    "ops": "运维",
+    "apps-port": "应用与端口",
+    "files": "文件管理",
+    "agent": "Agent 接入",
+    "security": "安全中心",
+    "settings": "设置"
+  },
+  "view": {
+    "overview": "概览",
+    "performance": "性能监控",
+    "terminal": "网页终端",
+    "apps": "常驻应用",
+    "market": "应用市场",
+    "logs": "控制台 / 日志",
+    "storage": "存储空间",
+    "processes": "进程管理",
+    "services": "服务管理",
+    "ops": "运维",
+    "apps-port": "应用与端口",
+    "files": "文件管理",
+    "agent": "Agent 接入",
+    "security": "安全中心",
+    "settings": "设置"
+  },
+  "btn": {
+    "refresh": "刷新",
+    "save": "保存",
+    "cancel": "取消",
+    "ok": "确定",
+    "delete": "删除",
+    "create": "创建",
+    "login": "登录",
+    "logout": "退出登录",
+    "search": "搜索",
+    "close": "关闭",
+    "copy": "复制",
+    "install": "一键注册",
+    "docs": "文档"
+  },
+  "login": {
+    "password": "面板密码",
+    "username": "用户名（留空 = 内置 admin）",
+    "submit": "登录",
+    "totp": "二次验证码"
+  },
+  "common": {
+    "loading": "加载中…",
+    "empty": "暂无数据",
+    "console": "系统控制台",
+    "connected": "已连接"
+  }
+}

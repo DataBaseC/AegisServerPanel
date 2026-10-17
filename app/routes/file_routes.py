@@ -8,11 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import ipaddress
+import errno
 import os
 import re
 import shutil
-import socket
 import stat
 import sys
 import tarfile
@@ -31,7 +30,7 @@ from pydantic import BaseModel
 from .. import shell
 from ..audit import AuditEvent, audit
 from ..auth import client_ip, require_internal
-from ..config import config
+from ..ssrf import assert_url_allowed
 from ..trash import trash
 
 # 文件管理涉及读写、上传、删除，仅在内网模式开放
@@ -46,6 +45,7 @@ PROTECTED = {
 EDIT_LIMIT = 2 * 1024 * 1024  # 在线编辑上限 2MB
 ARCHIVE_PREFIX = "serverpanel-"
 ARCHIVE_STALE_SECONDS = 3600  # 进程崩溃遗留的打包临时目录，超过 1 小时后清扫
+ARCHIVE_MAX_BYTES = 1024 ** 3  # 批量打包单次总体积上限（1GiB），防止一次请求写满临时分区
 FETCH_CHUNK = 256 * 1024
 FETCH_MAX_BYTES = 1024 * 1024 * 1024  # 单个远程文件上限 1GB
 FETCH_TIMEOUT = 30                    # 远程拉取的连接/读超时（秒）
@@ -96,6 +96,35 @@ def _abs(path: str) -> str:
         return os.path.abspath(path)
     except ValueError:  # 路径里混入 NUL 字节等非法内容
         raise HTTPException(400, "路径不合法")
+
+
+def _validate_write_target(path: str) -> None:
+    """写盘前的目标校验：目录、符号链接都拒绝（2.0 M1 / P1-7）。"""
+    if os.path.isdir(path):
+        raise HTTPException(400, "目标是一个目录")
+    if os.path.islink(path):
+        # 编辑一个链接会让写入落到链路目标（可能是 /etc/shadow）
+        raise HTTPException(400, "目标是符号链接，拒绝写入（请先删除链接或直接编辑目标文件）")
+
+
+def _safe_write(path: str, content: str) -> None:
+    """写盘时拒绝跟随符号链接（2.0 M1 / P1-7）。
+
+    父目录先取 ``realpath``（路径中间的正常目录链接仍可解析），最终文件用
+    ``O_NOFOLLOW`` 打开：即使"检查是否为链接"与"打开"之间被换成链接，
+    内核也会拒绝，从而堵住 TOCTOU。
+    """
+    parent = os.path.realpath(os.path.dirname(path) or "/")
+    target = os.path.join(parent, os.path.basename(path))
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(target, flags, 0o644)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.ELOOP:
+            raise HTTPException(400, "目标是符号链接，拒绝写入（请先删除链接或直接编辑目标文件）")
+        raise
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(content)
 
 
 def cleanup_stale_archives() -> None:
@@ -172,30 +201,51 @@ async def roots():
     }
 
 
+# 单次目录列举最多返回的条目数。几万条目的目录（/usr/lib、node_modules）一次性
+# 序列化并渲染会同时打爆后端内存与前端 DOM，超出部分截断并在响应里标明。
+DIR_LIST_LIMIT = 5000
+
+
 @router.get("/list")
-async def list_dir(path: str = "/", show_hidden: bool = True):
+async def list_dir(path: str = "/", show_hidden: bool = True, limit: int = DIR_LIST_LIMIT):
     full = _abs(path)
     if not os.path.exists(full):
         raise HTTPException(404, "路径不存在")
     if not os.path.isdir(full):
         raise HTTPException(400, "路径不是目录")
-    try:
+    limit = max(1, min(limit, DIR_LIST_LIMIT))
+
+    def _scan() -> tuple[list[dict], dict | None]:
         names = os.listdir(full)
+        entries = [_entry(full, n) for n in names]
+        try:
+            usage = shutil.disk_usage(full)
+            disk = {"total": usage.total, "used": usage.used, "free": usage.free}
+        except OSError:
+            disk = None
+        return entries, disk
+
+    try:
+        # listdir + 每条 lstat + disk_usage 全是同步系统调用：几万条目的目录
+        # 或慢速 NFS 上会阻塞事件循环数秒，期间整站（含 WebSocket）停摆
+        entries, disk = await asyncio.to_thread(_scan)
     except PermissionError:
         raise HTTPException(403, "没有权限读取该目录")
+    except OSError as exc:
+        raise HTTPException(500, f"读取目录失败: {exc}")
 
-    entries = [_entry(full, n) for n in names]
     if not show_hidden:
         entries = [e for e in entries if not e["name"].startswith(".")]
     entries.sort(key=lambda e: (not e.get("is_dir", False), e["name"].lower()))
 
+    total = len(entries)
+    truncated = total > limit
+    if truncated:
+        entries = entries[:limit]
+
     parent = os.path.dirname(full.rstrip("/")) or "/"
-    try:
-        usage = shutil.disk_usage(full)
-        disk = {"total": usage.total, "used": usage.used, "free": usage.free}
-    except OSError:
-        disk = None
-    return {"path": full, "parent": parent, "entries": entries, "disk": disk}
+    return {"path": full, "parent": parent, "entries": entries, "disk": disk,
+            "total": total, "truncated": truncated}
 
 
 @router.get("/stat")
@@ -233,8 +283,7 @@ async def read_file(path: str, max_bytes: int = EDIT_LIMIT):
 @router.post("/write")
 async def write_file(body: WriteBody, request: Request):
     full = _abs(body.path)
-    if os.path.isdir(full):
-        raise HTTPException(400, "目标是一个目录")
+    _validate_write_target(full)
     if len(body.content.encode()) > EDIT_LIMIT:
         raise HTTPException(413, "内容过大，请改用上传方式")
     if body.expected_mtime is not None and os.path.exists(full):
@@ -266,8 +315,7 @@ async def write_file(body: WriteBody, request: Request):
 
     def _save() -> None:
         os.makedirs(os.path.dirname(full) or "/", exist_ok=True)
-        with open(full, "w", encoding="utf-8") as fh:
-            fh.write(body.content)
+        _safe_write(full, body.content)
 
     try:
         await asyncio.to_thread(_save)  # 写盘不阻塞事件循环
@@ -402,7 +450,13 @@ async def download(background: BackgroundTasks, path: str = Query(...)):
     normalized = os.path.abspath(full).rstrip("/") or "/"
     if normalized in PROTECTED or os.path.dirname(normalized) == normalized:
         raise HTTPException(400, f"{normalized} 是系统关键目录或文件系统根，请进入子目录逐级下载")
-    # 打包可能耗时较长，放线程池执行，避免阻塞事件循环拖死整个面板
+    # 打包可能耗时较长，放线程池执行，避免阻塞事件循环拖死整个面板。
+    # 先用与批量打包相同的 1GiB 上限预检：否则对 /home、/var/lib 点一次下载
+    # 就会在 /tmp 生成同体积 zip，把临时分区写满（批量打包也有同样限制）。
+    size = await asyncio.to_thread(_path_size, full, ARCHIVE_MAX_BYTES)
+    if size > ARCHIVE_MAX_BYTES:
+        raise HTTPException(
+            400, f"目录体积超过单次下载上限 {ARCHIVE_MAX_BYTES // (1024 ** 2)}MB，请进入子目录分批下载")
     tmp_dir = tempfile.mkdtemp(prefix=ARCHIVE_PREFIX)
     archive_base = os.path.join(tmp_dir, os.path.basename(normalized) or "root")
     try:
@@ -415,6 +469,169 @@ async def download(background: BackgroundTasks, path: str = Query(...)):
     # FileResponse 发送完毕后删除临时目录；进程中途被杀时由 cleanup_stale_archives 兜底
     background.add_task(_rmtree_quiet, tmp_dir)
     return FileResponse(archive, filename=os.path.basename(archive), media_type="application/zip")
+
+
+# ---------------------------------------------------------------- 批量移动 / 打包（1.6.0 F2）
+
+
+class MoveBody(BaseModel):
+    paths: list[str]
+    dest: str
+
+
+class ArchiveBody(BaseModel):
+    paths: list[str]
+
+
+def _path_size(path: str, limit: int) -> int:
+    """单个路径的字节数；目录累加文件大小，超过 ``limit`` 立即停止。"""
+    if os.path.islink(path) or not os.path.isdir(path):
+        try:
+            return os.lstat(path).st_size
+        except OSError:
+            return 0
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                continue
+            if total > limit:
+                return total
+    return total
+
+
+def _tree_size(paths: list[str], limit: int) -> int:
+    """估算多个路径的总字节数，超过 ``limit`` 立即返回（不为拒绝大目录走完整棵树）。"""
+    total = 0
+    for path in paths:
+        total += _path_size(path, limit)
+        if total > limit:
+            return total
+    return total
+
+
+def _collect_archive_paths(paths: list[str]) -> list[tuple[str, str]]:
+    """校验待打包路径并分配 zip 内的条目名（同名自动加序号）。"""
+    selected: list[tuple[str, str]] = []
+    used: set[str] = set()
+    for raw in paths:
+        full = _abs(raw)
+        normalized = os.path.abspath(full).rstrip("/") or "/"
+        if normalized in PROTECTED or os.path.dirname(normalized) == normalized:
+            raise HTTPException(400, f"{normalized} 是系统关键目录或文件系统根，禁止打包")
+        if not os.path.lexists(full):
+            raise HTTPException(404, f"路径不存在：{full}")
+        base = os.path.basename(normalized) or "root"
+        name, index = base, 1
+        while name in used:
+            index += 1
+            name = f"{base} ({index})"
+        used.add(name)
+        selected.append((full, name))
+    return selected
+
+
+def _add_to_zip(bundle: zipfile.ZipFile, full: str, arcname: str) -> None:
+    """把单个文件/目录加入 zip；符号链接一律跳过（不跟随到链路之外）。"""
+    if os.path.islink(full):
+        return
+    if os.path.isfile(full):
+        bundle.write(full, arcname)
+        return
+    for root, _dirs, files in os.walk(full):
+        for name in files:
+            src = os.path.join(root, name)
+            if os.path.islink(src):
+                continue
+            bundle.write(src, os.path.join(arcname, os.path.relpath(src, full)))
+
+
+def _pack_archive(selected: list[tuple[str, str]]) -> tuple[str, str]:
+    """在线程池里执行的实际打包；失败时清掉半成品临时目录。"""
+    tmp_dir = tempfile.mkdtemp(prefix=ARCHIVE_PREFIX)
+    target = os.path.join(tmp_dir, f"batch-{time.strftime('%Y%m%d-%H%M%S')}.zip")
+    try:
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as bundle:
+            for full, arcname in selected:
+                _add_to_zip(bundle, full, arcname)
+    except OSError:
+        _rmtree_quiet(tmp_dir)
+        raise
+    return tmp_dir, target
+
+
+@router.post("/move")
+async def move(body: MoveBody, request: Request):
+    """批量移动到目标目录：部分成功语义，逐条返回成功/失败明细（与 /delete 一致）。"""
+    if not body.paths:
+        raise HTTPException(400, "未指定要移动的路径")
+    dest = _abs(body.dest)
+    if not os.path.isdir(dest):
+        raise HTTPException(400, "目标必须是已存在的目录")
+
+    def _move() -> tuple[list, list]:
+        moved, failed = [], []
+        for item in body.paths:
+            full = _abs(item)
+            try:
+                _guard_delete(full)          # 系统关键目录本身禁止操作
+                if not os.path.lexists(full):
+                    failed.append({"path": full, "error": "不存在"})
+                    continue
+                target = os.path.join(dest, os.path.basename(full.rstrip("/")))
+                if os.path.lexists(target):
+                    failed.append({"path": full, "error": "目标位置已存在同名项"})
+                    continue
+                shutil.move(full, target)     # 跨设备退化为复制 + 删除
+                moved.append(full)
+            except HTTPException as exc:
+                failed.append({"path": full, "error": exc.detail})
+            except OSError as exc:
+                failed.append({"path": full, "error": str(exc)})
+        return moved, failed
+
+    moved, failed = await asyncio.to_thread(_move)  # 大目录移动可能跨盘复制
+    audit.record(AuditEvent(
+        action="file_move",
+        target=dest,
+        summary=f"移动 {len(moved)} 项到 {dest}"
+                + (f"，{len(failed)} 项失败" if failed else ""),
+        source="web",
+        ip=client_ip(request),
+        ok=not failed,
+    ))
+    return {"ok": not failed, "moved": moved, "failed": failed,
+            "message": f"已移动 {len(moved)} 项到 {dest}"
+                       + (f"，{len(failed)} 项失败" if failed else "")}
+
+
+@router.post("/archive")
+async def archive(body: ArchiveBody, background: BackgroundTasks, request: Request):
+    """把选中的多个文件/目录打包成一个 zip 下载（1.6.0 F2）。"""
+    if not body.paths:
+        raise HTTPException(400, "未指定要打包的路径")
+    selected = _collect_archive_paths(body.paths)
+    total = await asyncio.to_thread(_tree_size, [p for p, _ in selected], ARCHIVE_MAX_BYTES)
+    if total > ARCHIVE_MAX_BYTES:
+        raise HTTPException(
+            400, f"选中内容超过单次打包上限 {ARCHIVE_MAX_BYTES // (1024 ** 2)}MB")
+
+    try:
+        tmp_dir, archive_path = await asyncio.to_thread(_pack_archive, selected)
+    except OSError as exc:
+        raise HTTPException(500, f"打包失败: {exc}")
+    background.add_task(_rmtree_quiet, tmp_dir)
+    audit.record(AuditEvent(
+        action="file_archive",
+        target=", ".join(name for _, name in selected)[:1024],
+        summary=f"打包 {len(selected)} 项",
+        source="web",
+        ip=client_ip(request),
+    ))
+    return FileResponse(archive_path, filename=os.path.basename(archive_path),
+                        media_type="application/zip")
 
 
 @router.post("/upload")
@@ -582,17 +799,30 @@ def _extract(source: str, dest: str) -> int:
     lower = source.lower()
     if lower.endswith(".zip"):
         with zipfile.ZipFile(source) as bundle:
+            members = bundle.infolist()
+            # 解压前按声明体积预检：1MB 的压缩包解出几十 GB 足以写满磁盘
+            total = sum(item.file_size for item in members)
+            if total > ARCHIVE_MAX_BYTES:
+                raise HTTPException(
+                    400, f"解压后体积约 {total // (1024 ** 2)}MB，超过单次上限 "
+                         f"{ARCHIVE_MAX_BYTES // (1024 ** 2)}MB，已拒绝")
             # CPython 的 zipfile 自带成员路径清洗（去盘符、去绝对路径、去 ..）
             bundle.extractall(dest)
-            return len(bundle.namelist())
+            return len(members)
     base = os.path.realpath(dest)
     count = 0
     try:
         with tarfile.open(source, "r:*") as bundle:
+            members = bundle.getmembers()
+            total = sum(member.size for member in members if member.isfile())
+            if total > ARCHIVE_MAX_BYTES:
+                raise HTTPException(
+                    400, f"解压后体积约 {total // (1024 ** 2)}MB，超过单次上限 "
+                         f"{ARCHIVE_MAX_BYTES // (1024 ** 2)}MB，已拒绝")
             if sys.version_info >= (3, 12):
                 # 3.12+ 官方安全过滤器：越界链接 / 设备文件 / 绝对路径会被拒绝并抛 FilterError
                 bundle.extractall(dest, filter="data")
-                return len(bundle.getmembers())
+                return len(members)
             safe = []
             for member in bundle.getmembers():
                 parts = Path(member.name).parts
@@ -627,6 +857,9 @@ async def extract(body: PathBody, request: Request):
     os.makedirs(dest)
     try:
         count = await asyncio.to_thread(_extract, source, dest)
+    except HTTPException:
+        shutil.rmtree(dest, ignore_errors=True)  # 体积超限等主动拒绝：同样清理现场
+        raise
     except (zipfile.BadZipFile, tarfile.TarError, OSError) as exc:
         shutil.rmtree(dest, ignore_errors=True)  # 解压失败不留半个目录
         raise HTTPException(500, f"解压失败: {exc}")
@@ -639,65 +872,9 @@ async def extract(body: PathBody, request: Request):
 
 # ---------------------------------------------------------------- 远程拉取
 
-# SSRF 防护（1.4.0）：默认拒绝解析到私网/回环/链路本地的目标。
-# 面板以 root 运行， unrestricted fetch 可被用作探测/读取内网服务
-# （含云元数据 169.254.169.254）的跳板，且响应会落盘成文件可被读回。
-_BLOCKED_NETS = [
-    ipaddress.ip_network("0.0.0.0/8"),
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("100.64.0.0/10"),      # CGNAT
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("169.254.0.0/16"),     # 链路本地 / 云元数据
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.0.0.0/24"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),           # IPv6 唯一本地
-    ipaddress.ip_network("fe80::/10"),          # IPv6 链路本地
-]
-
-
-def _ip_blocked(ip_text: str) -> bool:
-    try:
-        addr = ipaddress.ip_address(ip_text)
-    except ValueError:
-        return True  # 解析不出来的地址一律按拒绝处理
-    if addr.is_link_local or addr.is_loopback or addr.is_unspecified or addr.is_multicast:
-        return True
-    return any(addr in net for net in _BLOCKED_NETS)
-
-
-def _assert_url_allowed(url: str) -> None:
-    """URL 级 SSRF 校验：协议白名单 + 主机名解析后不得落入私网。
-
-    配置 ``fetch_allow_private=true`` 可显式放行内网目标（内网运维场景）。
-
-    **残余风险（1.4.1 起如实标注）**：这里是"解析→校验→交给 urllib 连接"，
-    连接时 urllib 会**重新解析一次域名**，因此理论上存在 DNS rebinding 的
-    TOCTOU 窗口；本函数不再声称"防住 rebinding"。真正消除它需要把连接
-    固定到已校验的 IP（自定义 opener / 直连 IP + Host 头），代价与收益
-    不成比例，这里只做"DNS 层拦截 + 重定向逐跳复核"。
-    """
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise HTTPException(400, "仅支持 http/https 直链")
-    host = parsed.hostname or ""
-    if not host:
-        raise HTTPException(400, "URL 缺少主机名")
-    try:
-        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80),
-                                   proto=socket.IPPROTO_TCP)
-    except socket.gaierror as exc:
-        raise HTTPException(400, f"无法解析主机名 {host}: {exc}")
-    addresses = {info[4][0] for info in infos}
-    if not addresses:
-        raise HTTPException(400, f"无法解析主机名 {host}")
-    if config.fetch_allow_private:
-        return
-    for address in addresses:
-        if _ip_blocked(address):
-            raise HTTPException(400, f"目标地址 {address} 属于内网/回环/链路本地地址，"
-                                     f"已被 SSRF 防护拦截（可在配置中放行私网）")
+# SSRF 判定已抽到 app/ssrf.py（1.6.0 F1）：文件远程拉取与事件通知共用同一套实现。
+# 保留模块内别名，避免 _fetch_sync 的调用点与既有测试被打散。
+_assert_url_allowed = assert_url_allowed
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):

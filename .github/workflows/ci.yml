@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 升级链路会用这份清单做完整性校验（2.0 M1），提交前必须与工作树一致
+      - name: 校验代码完整性清单
+        run: python3 tools/gen_sha256sums.py --check
+
+      # 运行期依赖按仓库既有的锁定组合安装；httpx2 是 starlette TestClient 的
+      # 测试期依赖（仓库 requirements.txt 只登记运行期直接依赖，测试依赖在此补装）。
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -c constraints.txt httpx2
+
+      - name: 单元测试
+        run: python -m pytest -q
+
+      - name: 前端语法检查
+        run: node --check static/app.js
+
+  audit:
+    # 依赖漏洞扫描（2.0 M1 / P1-9）：pip-audit 只在 CI 里跑，不进运行时依赖
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 依赖漏洞扫描
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit -r requirements.txt
+
+# 冒烟测试（Playwright，tests/smoke_frontend.py）不进 CI：
+# 它依赖真实浏览器与真实系统环境（pty 终端、systemd/服务管理、可写的
+# /etc/serverpanel 与 /var/lib 等），在标准 GitHub runner 上不稳定也缺乏意义；
+# 冒烟保持在发布前于真机手动执行：
+#   bash tests/smoke_reset.sh && python3 tests/smoke_frontend.py

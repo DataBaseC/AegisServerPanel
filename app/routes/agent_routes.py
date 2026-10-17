@@ -117,7 +117,8 @@ async def create_token(body: CreateTokenBody, request: Request,
     try:
         token = config.create_agent_token(
             name=body.name, scope=body.scope, prefixes=body.prefixes,
-            expires_days=body.expires_days, note=body.note)
+            expires_days=body.expires_days, note=body.note,
+            token=custom or None)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     audit.record(AuditEvent(

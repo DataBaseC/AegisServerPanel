@@ -8,6 +8,53 @@ const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
 const S = String;
 
+/* ============================ i18n ============================ */
+// 框架 + 基础覆盖（2.0 M4）：导航、视图标题与常见按钮走字典，业务文案按需
+// 逐步补——未命中的键一律回退中文，界面不会出现空字符串或 key 本身。
+const I18N = {
+  locale: 'zh-CN',
+  dict: {},
+
+  async load(locale) {
+    const wanted = locale === 'en-US' ? 'en-US' : 'zh-CN';
+    try {
+      const res = await fetch(`/static/i18n/${wanted}.json`, { credentials: 'same-origin' });
+      if (!res.ok) throw new Error(String(res.status));
+      this.dict = await res.json();
+      this.locale = wanted;
+    } catch (err) {
+      this.dict = {};
+      this.locale = 'zh-CN';
+    }
+    try { localStorage.setItem('sp-locale', this.locale); } catch (err) { /* 隐私模式忽略 */ }
+    return this.locale;
+  },
+
+  t(key, fallback = '') {
+    const hit = S(key).split('.').reduce(
+      (node, part) => (node && typeof node === 'object' && part in node ? node[part] : undefined),
+      this.dict,
+    );
+    return S(hit === undefined || hit === null || hit === '' ? (fallback || key) : hit);
+  },
+
+  /** 把 data-i18n / data-i18n-placeholder 应用到静态 DOM（只翻译，不重绘）。 */
+  apply(root = document) {
+    $$('[data-i18n]', root).forEach((el) => {
+      el.textContent = this.t(el.dataset.i18n, el.textContent);
+    });
+    $$('[data-i18n-placeholder]', root).forEach((el) => {
+      el.placeholder = this.t(el.dataset.i18nPlaceholder, el.placeholder);
+    });
+  },
+};
+
+// 当前登录账号（2.0 M4）：单密码模式下角色恒为 admin、用户名恒为 admin，
+// 因此下面这些判断在兼容模式下永远等价于"全部允许"。
+let authUser = { username: 'admin', role: 'admin', multiUser: false };
+const isAdmin = () => authUser.role === 'admin';
+const canOperate = () => authUser.role === 'admin' || authUser.role === 'operator';
+
 function esc(value) {
   return S(value ?? '').replace(/[&<>"']/g, (c) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
@@ -90,7 +137,7 @@ function toast(message, type = 'ok', timeout = 3400) {
 
 let modalStack = [];
 
-function openModal({ title, body, footer, size = '', onEscape = null }) {
+function openModal({ title, body, footer, size = '', onEscape = null, onClose = null }) {
   const root = $('#modal-root');
   const overlay = document.createElement('div');
   overlay.className = 'modal';
@@ -115,13 +162,21 @@ function openModal({ title, body, footer, size = '', onEscape = null }) {
     else footEl.appendChild(footer);
   }
   root.appendChild(overlay);
+  let closed = false;
   const handle = {
     overlay, body: bodyEl, foot: $('.modal-foot', overlay),
     // ESC 语义由调用方定：对话框走「取消」（resolve 出值），普通弹窗直接关闭
     escape: onEscape || (() => handle.close()),
     close() {
+      if (closed) return;
+      closed = true;
       overlay.remove();
       modalStack = modalStack.filter((m) => m !== handle);
+      // 任何关闭路径（✕ / 遮罩 / Esc / 主动调用）都要回收资源：
+      // 回放定时器、上传轮询等曾只在某个路径清理，导致对话框关了还在跑
+      if (onClose) {
+        try { onClose(); } catch (err) { /* 关闭回调不允许影响关闭本身 */ }
+      }
     },
   };
   modalStack.push(handle);
@@ -207,8 +262,9 @@ function setOfflineBanner(show) {
   banner.style.display = show ? 'block' : 'none';
 }
 
-async function request(method, url, payload, isForm = false, timeoutMs = 120000) {
+async function request(method, url, payload, isForm = false, timeoutMs = 120000, extraHeaders = null) {
   const options = { method, headers: {}, credentials: 'same-origin' };
+  if (extraHeaders) Object.assign(options.headers, extraHeaders);
   if (payload !== undefined && payload !== null) {
     if (isForm) {
       options.body = payload;
@@ -251,12 +307,29 @@ async function request(method, url, payload, isForm = false, timeoutMs = 120000)
   return data;
 }
 
+/** 高危操作的服务端确认令牌（2.0）：2 分钟有效、绑定动作。 */
+async function confirmToken(action) {
+  const res = await request('POST', '/api/panel/confirm', { action });
+  return res.token;
+}
+
 const api = {
   get: (url, timeoutMs) => request('GET', url, undefined, false, timeoutMs || 120000),
   post: (url, body, timeoutMs) => request('POST', url, body, false, timeoutMs || 120000),
   put: (url, body, timeoutMs) => request('PUT', url, body, false, timeoutMs || 120000),
   del: (url, timeoutMs) => request('DELETE', url, undefined, false, timeoutMs || 120000),
+  // 需要请求体的 DELETE（如删除某一行 SSH 公钥）
+  delBody: (url, body, timeoutMs) => request('DELETE', url, body, false, timeoutMs || 120000),
   upload: (url, formData, timeoutMs) => request('POST', url, formData, true, timeoutMs || 600000),
+  postConfirmed: async (url, body, action, timeoutMs) =>
+    request('POST', url, body, false, timeoutMs || 120000,
+            { 'X-Confirm-Token': await confirmToken(action) }),
+  delConfirmed: async (url, action, timeoutMs) =>
+    request('DELETE', url, undefined, false, timeoutMs || 120000,
+            { 'X-Confirm-Token': await confirmToken(action) }),
+  uploadConfirmed: async (url, formData, action, timeoutMs) =>
+    request('POST', url, formData, true, timeoutMs || 600000,
+            { 'X-Confirm-Token': await confirmToken(action) }),
 };
 
 /* ============================ 折线图 ============================ */
@@ -271,14 +344,32 @@ class Chart {
     this.fmt = opts.fmt || ((v) => S(Math.round(v)));
     this.data = [];
     canvas.style.height = `${this.height}px`;
-    this.observer = new ResizeObserver(() => this.draw());
-    this.observer.observe(canvas);
+    // 宽度只在尺寸变化时读一次并缓存：draw 里再读 clientWidth 会在每次
+    // push（每 2 秒 × 8 个图）都强制一次同步布局
+    this.width = canvas.clientWidth || 300;
+    if (window.ResizeObserver) {
+      this.observer = new ResizeObserver(() => {
+        this.width = canvas.clientWidth || 300;
+        this.draw();
+      });
+      this.observer.observe(canvas);
+    } else {
+      // Safari 13 / 旧 Android WebView 没有 ResizeObserver：
+      // 直接抛错会让整个概览/性能视图渲染失败，退化为 window.resize
+      this.observer = null;
+      this._onResize = () => {
+        this.width = canvas.clientWidth || 300;
+        this.draw();
+      };
+      window.addEventListener('resize', this._onResize);
+    }
   }
 
   push(values) {
     this.data.push(values.map(Number));
     while (this.data.length > this.capacity) this.data.shift();
-    this.draw();
+    // 后台标签页不重绘（2.0 能耗优化）：数据照常累积，切回前台后下一次 push 会补画
+    if (!document.hidden) this.draw();
   }
 
   load(points, pick) {
@@ -286,11 +377,14 @@ class Chart {
     this.draw();
   }
 
-  destroy() { this.observer.disconnect(); }
+  destroy() {
+    if (this.observer) this.observer.disconnect();
+    else if (this._onResize) window.removeEventListener('resize', this._onResize);
+  }
 
   draw() {
     const canvas = this.canvas;
-    const width = canvas.clientWidth || 300;
+    const width = this.width || canvas.clientWidth || 300;
     const height = this.height;
     const dpr = window.devicePixelRatio || 1;
     canvas.width = Math.max(1, Math.round(width * dpr));
@@ -413,15 +507,17 @@ const views = {};
 const NAV = [
   { id: 'overview', label: '概览', icon: '▤' },
   { id: 'performance', label: '性能监控', icon: '◉' },
-  { id: 'terminal', label: '网页终端', icon: '▶', internalOnly: true },
+  { id: 'terminal', label: '网页终端', icon: '▶', internalOnly: true, adminOnly: true },
   { id: 'apps', label: '常驻应用', icon: '⏱', internalOnly: true },
+  { id: 'market', label: '应用市场', icon: '⌸', internalOnly: true },
   { id: 'logs', label: '控制台 / 日志', icon: '☰' },
   { id: 'storage', label: '存储空间', icon: '⛁' },
   { id: 'processes', label: '进程管理', icon: '⚙' },
   { id: 'services', label: '服务管理', icon: '⏻' },
+  { id: 'ops', label: '运维', icon: '⛭', internalOnly: true },
   { id: 'apps-port', label: '应用与端口', icon: '⧉', internalOnly: true },
   { id: 'files', label: '文件管理', icon: '▦', internalOnly: true },
-  { id: 'agent', label: 'Agent 接入', icon: '⌘', internalOnly: true },
+  { id: 'agent', label: 'Agent 接入', icon: '⌘', internalOnly: true, adminOnly: true },
   { id: 'security', label: '安全中心', icon: '◈', internalOnly: true },
   { id: 'settings', label: '设置', icon: '⚒' },
 ];
@@ -435,7 +531,10 @@ let appMode = 'public';
 const isInternal = () => appMode === 'internal';
 
 function visibleNav() {
-  return NAV.filter((item) => !item.internalOnly || isInternal());
+  return NAV
+    .filter((item) => (!item.internalOnly || isInternal())
+      && (!item.adminOnly || isAdmin()))
+    .map((item) => ({ ...item, label: I18N.t(`nav.${item.id}`, item.label) }));
 }
 
 function renderModeBadge() {
@@ -509,8 +608,9 @@ function renderTabs() {
   if (!bar) return;
   bar.innerHTML = openTabs.map((id) => {
     const item = NAV.find((n) => n.id === id) || { label: id, icon: '' };
+    const label = I18N.t(`nav.${id}`, item.label);
     return `<button class="tab${id === currentView ? ' active' : ''}" data-tab="${id}">
-      <span class="tab-ico">${item.icon}</span><span class="tab-label">${esc(item.label)}</span>
+      <span class="tab-ico">${item.icon}</span><span class="tab-label">${esc(label)}</span>
       <span class="tab-close" data-close="${id}" title="关闭标签">×</span></button>`;
   }).join('');
 }
@@ -596,7 +696,7 @@ async function navigate(id) {
   currentView = viewId;
   location.hash = `#/${viewId}`;
   renderTabs();
-  $('#page-title').textContent = def.title;
+  $('#page-title').textContent = I18N.t(`view.${viewId}`, def.title);
   $$('#nav .nav-item').forEach((el) => el.classList.toggle('active', el.dataset.id === viewId));
   const host = $('#view');
   // 清掉上个视图挂在容器上的事件属性与残留监听，避免旧闭包跨视图继续收事件
@@ -649,12 +749,17 @@ function showLogin(expired = false) {
   $('#app').classList.add('hidden');
   $('#login-screen').classList.remove('hidden');
   const initialized = authState.initialized;
-  $('#login-label').textContent = initialized ? '面板密码' : '设置面板密码';
-  $('#login-submit').textContent = initialized ? '登录' : '设置密码并登录';
+  $('#login-label').textContent = initialized
+    ? I18N.t('login.password', '面板密码') : '设置面板密码';
+  $('#login-submit').textContent = initialized
+    ? I18N.t('btn.login', '登录') : '设置密码并登录';
   $('#confirm-field').classList.toggle('hidden', initialized);
   $('#login-password').setAttribute('autocomplete', initialized ? 'current-password' : 'new-password');
+  // 多用户（2.0 M4）：仅当已进入多用户模式时显示用户名输入框
+  const needUser = initialized && !!authState.multi_user;
+  $('#username-field').classList.toggle('hidden', !needUser);
   // 二次认证（1.4.0）：仅在已启用 TOTP 且是登录（非首次设置）时要求动态码
-  const needTotp = initialized && !!authState.totp_enabled;
+  const needTotp = initialized && !!(authState.user_totp_enabled ?? authState.totp_enabled);
   $('#totp-field').classList.toggle('hidden', !needTotp);
   $('#totp-hint').classList.toggle('hidden', !needTotp);
   $('#login-error').textContent = expired ? '会话已过期，请重新登录' : '';
@@ -682,7 +787,8 @@ async function submitLogin(event) {
     }
     const url = authState.initialized ? '/api/auth/login' : '/api/auth/setup';
     const code = ($('#login-totp').value || '').trim();
-    await api.post(url, { password, code });
+    const username = ($('#login-username')?.value || '').trim();
+    await api.post(url, { password, code, username });
     $('#login-form').reset();
     await startApp();
   } catch (err) {
@@ -712,6 +818,13 @@ async function startApp(precached = null) {
   authState = status;
   if (!status.authenticated) { showLogin(false); return; }
   appMode = status.mode || 'public';
+  authUser = {
+    username: status.username || 'admin',
+    role: status.role || 'admin',
+    multiUser: !!status.multi_user,
+  };
+  renderUserBadge();
+  await syncLocale();
   $('#login-screen').classList.add('hidden');
   $('#app').classList.remove('hidden');
   $('#brand-host').textContent = status.hostname || '-';
@@ -725,18 +838,35 @@ async function startApp(precached = null) {
 }
 
 async function boot() {
+  // 语言包先加载：即便未登录，登录页的按钮/标签也要立刻是正确语言
+  await I18N.load(localStorage.getItem('sp-locale') || 'zh-CN');
+  registerServiceWorker();
   try {
     authState = await api.get('/api/auth/status');
   } catch (err) {
     authState = { initialized: true, authenticated: false };
   }
+  I18N.apply();
   $('#login-host').textContent = authState.hostname ? `主机 ${authState.hostname}` : '本机系统控制台';
   $('#login-form').addEventListener('submit', submitLogin);
   if (authState.authenticated) await startApp(authState);  // 复用已拉到的状态，不重复请求
   else showLogin(false);
 }
 
-$('#btn-refresh')?.addEventListener('click', () => navigate(currentView || 'overview'));
+$('#btn-refresh')?.addEventListener('click', async () => {
+  // 网页终端的刷新 = 销毁 term + 断开 WS；用户往往只是想"刷新数据"，
+  // 结果把正在跑的编译/部署打断，这里必须先说清楚
+  if (currentView === 'terminal') {
+    const ok = await confirmDialog({
+      title: '刷新会断开终端',
+      message: '重新加载视图会终止当前终端会话，正在前台运行的命令也会被结束。确定继续？',
+      confirmText: '断开并刷新',
+      danger: true,
+    });
+    if (!ok) return;
+  }
+  navigate(currentView || 'overview');
+});
 $('#mode-badge')?.addEventListener('click', showModeHelp);
 $('#btn-logout')?.addEventListener('click', async () => {
   await api.post('/api/auth/logout', {});
@@ -753,6 +883,10 @@ registerView('overview', {
   title: '概览',
   async render(root, res) {
     const info = await api.get('/api/system/info');
+    // 概览页的回收站水位告警（1.6.0 U3）：仅内网模式下可读安全摘要
+    const security = isInternal()
+      ? await api.get('/api/panel/security').catch(() => null)
+      : null;
     const addressRows = info.addresses.length
       ? info.addresses.map((a) => `<dd>${esc(a.address)} <span class="dim">(${esc(a.interface)})</span></dd>`).join('')
       : '<dd class="dim">未检测到局域网地址</dd>';
@@ -807,13 +941,17 @@ registerView('overview', {
           <div class="card" style="margin-bottom:14px">
             <h2>快捷操作</h2>
             <div class="row">
-              ${isInternal() ? '<button class="btn sm" data-act="go-terminal">打开终端</button>' : ''}
+              ${isInternal() && isAdmin() ? '<button class="btn sm" data-act="go-terminal">打开终端</button>' : ''}
               <button class="btn sm" data-act="go-logs">查看日志</button>
               ${isInternal() ? '<button class="btn sm" data-act="go-files">文件管理</button>' : ''}
               <div class="spacer"></div>
               ${isInternal() ? `<button class="btn sm danger" data-act="reboot">重启系统</button>
               <button class="btn sm danger" data-act="shutdown">关机</button>` : ''}
             </div>
+            ${security?.trash?.over_limit
+              ? `<div style="margin-top:10px"><span class="badge warn">回收站占用超过水位</span>
+                 <span class="dim" style="font-size:12px">占用 ${bytes(security.trash.bytes || 0)}，建议到「文件管理 → 回收站」清理</span></div>`
+              : ''}
             ${isInternal() ? '' : '<div class="dim" style="font-size:12px;margin-top:10px">公网模式下已隐藏终端、文件与电源操作。</div>'}
           </div>
           <div class="card">
@@ -911,7 +1049,7 @@ registerView('overview', {
     root.onclick = async (event) => {
       const action = event.target.dataset?.act;
       if (!action) return;
-      if (action === 'go-terminal') navigate('terminal');
+      if (action === 'go-terminal') { if (!isAdmin()) return; navigate('terminal'); }
       if (action === 'go-logs') navigate('logs');
       if (action === 'go-files') navigate('files');
       if (action === 'reboot' || action === 'shutdown') {
@@ -925,7 +1063,7 @@ registerView('overview', {
         });
         if (!ok) return;
         try {
-          const res = await api.post('/api/system/power', { action, confirm: 'CONFIRM' });
+          const res = await api.postConfirmed('/api/system/power', { action, confirm: 'CONFIRM' }, 'power');
           toast(res.message, 'warn');
         } catch (err) { toast(err.message, 'err'); }
       }
@@ -944,7 +1082,15 @@ registerView('overview', {
 registerView('performance', {
   title: '性能监控',
   async render(root, res) {
+    let historyRange = '1h';
     root.innerHTML = `
+      <div class="toolbar" style="margin-bottom:12px">
+        <span class="dim" style="font-size:12px">历史范围</span>
+        ${[['1h', '1 小时'], ['1d', '1 天'], ['30d', '30 天'], ['365d', '365 天']]
+    .map(([v, label]) => `<button class="btn sm ${v === '1h' ? 'primary' : 'ghost'}" data-history-range="${v}">${label}</button>`).join('')}
+        <div class="spacer"></div>
+        <span class="badge" id="pf-power" title="整机功耗（Intel RAPL，部分机器不可读）">功耗 -- W</span>
+      </div>
       <div class="grid c2" style="margin-bottom:14px">
         <div class="card">
           <h2>CPU 总使用率 <span class="spacer"></span><span class="badge info" id="pf-cpu-now">--%</span></h2>
@@ -987,11 +1133,27 @@ registerView('performance', {
     };
     res.own(() => Object.values(charts).forEach((c) => c.destroy()));
 
-    const history = await api.get('/api/system/history').catch(() => ({ points: [] }));
-    charts.cpu.load(history.points, (p) => [p.cpu]);
-    charts.mem.load(history.points, (p) => [p.mem]);
-    charts.disk.load(history.points, (p) => [p.disk_read, p.disk_write]);
-    charts.net.load(history.points, (p) => [p.net_recv, p.net_sent]);
+    let histSeq = 0;
+    async function loadHistory() {
+      // 请求序号：连点「1 小时 → 30 天」时，慢的旧请求不能覆盖新选择
+      const seq = ++histSeq;
+      const data = await api.get(`/api/system/history?period=${encodeURIComponent(historyRange)}`)
+        .catch(() => ({ points: [] }));
+      if (seq !== histSeq) return;
+      const points = data.points || [];
+      charts.cpu.load(points, (p) => [p.cpu]);
+      charts.mem.load(points, (p) => [p.mem]);
+      charts.disk.load(points, (p) => [p.disk_read, p.disk_write]);
+      charts.net.load(points, (p) => [p.net_recv, p.net_sent]);
+    }
+    await loadHistory();
+    $$('[data-history-range]', root).forEach((btn) => btn.addEventListener('click', async () => {
+      historyRange = btn.dataset.historyRange;
+      $$('[data-history-range]', root).forEach((b) => {
+        b.className = `btn sm ${b.dataset.historyRange === historyRange ? 'primary' : 'ghost'}`;
+      });
+      await loadHistory();
+    }));
 
     let coresBuilt = -1;
     const update = (m) => {
@@ -1003,6 +1165,8 @@ registerView('performance', {
       $('#pf-mem-sub').textContent = `已用 ${bytes(m.mem.used)} / ${bytes(m.mem.total)} · 可用 ${bytes(m.mem.available)}`;
       $('#pf-disk-now').textContent = `读 ${rate(m.disk.disk_read)}　写 ${rate(m.disk.disk_write)}`;
       $('#pf-net-now').textContent = `收 ${rate(m.net.net_recv)}　发 ${rate(m.net.net_sent)}`;
+      const power = $('#pf-power');
+      if (power) power.textContent = m.power_w == null ? '功耗 -- W' : `功耗 ${m.power_w} W`;
       charts.cpu.push([m.cpu]);
       charts.mem.push([m.mem.percent]);
       charts.disk.push([m.disk.disk_read, m.disk.disk_write]);
@@ -1075,6 +1239,13 @@ registerView('terminal', {
   title: '网页终端',
   fullbleed: true,
   async render(root) {
+    // xterm 是本地 vendor 文件：缺失（安装不完整/离线壳未缓存）时给出可操作提示，
+    // 而不是整页"加载失败"并抛 ReferenceError
+    if (typeof Terminal === 'undefined') {
+      root.innerHTML = '<div class="card"><div class="empty">终端组件未加载'
+        + '（/static/vendor/xterm.js 缺失）。请重新执行安装脚本，或改用系统 SSH。</div></div>';
+      return null;
+    }
     const info = await api.get('/api/terminal/info').catch(() => ({ shell: '/bin/bash', user: 'root' }));
     root.innerHTML = `
       <div class="terminal-bar">
@@ -1166,13 +1337,19 @@ registerView('terminal', {
       }
     });
 
-    const hostObserver = new ResizeObserver(() => doFit());
-    hostObserver.observe($('#terminal-host'));
+    // ResizeObserver 只负责容器尺寸变化（侧栏折叠等）；老浏览器没有它时
+    // window.resize 已覆盖窗口缩放，不需要为了适配让整个终端视图渲染失败
+    const hostObserver = window.ResizeObserver
+      ? new ResizeObserver(() => doFit())
+      : null;
+    if (hostObserver) hostObserver.observe($('#terminal-host'));
     const onWindowResize = () => doFit();
     window.addEventListener('resize', onWindowResize);
 
     connect();
-    setTimeout(() => { doFit(); term.focus(); }, 60);
+    // 延后布局一次（终端容器尺寸稳定后 fit）；路由切走时必须清掉，
+    // 否则对已 dispose 的 term 调 focus 会抛异常
+    const focusTimer = setTimeout(() => { doFit(); term.focus(); }, 60);
 
     root.querySelector('.terminal-bar').onclick = (event) => {
       const action = event.target.dataset?.act;
@@ -1192,8 +1369,9 @@ registerView('terminal', {
     return () => {
       disposed = true;
       clearTimeout(reconnectTimer);
+      clearTimeout(focusTimer);
       window.removeEventListener('resize', onWindowResize);
-      hostObserver.disconnect();
+      hostObserver?.disconnect();
       try { dataSub.dispose(); resizeSub.dispose(); } catch (err) { /* 忽略 */ }
       if (socket) { socket.onclose = null; socket.close(); }
       term.dispose();
@@ -1244,6 +1422,9 @@ registerView('logs', {
           <label class="row" style="font-size:13px;gap:6px">
             <input type="checkbox" id="log-auto"> 自动刷新
           </label>
+          <label class="row" style="font-size:13px;gap:6px">
+            <input type="checkbox" id="log-follow"> 实时跟随
+          </label>
           <button class="btn sm primary" id="log-refresh">刷新</button>
           <button class="btn sm ghost" id="log-copy">复制</button>
         </div>
@@ -1256,8 +1437,69 @@ registerView('logs', {
     const output = $('#log-output');
     const meta = $('#log-meta');
     let rawLines = [];
+    // 与 rawLines 同下标的样式缓存：每条新行只算一次正则，重绘时不再逐行匹配
+    let rawClasses = [];
     let timer = null;
     let busy = false;
+    let followWs = null;
+    let paintTimer = null;
+
+    function paintSoon() {
+      // 高频日志（journalctl -f / nginx access）按 120ms 合并重绘：
+      // 每条 WS 消息都重建最多 3000 行 DOM 会让标签页直接卡死
+      if (paintTimer) return;
+      paintTimer = setTimeout(() => { paintTimer = null; paint(); }, 120);
+    }
+    res.own(() => clearTimeout(paintTimer));
+
+    function stopFollow() {
+      if (followWs) {
+        try { followWs.close(); } catch (_) { /* 已关闭 */ }
+        followWs = null;
+      }
+      const box = $('#log-follow');
+      if (box) box.checked = false;
+    }
+
+    function setLines(lines) {
+      rawLines = lines || [];
+      rawClasses = rawLines.map((line) => lineClass(line));
+    }
+
+    function startFollow() {
+      stopFollow();
+      if (sourceEl.value !== 'file') {
+        toast('实时跟随仅支持「日志文件」来源', 'warn');
+        return;
+      }
+      const path = fileEl.value;
+      if (!path) { toast('没有可用的日志文件', 'warn'); return; }
+      const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+      const ws = new WebSocket(
+        `${scheme}://${location.host}/api/logs/ws?path=${encodeURIComponent(path)}&lines=100`);
+      followWs = ws;
+      ws.onmessage = (event) => {
+        if (String(event.data).startsWith('[error]')) {
+          toast(String(event.data).replace('[error] ', ''), 'err');
+          stopFollow();
+          return;
+        }
+        rawLines.push(event.data);
+        rawClasses.push(lineClass(event.data));
+        if (rawLines.length > 6000) {
+          rawLines = rawLines.slice(-4000);
+          rawClasses = rawClasses.slice(-4000);
+        }
+        paintSoon();
+      };
+      ws.onclose = () => {
+        if (followWs === ws) {
+          followWs = null;
+          const box = $('#log-follow');
+          if (box) box.checked = false;
+        }
+      };
+    }
 
     const lineClass = (line) => {
       const lower = line.toLowerCase();
@@ -1268,11 +1510,15 @@ registerView('logs', {
 
     function paint() {
       const keyword = $('#log-filter').value.trim().toLowerCase();
-      const matched = keyword ? rawLines.filter((l) => l.toLowerCase().includes(keyword)) : rawLines;
-      const lines = matched.slice(0, 3000);  // 渲染上限：几千行 innerHTML 重建会明显掉帧
+      // 无过滤时直接用缓存样式；有过滤才重算（用户主动操作，频率低）
+      const matched = keyword
+        ? rawLines.map((line) => ({ line, cls: lineClass(line) }))
+          .filter((item) => item.line.toLowerCase().includes(keyword))
+        : rawLines.map((line, index) => ({ line, cls: rawClasses[index] || '' }));
+      const shown = matched.slice(0, 3000);  // 渲染上限：几千行 innerHTML 重建会明显掉帧
       const atBottom = output.scrollTop + output.clientHeight >= output.scrollHeight - 40;
-      output.innerHTML = lines.length
-        ? lines.map((line) => `<span class="${lineClass(line)}">${esc(line) || '&nbsp;'}</span>`).join('\n')
+      output.innerHTML = shown.length
+        ? shown.map(({ line, cls }) => `<span class="${cls}">${esc(line) || '&nbsp;'}</span>`).join('\n')
         : '<span class="dim">没有匹配的日志行</span>';
       if (atBottom) output.scrollTop = output.scrollHeight;
       meta.textContent = `共 ${rawLines.length} 行`
@@ -1287,19 +1533,23 @@ registerView('logs', {
       try {
         const source = sourceEl.value;
         if (source === 'dmesg') {
-          rawLines = (await api.get(`/api/logs/dmesg?lines=${lines}`)).lines;
+          setLines((await api.get(`/api/logs/dmesg?lines=${lines}`)).lines);
         } else if (source === 'file') {
           const path = fileEl.value;
           if (!path) throw new ApiError('没有可用的日志文件', 0);
           const data = await api.get(`/api/logs/file?path=${encodeURIComponent(path)}`);
-          rawLines = data.content.split('\n');
-          if (data.truncated) rawLines.unshift(`… 文件较大（${bytes(data.size)}），仅显示末尾部分 …`);
+          setLines(data.content.split('\n'));
+          if (data.truncated) {
+            const hint = `… 文件较大（${bytes(data.size)}），仅显示末尾部分 …`;
+            rawLines.unshift(hint);
+            rawClasses.unshift(lineClass(hint));
+          }
         } else {
           const priority = $('#log-priority').value;
           const boot = source === 'boot' ? '&boot=true' : '';
           const data = await api.get(`/api/logs/journal?lines=${lines}${boot}${priority ? `&priority=${priority}` : ''}`);
           if (!data.ok && data.error) throw new ApiError(data.error, 500);
-          rawLines = data.lines;
+          setLines(data.lines);
         }
         paint();
       } catch (err) {
@@ -1311,26 +1561,26 @@ registerView('logs', {
     }
 
     sourceEl.onchange = () => {
+      stopFollow();
       const isFile = sourceEl.value === 'file';
       fileEl.classList.toggle('hidden', !isFile);
       $('#log-priority').parentElement.classList.toggle('hidden', isFile || sourceEl.value === 'dmesg');
       load();
     };
-    fileEl.onchange = load;
+    fileEl.onchange = () => { stopFollow(); load(); };
     $('#log-priority').onchange = load;
     $('#log-lines').onchange = load;
     $('#log-refresh').onclick = load;
+    $('#log-follow').onchange = (event) => {
+      if (event.target.checked) startFollow(); else stopFollow();
+    };
+    res.own(stopFollow);   // 切视图时必须关闭 WS，否则 tail 进程会一直跟着文件
     let filterTimer = null;
     $('#log-filter').oninput = () => {
       clearTimeout(filterTimer);
       filterTimer = setTimeout(paint, 200);  // 200ms 防抖：逐字符重绘大日志会掉帧
     };
-    $('#log-copy').onclick = async () => {
-      try {
-        await navigator.clipboard.writeText(rawLines.join('\n'));
-        toast('日志已复制到剪贴板');
-      } catch (err) { toast('复制失败，浏览器限制', 'err'); }
-    };
+    $('#log-copy').onclick = () => copyText(rawLines.join('\n'), '日志已复制到剪贴板');
     $('#log-auto').onchange = (event) => {
       clearInterval(timer);
       timer = null;
@@ -1871,7 +2121,7 @@ registerView('services', {
         if (!ok) return;
       }
       try {
-        const res = await api.post(`/api/services/${encodeURIComponent(service.unit)}/action`, { action });
+        const res = await api.postConfirmed(`/api/services/${encodeURIComponent(service.unit)}/action`, { action }, 'service');
         toast(res.message);
         reloadTimer = setTimeout(load, 700);  // systemd 状态切换有延迟，稍后再刷一次
       } catch (err) { toast(err.message, 'err'); }
@@ -1996,6 +2246,8 @@ registerView('files', {
       if (!selected.size) { bar.classList.add('hidden'); bar.innerHTML = ''; return; }
       bar.classList.remove('hidden');
       bar.innerHTML = `<span class="badge info">已选 ${selected.size} 项</span>
+        <button class="btn sm" data-act="batch-move">移动到…</button>
+        <button class="btn sm" data-act="batch-archive">打包下载</button>
         <button class="btn sm danger" data-act="batch-delete">批量删除</button>
         <button class="btn sm ghost" data-act="batch-clear">取消选择</button>`;
     }
@@ -2051,7 +2303,9 @@ registerView('files', {
         sortEntries();
         renderCrumbs(cwd);
         renderTable();
-        $('#file-meta').textContent = `${entries.length} 项`
+        $('#file-meta').textContent = (data.truncated
+          ? `显示前 ${entries.length} 项（共 ${data.total} 项，目录过大已截断）`
+          : `${entries.length} 项`)
           + (data.disk ? ` · 分区可用 ${bytes(data.disk.free)} / ${bytes(data.disk.total)}` : '');
       } catch (err) {
         if (seq !== loadSeq) return;
@@ -2362,6 +2616,56 @@ registerView('files', {
       } catch (err) { toast(err.message, 'err'); }
     }
 
+    async function doBatchMove() {
+      const paths = [...selected];
+      const dest = await promptDialog({
+        title: '批量移动', label: '目标目录（绝对路径，必须已存在）', value: cwd, confirmText: '移动',
+      });
+      if (!dest) return;
+      try {
+        const res = await api.post('/api/files/move', { paths, dest });
+        toast(res.message, res.ok ? 'ok' : 'warn');
+        selected.clear();
+        paintBatch();
+        load(cwd);
+      } catch (err) { toast(err.message, 'err'); }
+    }
+
+    async function doBatchArchive() {
+      const paths = [...selected];
+      if (!paths.length) return;
+      toast('正在打包…', 'warn', 2000);
+      try {
+        // 路径列表走 POST body，拿到 zip 后交给隐藏 <a> 触发原生下载
+        const res = await fetch('/api/files/archive', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ paths }),
+          cache: 'no-store',
+        });
+        if (!res.ok) {
+          let detail = `打包失败（HTTP ${res.status}）`;
+          try { detail = (await res.json()).detail || detail; } catch (_) { /* 非 JSON 响应 */ }
+          throw new Error(detail);
+        }
+        const now = new Date();
+        const pad = (n) => String(n).padStart(2, '0');
+        const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`
+          + `-${pad(now.getHours())}${pad(now.getMinutes())}`;
+        const url = URL.createObjectURL(await res.blob());
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `batch-${stamp}.zip`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        selected.clear();
+        paintBatch();
+        load(cwd);
+      } catch (err) { toast(err.message, 'err'); }
+    }
+
     root.onclick = async (event) => {
       const crumb = event.target.closest('[data-crumb]');
       if (crumb) { load(crumb.dataset.crumb); return; }
@@ -2393,6 +2697,8 @@ registerView('files', {
       if (action === 'fetch-url') doFetchUrl();
       if (action === 'trash') openTrash();
       if (action === 'batch-delete') doBatchDelete();
+      if (action === 'batch-move') doBatchMove();
+      if (action === 'batch-archive') doBatchArchive();
       if (action === 'batch-clear') { selected.clear(); paintBatch(); renderTable(); }
       if (action === 'mkdir') {
         const name = await promptDialog({ title: '新建文件夹', label: '文件夹名称', confirmText: '创建' });
@@ -3226,7 +3532,7 @@ registerView('apps', {
           });
           if (!values) return;
           if (values.confirm !== app.name) { toast('名称不匹配，已取消', 'err'); return; }
-          const res = await api.del(`/api/panel/apps/${app.id}`);
+          const res = await api.delConfirmed(`/api/panel/apps/${app.id}`, 'apps');
           if (logState && logState.id === app.id) { logState = null; }
           toast(res.message);
           await refresh();
@@ -3255,23 +3561,28 @@ const SCOPE_LABEL = { full: '完整权限', readonly: '只读命令', custom: '�
 
 registerView('security', {
   title: '安全中心',
-  async render(root) {
+  async render(root, res) {
     let summary = null;
     let totp = null;
     let tokens = [];
     let sessions = [];
+    let checkup = [];
     let auditDays = 7;
     let auditSource = '';
     let auditQ = '';
+    let auditEvents = [];
+    let loginEvents = [];
 
     async function loadAll() {
-      const [s, t, tk, ss] = await Promise.all([
+      const [s, t, tk, ss, ck] = await Promise.all([
         api.get('/api/panel/security'),
         api.get('/api/auth/totp/status'),
         api.get('/api/agent/tokens'),
         api.get('/api/panel/sessions'),
+        api.get('/api/panel/security/checkup'),
       ]);
       summary = s; totp = t; tokens = tk.tokens; sessions = ss.sessions;
+      checkup = ck.items || [];
     }
 
     // ---------------- TOTP ----------------
@@ -3374,7 +3685,8 @@ registerView('security', {
             <option value="custom">自定义前缀白名单</option>
           </select></label>
         <label class="field hidden" id="tk-prefixes-field"><span>允许的命令前缀（每行一个，如 <code>systemctl restart nginx</code>）</span>
-          <textarea class="input" id="tk-prefixes" rows="3" style="font-family:ui-monospace,monospace"></textarea></label>
+          <textarea class="input" id="tk-prefixes" rows="3" style="font-family:ui-monospace,monospace"></textarea>
+          <p class="dim" id="tk-prefixes-hint" style="font-size:12px;line-height:1.6;margin-top:6px">custom 作用域不支持 <code>$()</code>、反引号、<code>&gt;</code>、<code>&gt;&gt;</code>、<code>&lt;</code>、<code>*</code>、<code>?</code>、<code>&amp;</code>（单个）、换行等 shell 元字符，含这些字符的命令会被拒绝。</p></label>
         <label class="field"><span>过期天数（0 = 永不过期）</span>
           <input class="input" id="tk-expires" type="number" value="0" min="0" max="3650"></label>
         <label class="field"><span>备注（用途说明，可选）</span>
@@ -3447,7 +3759,7 @@ registerView('security', {
       });
       if (!ok) return;
       try {
-        const res = await api.del('/api/agent/tokens');
+        const res = await api.delConfirmed('/api/agent/tokens', 'tokens');
         toast(res.message, 'ok');
         await loadAll(); paint();
       } catch (err) { toast(err.message, 'err'); }
@@ -3504,6 +3816,88 @@ registerView('security', {
         </tr>`).join('')}</tbody></table></div>`;
     }
 
+    // CSV 单元格转义：Excel / WPS 会把以 = + - @、TAB、CR 开头的单元格当公式
+    // 执行（CSV 注入），前置一个单引号让它按纯文本处理；含引号/逗号/换行时按
+    // RFC 4180 用双引号包裹，内部双引号翻倍。
+    function csvCell(value) {
+      let text = value == null ? '' : String(value);
+      if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
+      if (/[",\n\r]/.test(text)) text = `"${text.replace(/"/g, '""')}"`;
+      return text;
+    }
+
+    function buildAuditCsv(events) {
+      const header = ['时间', '动作', '来源', '来源IP', '执行者', '目标', '摘要', '结果', '退出码', '耗时'];
+      const rows = events.map((e) => [
+        datetime(e.time), e.action, e.source, e.ip, e.actor, e.target, e.summary,
+        e.ok ? '成功' : '失败', e.code == null ? '' : e.code,
+        e.duration == null ? '' : `${e.duration}s`,
+      ]);
+      return [header, ...rows].map((row) => row.map(csvCell).join(',')).join('\r\n');
+    }
+
+    function exportAuditCsv() {
+      if (!auditEvents.length) {
+        toast('当前筛选结果为空，没有可导出的记录', 'warn');
+        return;
+      }
+      const now = new Date();
+      const pad = (n) => String(n).padStart(2, '0');
+      const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`
+        + `-${pad(now.getHours())}${pad(now.getMinutes())}`;
+      // BOM 让 Excel/WPS 正确识别 UTF-8 中文
+      const blob = new Blob([`\ufeff${buildAuditCsv(auditEvents)}`],
+        { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `audit-${stamp}.csv`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      // 导出动作本身也留痕（只记录条数与筛选条件，不回传导出数据）
+      api.post('/api/panel/audit/export', {
+        count: auditEvents.length,
+        filters: [`${auditDays}天`, auditSource || '全部来源', auditQ].filter(Boolean).join(' / '),
+      }).catch(() => {});
+    }
+
+    async function loadLogins() {
+      const box = $('#sec-logins-body');
+      if (!box) return;
+      try {
+        // 复用现有审计查询接口（不新增端点）：成功与失败各取最近 20 条
+        const [okRes, badRes] = await Promise.all([
+          api.get('/api/panel/audit/log?days=7&action=login&limit=20'),
+          api.get('/api/panel/audit/log?days=7&action=login_failed&limit=20'),
+        ]);
+        loginEvents = [
+          ...okRes.events.map((e) => ({ ...e, success: true })),
+          ...badRes.events.map((e) => ({ ...e, success: false })),
+        ].sort((a, b) => (b.time || 0) - (a.time || 0)).slice(0, 20);
+        paintLogins();
+      } catch (err) {
+        box.innerHTML = `<div class="empty">读取失败：${esc(err.message)}</div>`;
+      }
+    }
+
+    function paintLogins() {
+      const box = $('#sec-logins-body');
+      if (!box) return;
+      if (!loginEvents.length) {
+        box.innerHTML = '<div class="empty">最近 7 天没有登录记录</div>';
+        return;
+      }
+      box.innerHTML = `<div class="table-wrap"><table class="data"><thead><tr>
+        <th>时间</th><th>结果</th><th>来源 IP</th></tr></thead>
+        <tbody>${loginEvents.map((e) => `<tr>
+          <td class="cell-sub">${datetime(e.time)}</td>
+          <td><span class="badge ${e.success ? 'ok' : 'danger'}">${e.success ? '成功' : '失败'}</span></td>
+          <td class="cell-sub mono">${esc(e.ip || '-')}</td>
+        </tr>`).join('')}</tbody></table></div>`;
+    }
+
     async function loadAudit() {
       const box = $('#sec-audit-body');
       if (!box) return;
@@ -3513,7 +3907,8 @@ registerView('security', {
         if (auditSource) params.set('source', auditSource);
         if (auditQ) params.set('q', auditQ);
         const data = await api.get(`/api/panel/audit/log?${params.toString()}`);
-        box.innerHTML = auditTable(data.events);
+        auditEvents = data.events || [];
+        box.innerHTML = auditTable(auditEvents);
       } catch (err) {
         box.innerHTML = `<div class="empty">读取失败：${esc(err.message)}</div>`;
       }
@@ -3521,32 +3916,59 @@ registerView('security', {
 
     // ---------------- 渲染 ----------------
 
+    function checkupCard() {
+      const badge = { ok: 'ok', warn: 'warn', bad: 'danger' };
+      const label = { ok: '正常', warn: '建议处理', bad: '需立即处理' };
+      const worst = checkup.some((it) => it.level === 'bad') ? 'bad'
+        : checkup.some((it) => it.level === 'warn') ? 'warn' : 'ok';
+      const rows = checkup.map((it) => `
+        <button class="checkup-item" data-checkup-target="${esc(it.target || '')}"
+                style="display:flex;gap:10px;align-items:flex-start;width:100%;text-align:left;background:none;border:0;padding:8px 0;color:inherit;cursor:${it.target ? 'pointer' : 'default'}">
+          <span class="badge ${badge[it.level] || 'ok'}">${esc(label[it.level] || it.level)}</span>
+          <span style="flex:1">
+            <span class="cell-main">${esc(it.title)}</span>
+            <span class="cell-sub">${esc(it.detail)}</span>
+          </span>
+        </button>`).join('');
+      return `<div class="card" id="security-checkup" style="margin-bottom:14px">
+        <h2>安全巡检
+          <span class="badge ${badge[worst]}">${worst === 'ok' ? '未发现待处理项' : '有待办'}</span>
+        </h2>
+        <div class="dim" style="font-size:12px;margin:4px 0 6px">汇总当前安全短板，点击条目跳到对应卡片。</div>
+        ${rows}
+      </div>`;
+    }
+
     function paint() {
       const lock = summary?.lockout || {};
       root.innerHTML = `
+        ${checkupCard()}
+
         <div class="grid c4" style="margin-bottom:14px">
-          <div class="card">
+          <div class="card" id="security-totp">
             <div class="metric-label">二次认证（TOTP）</div>
             <div class="metric-value" style="font-size:20px">
               ${totp?.enabled ? '<span class="badge ok">已启用</span>' : '<span class="badge danger">未启用</span>'}</div>
             <div class="metric-sub">剩余恢复码 ${totp?.recovery_left ?? 0} 个</div>
           </div>
-          <div class="card">
+          <div class="card" id="security-lockout">
             <div class="metric-label">登录防爆破</div>
             <div class="metric-value" style="font-size:20px">${lock.ip_failures ?? 0} 次失败</div>
             <div class="metric-sub">${lock.locked_seconds > 0
               ? `<span class="badge danger">锁定中 · 剩余 ${lock.locked_seconds}s</span>`
               : `当前 IP 未锁定 · 全局 ${lock.global_failures ?? 0} 次`}</div>
           </div>
-          <div class="card">
+          <div class="card" id="security-sessions">
             <div class="metric-label">活跃会话 / Agent 令牌</div>
             <div class="metric-value" style="font-size:20px">${summary?.sessions?.active ?? 0} / ${summary?.tokens?.total ?? 0}</div>
             <div class="metric-sub">完整权限令牌 ${summary?.tokens?.full ?? 0} 个</div>
           </div>
-          <div class="card">
+          <div class="card" id="security-trash">
             <div class="metric-label">回收站</div>
             <div class="metric-value" style="font-size:20px">${summary?.trash?.count ?? 0} 项</div>
             <div class="metric-sub">占用 ${bytes(summary?.trash?.bytes || 0)} · 保留 ${summary?.trash?.retention_days ?? 0} 天</div>
+            ${summary?.trash?.over_limit
+              ? '<div style="margin-top:6px"><span class="badge warn">占用超过水位</span></div>' : ''}
           </div>
         </div>
 
@@ -3587,7 +4009,15 @@ registerView('security', {
           </div>
         </div>
 
-        <div class="card" style="margin-top:14px">
+        <div class="card" style="margin-top:14px" id="security-logins">
+          <h2>最近登录</h2>
+          <div class="dim" style="font-size:12px;margin:4px 0 10px">
+            最近 7 天成功与失败的登录记录（数据来自审计日志，每 30 秒刷新）。
+          </div>
+          <div id="sec-logins-body"><div class="empty">加载中…</div></div>
+        </div>
+
+        <div class="card" style="margin-top:14px" id="security-tokens">
           <h2>Agent 令牌</h2>
           <div class="dim" style="font-size:12px;margin:4px 0 10px">
             令牌按「名称 + 作用域」管理：只读令牌只能执行查看类命令，自定义令牌按前缀白名单放行。
@@ -3613,7 +4043,7 @@ registerView('security', {
             </tr>`).join('') : '<tr><td colspan="6"><div class="empty">尚未创建令牌</div></td></tr>'}</tbody></table></div>
         </div>
 
-        <div class="card" style="margin-top:14px">
+        <div class="card" style="margin-top:14px" id="security-audit">
           <h2>审计日志</h2>
           <div class="dim" style="font-size:12px;margin:4px 0 10px">
             所有敏感操作（登录、命令执行、文件变更、令牌与会话管理）统一记录，按天滚动、保留 90 天，不可删除。
@@ -3633,6 +4063,7 @@ registerView('security', {
             </select>
             <input class="input" id="sec-audit-q" placeholder="搜索对象 / 摘要…" value="${esc(auditQ)}" style="width:200px">
             <button class="btn sm" id="sec-audit-search">查询</button>
+            <button class="btn sm ghost" id="sec-audit-export" title="导出当前筛选结果（CSV）">导出 CSV</button>
           </div>
           <div id="sec-audit-body"><div class="empty">加载中…</div></div>
         </div>`;
@@ -3654,8 +4085,17 @@ registerView('security', {
         auditQ = ($('#sec-audit-q').value || '').trim();
         loadAudit();
       });
+      $('#sec-audit-export')?.addEventListener('click', () => exportAuditCsv());
       $('#sec-audit-q')?.addEventListener('keydown', (event) => {
         if (event.key === 'Enter') $('#sec-audit-search').click();
+      });
+      $$('[data-checkup-target]', root).forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const target = btn.dataset.checkupTarget;
+          if (!target) return;
+          if (target === 'settings') { navigate('settings'); return; }
+          document.getElementById(target)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        });
       });
       $$('[data-token-revoke]', root).forEach((btn) => btn.addEventListener('click', () => {
         const item = tokens.find((t) => t.id === btn.dataset.tokenRevoke);
@@ -3666,6 +4106,7 @@ registerView('security', {
         if (item) sessionRevoke(item);
       }));
       loadAudit();
+      loadLogins();
     }
 
     try {
@@ -3675,6 +4116,9 @@ registerView('security', {
       return;
     }
     paint();
+    // 最近登录定时刷新；定时器登记到路由资源表，切视图时回收（1.5.0 规范）
+    const loginTimer = setInterval(loadLogins, 30000);
+    res.own(() => clearInterval(loginTimer));
   },
 });
 
@@ -3726,6 +4170,898 @@ function waitForPanelRestart({ before = '', expected = null, timeoutMs = 180000,
   });
 }
 
+/* ============================ 视图：运维（2.0 M3） ============================ */
+
+/*
+ * 九个面板全部基于系统自带 CLI（crontab / tar / rclone / apt / docker / ufw /
+ * nginx / openssl / mysql / psql / redis-cli / ssh-keygen / ping / traceroute /
+ * mtr / curl）。能力探测不通过时只显示 dim 提示，不提供"假装可用"的按钮。
+ */
+
+const OPS_TABS = [
+  { id: 'cron', label: '定时任务' },
+  { id: 'backup', label: '备份' },
+  { id: 'update', label: '系统更新' },
+  { id: 'docker', label: 'Docker' },
+  { id: 'firewall', label: '防火墙' },
+  { id: 'proxy', label: '反代 / 证书' },
+  { id: 'db', label: '数据库' },
+  { id: 'ssh', label: 'SSH 密钥' },
+  { id: 'net', label: '网络工具' },
+  { id: 'recording', label: '会话录制' },
+];
+
+const opsHint = (title, hint) => `<div class="card"><h2>${esc(title)}</h2>
+  <div class="dim" style="line-height:1.8">${hint}</div></div>`;
+
+const opsFail = (err) => `<div class="card"><div class="empty">读取失败：${esc(err.message)}</div></div>`;
+
+/** 与后端 app/ops.py 同规则的轻量解析：只用于在表格里预览/切启停。 */
+function cronParse(line) {
+  const text = S(line || '').trim();
+  const off = text.startsWith('#');
+  const body = off ? text.replace(/^#\s*/, '') : text;
+  const parts = body.split(/\s+/).filter(Boolean);
+  let schedule = '';
+  let command = '';
+  if (parts.length) {
+    if (parts[0].startsWith('@')) {
+      schedule = parts[0];
+      command = parts.slice(1).join(' ');
+    } else {
+      schedule = parts.slice(0, 5).join(' ');
+      command = parts.slice(5).join(' ');
+    }
+  }
+  return { off, schedule, command };
+}
+
+/* ---------- 定时任务 ---------- */
+
+async function opsCron(host, ctx) {
+  const data = await api.get('/api/panel/maintenance/cron');
+  if (!data.capabilities.crontab) {
+    host.innerHTML = opsHint('定时任务不可用',
+      '本机没有 <span class="mono">crontab</span> 命令（容器与精简系统常见）。<br>'
+      + '需要后台常驻时，可改用「常驻应用」托管进程。');
+    return null;
+  }
+  host.innerHTML = `
+    <div class="card">
+      <div class="toolbar" style="margin-bottom:8px">
+        <span class="badge">${data.lines.length} 行</span>
+        ${data.error ? `<span class="badge warn">${esc(data.error)}</span>` : ''}
+        <div class="spacer"></div>
+        <button class="btn sm" data-act="cron-reload">重新读取</button>
+        <button class="btn sm primary" data-act="cron-save">保存 crontab</button>
+      </div>
+      <div class="dim" style="margin-bottom:8px">
+        每行一条任务，以 <span class="mono">#</span> 开头的行表示停用。保存前会自动备份到配置目录，
+        写入后读回校验，不一致立即回滚。
+      </div>
+      <textarea class="input mono" id="cron-text" spellcheck="false"
+        style="width:100%;height:200px;line-height:1.6"></textarea>
+    </div>
+    <div class="card flush"><div class="table-wrap" id="cron-table"></div></div>`;
+
+  const textarea = $('#cron-text', host);
+  textarea.value = data.lines.map((item) => item.raw).join('\n');
+
+  const paint = () => {
+    const table = $('#cron-table', host);
+    if (!table) return;
+    const rows = textarea.value.split('\n')
+      .map((line, index) => ({ line, index }))
+      .filter((row) => row.line.trim());
+    table.innerHTML = rows.length ? `<table class="data">
+      <thead><tr><th>状态</th><th>计划</th><th>命令</th><th></th></tr></thead><tbody>
+      ${rows.map((row) => {
+    const parsed = cronParse(row.line);
+    return `<tr>
+        <td>${parsed.off ? '<span class="badge">已停用</span>' : '<span class="badge ok">已启用</span>'}</td>
+        <td class="mono">${esc(parsed.schedule || '-')}</td>
+        <td class="cell-sub mono" style="max-width:520px;overflow:hidden;text-overflow:ellipsis">${esc(parsed.command || row.line.trim())}</td>
+        <td class="actions"><button class="btn sm" data-act="cron-toggle" data-index="${row.index}">
+          ${parsed.off ? '启用' : '停用'}</button></td></tr>`;
+  }).join('')}</tbody></table>` : '<div class="empty">还没有定时任务</div>';
+  };
+  paint();
+
+  host.onclick = async (event) => {
+    const btn = event.target.closest('[data-act]');
+    if (!btn) return;
+    const act = btn.dataset.act;
+    if (act === 'cron-toggle') {
+      const arr = textarea.value.split('\n');
+      const index = Number(btn.dataset.index);
+      const line = arr[index];
+      if (line === undefined) return;
+      arr[index] = line.trim().startsWith('#')
+        ? line.trim().replace(/^#\s*/, '')
+        : `# ${line.trim()}`;
+      textarea.value = arr.join('\n');
+      paint();
+      return;
+    }
+    if (act === 'cron-reload') { await ctx.open('cron'); return; }
+    if (act === 'cron-save') {
+      const ok = await confirmDialog({
+        title: '写入 crontab', confirmText: '写入',
+        message: '将用当前内容<b>覆盖</b>系统 crontab（写入前自动备份到配置目录）。确定继续？',
+      });
+      if (!ok) return;
+      try {
+        const res = await api.post('/api/panel/maintenance/cron', { content: textarea.value });
+        toast(res.message);
+        await ctx.open('cron');
+      } catch (err) { toast(err.message, 'err'); }
+    }
+  };
+  return null;
+}
+
+/* ---------- 备份 ---------- */
+
+function opsBackupTable(items, rclone) {
+  if (!items.length) return '<div class="empty">还没有备份</div>';
+  return `<table class="data"><thead><tr>
+      <th>备份文件</th><th>大小</th><th>创建时间</th><th></th></tr></thead><tbody>
+    ${items.map((item) => `<tr>
+      <td class="cell-main mono">${esc(item.name)}</td>
+      <td>${bytes(item.size)}</td>
+      <td class="cell-sub">${datetime(item.mtime)}</td>
+      <td class="actions">
+        ${rclone ? `<button class="btn sm ghost" data-act="bk-upload" data-name="${esc(item.name)}">上传</button>` : ''}
+        <button class="btn sm danger" data-act="bk-del" data-name="${esc(item.name)}">删除</button>
+      </td></tr>`).join('')}</tbody></table>`;
+}
+
+async function opsBackup(host, ctx) {
+  const data = await api.get('/api/panel/maintenance/backups');
+  const remote = await api.get('/api/panel/maintenance/backups/remotes')
+    .catch(() => ({ remotes: [], capabilities: {} }));
+  const rclone = !!data.capabilities.rclone;
+  host.innerHTML = `
+    <div class="card">
+      <div class="toolbar" style="margin-bottom:10px">
+        <span class="badge">${data.items.length} 个备份</span>
+        <span class="dim mono">${esc(data.dir)}</span>
+        <div class="spacer"></div>
+        <button class="btn sm" data-act="bk-refresh">刷新</button>
+      </div>
+      <label class="field"><span>要备份的路径（每行一个，必须是绝对路径）</span>
+        <textarea class="input mono" id="bk-paths" spellcheck="false" style="height:84px"
+          placeholder="/etc/serverpanel&#10;/root/.ssh"></textarea></label>
+      <label class="field"><span>备份名（可留空自动生成，需以 .tar.gz 结尾）</span>
+        <input class="input mono" id="bk-name" placeholder="backup-20250101-000000.tar.gz"></label>
+      <label class="field"><span>备份目录（绝对路径，对应设置项 backup.dir；留空回到默认目录）</span>
+        <div class="row">
+          <input class="input mono" id="bk-dir" value="${esc(data.dir)}" style="flex:1">
+          <button class="btn sm" data-act="bk-dir-save">保存目录</button>
+        </div></label>
+      <div class="row">
+        <button class="btn sm primary" data-act="bk-create">创建备份</button>
+        <span class="dim">单次总体积上限 ${bytes(data.max_bytes)}；
+          ${rclone ? `已检测到 rclone（${(remote.remotes || []).length} 个远程）`
+    : '未安装 rclone，仅支持本地备份'}</span>
+      </div>
+    </div>
+    <div class="card flush"><div class="table-wrap" id="bk-table">${opsBackupTable(data.items, rclone)}</div></div>`;
+
+  host.onclick = async (event) => {
+    const btn = event.target.closest('[data-act]');
+    if (!btn) return;
+    const act = btn.dataset.act;
+    if (act === 'bk-refresh') { await ctx.open('backup'); return; }
+    if (act === 'bk-dir-save') {
+      const value = $('#bk-dir', host).value.trim();
+      try {
+        await api.put('/api/panel/prefs', { values: { 'backup.dir': value } });
+        toast('备份目录已更新');
+        await ctx.open('backup');
+      } catch (err) { toast(err.message, 'err'); }
+      return;
+    }
+    if (act === 'bk-create') {
+      const paths = $('#bk-paths', host).value.split('\n').map((s) => s.trim()).filter(Boolean);
+      if (!paths.length) { toast('请先填写要备份的路径', 'err'); return; }
+      const name = $('#bk-name', host).value.trim();
+      const ok = await confirmDialog({
+        title: '创建备份', confirmText: '开始打包',
+        message: `将打包 ${paths.length} 个路径到 <span class="mono">${esc(data.dir)}</span>，可能要几十秒。`,
+      });
+      if (!ok) return;
+      btn.disabled = true;
+      try {
+        const res = await api.post('/api/panel/maintenance/backups',
+          name ? { paths, name } : { paths }, 600000);
+        toast(`${res.message}（${bytes(res.size)}）`);
+        await ctx.open('backup');
+      } catch (err) { toast(err.message, 'err'); } finally { btn.disabled = false; }
+      return;
+    }
+    if (act === 'bk-del') {
+      const name = btn.dataset.name;
+      const ok = await confirmDialog({
+        title: '删除备份', danger: true, confirmText: '删除',
+        message: `确定删除备份 <b class="mono">${esc(name)}</b>？此操作不可恢复。`,
+      });
+      if (!ok) return;
+      try {
+        const res = await api.del(`/api/panel/maintenance/backups/${encodeURIComponent(name)}`);
+        toast(res.message);
+        await ctx.open('backup');
+      } catch (err) { toast(err.message, 'err'); }
+      return;
+    }
+    if (act === 'bk-upload') {
+      const name = btn.dataset.name;
+      const first = (remote.remotes || [])[0];
+      const value = await promptDialog({
+        title: '上传到远程存储', label: 'rclone 目标（形如 gdrive:backups）',
+        value: first ? `${first.name}backups` : '',
+      });
+      if (value === null || !value.trim()) return;
+      try {
+        const res = await api.post(
+          `/api/panel/maintenance/backups/${encodeURIComponent(name)}/upload`,
+          { remote: value.trim() }, 360000,
+        );
+        toast(res.message);
+      } catch (err) { toast(err.message, 'err'); }
+    }
+  };
+  return null;
+}
+
+/* ---------- 系统更新 ---------- */
+
+async function opsUpdate(host, ctx) {
+  const data = await api.get('/api/panel/maintenance/updates');
+  if (!data.capabilities.apt) {
+    host.innerHTML = opsHint('系统更新不可用',
+      '本机没有 <span class="mono">apt-get</span>（非 Debian 系发行版）。<br>请使用发行版自带的包管理器维护更新。');
+    return null;
+  }
+  host.innerHTML = `
+    <div class="card">
+      <div class="toolbar" style="margin-bottom:0">
+        <span class="badge">${data.count} 个可升级</span>
+        <span class="badge ${data.security ? 'warn' : ''}">${data.security} 个安全更新</span>
+        ${data.error ? `<span class="dim">${esc(data.error)}</span>` : ''}
+        <div class="spacer"></div>
+        <button class="btn sm" data-act="up-reload">重新检查</button>
+        ${data.count && isInternal()
+    ? '<button class="btn sm primary" data-act="up-apply">一键升级</button>' : ''}
+      </div>
+      <div class="dim" style="margin-top:8px">
+        只执行 <span class="mono">apt-get install --only-upgrade</span>，不会安装新包也不会卸载已有包。
+        升级内核等组件后需要重启系统才会生效。
+      </div>
+    </div>
+    <div class="card flush"><div class="table-wrap">
+      ${data.packages.length ? `<table class="data"><thead><tr>
+          <th>软件包</th><th>可升级到</th><th>来源</th><th>类型</th></tr></thead><tbody>
+        ${data.packages.map((item) => `<tr>
+          <td class="cell-main mono">${esc(item.name)}</td>
+          <td class="mono">${esc(item.version)}</td>
+          <td class="cell-sub">${esc(item.repo)}</td>
+          <td>${item.security ? '<span class="badge warn">安全更新</span>' : '<span class="badge">常规</span>'}</td>
+        </tr>`).join('')}</tbody></table>` : '<div class="empty">系统已是最新</div>'}
+    </div></div>`;
+
+  host.onclick = async (event) => {
+    const btn = event.target.closest('[data-act]');
+    if (!btn) return;
+    if (btn.dataset.act === 'up-reload') { await ctx.open('update'); return; }
+    if (btn.dataset.act !== 'up-apply') return;
+    const ok = await confirmDialog({
+      title: '一键升级系统', danger: true, confirmText: '立即升级',
+      message: `将升级 ${data.count} 个软件包（其中 ${data.security} 个安全更新），耗时可能较长。是否继续？`,
+    });
+    if (!ok) return;
+    btn.disabled = true;
+    btn.textContent = '升级中…';
+    try {
+      const res = await api.postConfirmed('/api/panel/maintenance/updates/apply', {}, 'update', 900000);
+      toast(res.message);
+      await ctx.open('update');
+    } catch (err) { toast(err.message, 'err'); } finally { btn.disabled = false; btn.textContent = '一键升级'; }
+  };
+  return null;
+}
+
+/* ---------- Docker ---------- */
+
+async function opsDockerLogs(id) {
+  const body = document.createElement('div');
+  body.innerHTML = '<div class="empty">加载中…</div>';
+  openModal({ title: `容器日志 · ${id}`, body, size: 'wide' });
+  try {
+    const data = await api.get(`/api/panel/infra/docker/containers/${encodeURIComponent(id)}/logs?tail=200`);
+    body.innerHTML = `<div class="log-output" style="max-height:60vh">${
+      data.lines.length ? data.lines.map((line) => esc(line)).join('\n') : '<span class="dim">暂无日志</span>'}</div>`;
+  } catch (err) {
+    body.innerHTML = `<div class="empty">读取失败：${esc(err.message)}</div>`;
+  }
+}
+
+async function opsDocker(host, ctx) {
+  const data = await api.get('/api/panel/infra/docker/containers');
+  if (!data.capabilities.docker) {
+    host.innerHTML = opsHint('Docker 不可用',
+      '本机没有 <span class="mono">docker</span> 命令，无法管理容器。'
+      + '需要容器管理能力时请先安装 Docker Engine。');
+    return null;
+  }
+  const images = await api.get('/api/panel/infra/docker/images')
+    .catch(() => ({ images: [], error: '' }));
+  const stateBadge = (state) => {
+    if (state === 'running') return '<span class="badge ok">运行中</span>';
+    if (state === 'exited') return '<span class="badge">已退出</span>';
+    if (state === 'paused') return '<span class="badge warn">已暂停</span>';
+    return `<span class="badge">${esc(state || '未知')}</span>`;
+  };
+  host.innerHTML = `
+    <div class="card">
+      <div class="toolbar" style="margin-bottom:0">
+        <span class="badge info">${data.containers.length} 个容器</span>
+        <span class="badge">${images.images.length} 个镜像</span>
+        ${data.error ? `<span class="dim">${esc(data.error)}</span>` : ''}
+        <div class="spacer"></div>
+        <button class="btn sm" data-act="dk-reload">刷新</button>
+      </div>
+    </div>
+    <div class="card flush"><div class="table-wrap">
+      ${data.containers.length ? `<table class="data"><thead><tr>
+          <th>容器</th><th>镜像</th><th>状态</th><th>端口</th><th></th></tr></thead><tbody>
+        ${data.containers.map((item) => `<tr>
+          <td class="cell-main mono">${esc(item.name || item.id)}<div class="cell-sub">${esc(item.id.slice(0, 12))}</div></td>
+          <td class="cell-sub mono">${esc(item.image)}</td>
+          <td>${stateBadge(item.state)}<div class="cell-sub">${esc(item.status)}</div></td>
+          <td class="cell-sub mono">${esc(item.ports || '-')}</td>
+          <td class="actions">
+            <button class="btn sm ghost" data-act="dk-logs" data-id="${esc(item.id)}">日志</button>
+            ${isInternal() ? (item.state === 'running'
+    ? `<button class="btn sm" data-act="dk-restart" data-id="${esc(item.id)}">重启</button>
+                 <button class="btn sm danger" data-act="dk-stop" data-id="${esc(item.id)}">停止</button>`
+    : `<button class="btn sm ok" data-act="dk-start" data-id="${esc(item.id)}">启动</button>`)
+    + `<button class="btn sm danger" data-act="dk-remove" data-id="${esc(item.id)}">删除</button>` : ''}
+          </td></tr>`).join('')}</tbody></table>` : '<div class="empty">没有容器</div>'}
+    </div></div>
+    <div class="card flush" style="margin-top:14px"><div class="table-wrap">
+      ${images.images.length ? `<table class="data"><thead><tr>
+          <th>镜像</th><th>标签</th><th>大小</th><th>创建时间</th></tr></thead><tbody>
+        ${images.images.map((item) => `<tr>
+          <td class="cell-main mono">${esc(item.repository)}</td>
+          <td class="mono">${esc(item.tag)}</td>
+          <td>${esc(item.size)}</td>
+          <td class="cell-sub">${esc(item.created)}</td></tr>`).join('')}</tbody></table>`
+    : '<div class="empty">没有镜像</div>'}
+    </div></div>`;
+
+  const act = async (id, action) => {
+    const label = { start: '启动', stop: '停止', restart: '重启' }[action];
+    if (action !== 'start') {
+      const ok = await confirmDialog({
+        title: `确认${label}容器`, danger: action === 'stop', confirmText: label,
+        message: `确定要${label}容器 <b class="mono">${esc(id)}</b> 吗？`,
+      });
+      if (!ok) return;
+    }
+    try {
+      const res = await api.post(`/api/panel/infra/docker/containers/${encodeURIComponent(id)}/action`,
+        { action }, 180000);
+      toast(res.message);
+      await ctx.open('docker');
+    } catch (err) { toast(err.message, 'err'); }
+  };
+
+  host.onclick = async (event) => {
+    const btn = event.target.closest('[data-act]');
+    if (!btn) return;
+    const id = btn.dataset.id;
+    switch (btn.dataset.act) {
+      case 'dk-reload': await ctx.open('docker'); break;
+      case 'dk-logs': await opsDockerLogs(id); break;
+      case 'dk-start': await act(id, 'start'); break;
+      case 'dk-stop': await act(id, 'stop'); break;
+      case 'dk-restart': await act(id, 'restart'); break;
+      case 'dk-remove': {
+        const ok = await confirmDialog({
+          title: '删除容器', danger: true, confirmText: '删除',
+          message: `将强制删除容器 <b class="mono">${esc(id)}</b>（数据卷不会被删除）。此操作不可恢复。`,
+        });
+        if (!ok) return;
+        try {
+          const res = await api.delConfirmed(`/api/panel/infra/docker/containers/${encodeURIComponent(id)}?force=true`,
+            'docker', 180000);
+          toast(res.message);
+          await ctx.open('docker');
+        } catch (err) { toast(err.message, 'err'); }
+        break;
+      }
+      default: break;
+    }
+  };
+  return null;
+}
+
+/* ---------- 防火墙 ---------- */
+
+async function opsFirewall(host, ctx) {
+  const data = await api.get('/api/panel/infra/firewall');
+  const backend = data.backend ? data.backend.toUpperCase() : '';
+  host.innerHTML = `
+    <div class="card">
+      <div class="toolbar" style="margin-bottom:10px">
+        <span class="badge ${backend ? 'info' : 'warn'}">${backend ? `${esc(backend)} 后端` : '未检测到防火墙'}</span>
+        <span class="badge">${data.rules.length} 条规则</span>
+        ${data.writable ? '' : '<span class="dim">当前后端仅支持只读查看</span>'}
+        <div class="spacer"></div>
+        <button class="btn sm" data-act="fw-reload">刷新</button>
+      </div>
+      ${data.writable && isInternal() ? `<div class="row" style="margin-bottom:8px">
+        <input class="input" id="fw-port" placeholder="端口，如 8080" style="width:150px">
+        <select class="input" id="fw-proto" style="width:90px">
+          <option value="tcp">tcp</option><option value="udp">udp</option></select>
+        <button class="btn sm primary" data-act="fw-allow">放行</button>
+        <button class="btn sm danger" data-act="fw-deny">拒绝</button>
+      </div>` : ''}
+      ${data.error ? `<div class="dim">${esc(data.error)}</div>` : ''}
+    </div>
+    <div class="card flush"><div class="table-wrap">
+      ${data.rules.length ? `<table class="data"><thead><tr>
+          <th>#</th><th>端口</th><th>协议</th><th>动作</th><th>来源</th><th>备注</th></tr></thead><tbody>
+        ${data.rules.map((rule) => `<tr>
+          <td class="cell-sub">${rule.index}</td>
+          <td class="cell-main mono">${esc(rule.port || '全部')}</td>
+          <td class="cell-sub">${esc(rule.proto || '-')}</td>
+          <td><span class="badge ${String(rule.action).startsWith('ALLOW') || rule.action === 'ACCEPT' ? 'ok' : 'danger'}">${esc(rule.action)}</span></td>
+          <td class="cell-sub mono">${esc(rule.from)}${rule.v6 ? ' (v6)' : ''}</td>
+          <td>${rule.risky ? '<span class="badge danger">对全网放行</span>' : ''}</td>
+        </tr>`).join('')}</tbody></table>` : '<div class="empty">没有可展示的规则</div>'}
+    </div></div>`;
+
+  host.onclick = async (event) => {
+    const btn = event.target.closest('[data-act]');
+    if (!btn) return;
+    if (btn.dataset.act === 'fw-reload') { await ctx.open('firewall'); return; }
+    const action = btn.dataset.act === 'fw-allow' ? 'allow' : 'deny';
+    const port = ($('#fw-port', host)?.value || '').trim();
+    const proto = $('#fw-proto', host)?.value || 'tcp';
+    if (!/^\d{1,5}$/.test(port)) { toast('端口需要是 1-65535 的数字', 'err'); return; }
+    const ok = await confirmDialog({
+      title: action === 'allow' ? '放行端口' : '拒绝端口', danger: action === 'deny',
+      confirmText: action === 'allow' ? '放行' : '拒绝',
+      message: `将对 <b class="mono">${esc(port)}/${esc(proto)}</b> 执行 ufw ${action}。确定继续？`,
+    });
+    if (!ok) return;
+    try {
+      const res = await api.postConfirmed(`/api/panel/infra/firewall/${action}`,
+        { port: Number(port), proto }, 'firewall');
+      toast(res.message);
+      await ctx.open('firewall');
+    } catch (err) { toast(err.message, 'err'); }
+  };
+  return null;
+}
+
+/* ---------- 反代 / 证书 ---------- */
+
+function opsProxyBlock(data) {
+  if (!data.nginx) {
+    return `<div class="card"><h2>nginx</h2><div class="dim">未检测到 nginx。</div></div>`;
+  }
+  const test = data.nginx.config_test || {};
+  return `<div class="card">
+    <div class="toolbar" style="margin-bottom:10px">
+      <span class="badge info">${esc(data.nginx.version || 'nginx')}</span>
+      <span class="badge ${test.ok ? 'ok' : 'danger'}">nginx -t ${test.ok ? '通过' : '未通过'}</span>
+      <span class="badge">${(data.nginx.sites || []).length} 个站点</span>
+      <div class="spacer"></div>
+      <button class="btn sm primary" data-act="px-reload">重载配置</button>
+    </div>
+    <div class="dim mono" style="margin-bottom:6px">${esc(data.nginx.dir || '')}</div>
+    <div class="dim mono">${(data.nginx.sites || []).join(' · ') || '（站点目录为空或不存在）'}</div>
+    ${test.output ? `<div class="log-output" style="max-height:180px;margin-top:10px">${esc(test.output)}</div>` : ''}
+  </div>`;
+}
+
+function opsCertTable(certs) {
+  if (!certs.length) return '<div class="empty">没有找到 Let\'s Encrypt 证书</div>';
+  return `<table class="data"><thead><tr>
+      <th>域名</th><th>到期时间</th><th>剩余</th></tr></thead><tbody>
+    ${certs.map((cert) => `<tr>
+      <td class="cell-main mono">${esc(cert.name)}</td>
+      <td class="cell-sub">${esc(cert.not_after || '未读取到（缺少 openssl）')}</td>
+      <td>${cert.days_left === null ? '-' : (cert.expiring
+    ? `<span class="badge danger">${cert.days_left} 天</span>`
+    : `<span class="badge ok">${cert.days_left} 天</span>`)}</td>
+    </tr>`).join('')}</tbody></table>`;
+}
+
+async function opsProxy(host, ctx) {
+  const data = await api.get('/api/panel/infra/proxy');
+  const certs = await api.get('/api/panel/infra/proxy/certificates')
+    .catch(() => ({ certificates: [], capabilities: {} }));
+  host.innerHTML = `
+    ${opsProxyBlock(data)}
+    <div class="card" style="margin-top:14px">
+      <h2>Caddy</h2>
+      <div class="dim">${data.caddy ? esc(data.caddy.version || '已安装') : '未检测到 caddy。'}</div>
+    </div>
+    <div class="card flush" style="margin-top:14px">
+      <div class="toolbar" style="padding:12px 14px 0;margin-bottom:8px">
+        <h2 style="margin:0">证书（${esc(certs.dir || '/etc/letsencrypt/live')}）</h2>
+        <div class="spacer"></div>
+        <span class="dim">剩余不足 ${certs.warn_days || 30} 天标记为告警</span>
+      </div>
+      <div class="table-wrap">${opsCertTable(certs.certificates || [])}</div>
+    </div>`;
+
+  host.onclick = async (event) => {
+    const btn = event.target.closest('[data-act]');
+    if (!btn || btn.dataset.act !== 'px-reload') return;
+    const ok = await confirmDialog({
+      title: '重载 nginx', confirmText: '重载',
+      message: '将先执行 <span class="mono">nginx -t</span> 校验，通过后重载配置。确定继续？',
+    });
+    if (!ok) return;
+    try {
+      const res = await api.postConfirmed('/api/panel/infra/proxy/reload', {}, 'proxy');
+      toast(res.message);
+      await ctx.open('proxy');
+    } catch (err) { toast(err.message, 'err'); }
+  };
+  return null;
+}
+
+/* ---------- 数据库 ---------- */
+
+async function opsDb(host) {
+  const data = await api.get('/api/panel/infra/databases');
+  const usable = data.engines.filter((engine) => engine.available);
+  if (!usable.length) {
+    host.innerHTML = opsHint('数据库探测不可用',
+      '本机没有 <span class="mono">mysql</span> / <span class="mono">psql</span> / '
+      + '<span class="mono">redis-cli</span> 客户端，无法连接数据库。<br>'
+      + '只做只读探测（<span class="mono">SHOW STATUS</span> / '
+      + '<span class="mono">SELECT version()</span> / <span class="mono">INFO</span>），不支持执行自定义 SQL。');
+    return null;
+  }
+  host.innerHTML = `
+    <div class="card">
+      <div class="toolbar" style="margin-bottom:10px">
+        ${data.engines.map((engine) => `<span class="badge ${engine.available ? 'ok' : ''}">${esc(engine.label)}${engine.available ? '' : '（未安装）'}</span>`).join('')}
+        <div class="spacer"></div>
+        <span class="dim">只读探测，禁止自定义 SQL</span>
+      </div>
+      <div class="row" style="margin-bottom:8px">
+        <select class="input" id="db-kind" style="width:170px">
+          ${usable.map((engine) => `<option value="${esc(engine.kind)}">${esc(engine.label)}</option>`).join('')}
+        </select>
+        <input class="input" id="db-host" value="127.0.0.1" placeholder="主机" style="width:150px">
+        <input class="input" id="db-port" placeholder="端口（默认）" style="width:130px">
+      </div>
+      <div class="row" style="margin-bottom:8px">
+        <input class="input" id="db-user" placeholder="用户名（可选）" style="width:170px">
+        <input class="input" id="db-name" placeholder="库名（可选）" style="width:170px">
+        <input class="input" id="db-pass" type="password" placeholder="密码（可选，不会写审计）" style="width:220px">
+        <button class="btn sm primary" data-act="db-probe">探测</button>
+      </div>
+      <div id="db-output" class="log-output" style="max-height:320px">点击「探测」执行固定的只读命令</div>
+    </div>`;
+
+  host.onclick = async (event) => {
+    const btn = event.target.closest('[data-act]');
+    if (!btn || btn.dataset.act !== 'db-probe') return;
+    const body = {
+      kind: $('#db-kind', host).value,
+      host: $('#db-host', host).value.trim() || '127.0.0.1',
+      user: $('#db-user', host).value.trim(),
+      database: $('#db-name', host).value.trim(),
+      password: $('#db-pass', host).value,
+    };
+    const port = $('#db-port', host).value.trim();
+    if (port) body.port = Number(port);
+    const out = $('#db-output', host);
+    out.textContent = '探测中…';
+    btn.disabled = true;
+    try {
+      const res = await api.post('/api/panel/infra/databases/probe', body, 60000);
+      out.textContent = res.output || '（无输出）';
+      toast('探测成功');
+    } catch (err) {
+      out.textContent = err.message;
+      toast(err.message, 'err');
+    } finally { btn.disabled = false; }
+  };
+  return null;
+}
+
+/* ---------- SSH 公钥 ---------- */
+
+async function opsSsh(host, ctx) {
+  const data = await api.get('/api/panel/infra/ssh/keys');
+  host.innerHTML = `
+    <div class="card">
+      <div class="toolbar" style="margin-bottom:10px">
+        <span class="badge">${data.keys.length} 把公钥</span>
+        <span class="dim mono">${esc(data.path)}</span>
+        <div class="spacer"></div>
+        ${data.capabilities.ssh_keygen ? '' : '<span class="badge warn">缺少 ssh-keygen，无法计算指纹</span>'}
+        <button class="btn sm" data-act="ss-reload">刷新</button>
+      </div>
+      <label class="field"><span>追加公钥（整行粘贴，支持 ssh-rsa / ssh-ed25519 / ecdsa / sk-）</span>
+        <textarea class="input mono" id="ss-line" spellcheck="false" style="height:70px"
+          placeholder="ssh-ed25519 AAAA... me@laptop"></textarea></label>
+      <button class="btn sm primary" data-act="ss-add">追加</button>
+    </div>
+    <div class="card flush"><div class="table-wrap">
+      ${data.keys.length ? `<table class="data"><thead><tr>
+          <th>类型</th><th>注释</th><th>指纹</th><th></th></tr></thead><tbody>
+        ${data.keys.map((key, index) => `<tr>
+          <td class="cell-main mono">${esc(key.type)}</td>
+          <td class="cell-sub">${esc(key.comment || '-')}</td>
+          <td class="cell-sub mono">${esc(key.fingerprint || '-')}</td>
+          <td class="actions"><button class="btn sm danger" data-act="ss-del" data-index="${index}">删除</button></td>
+        </tr>`).join('')}</tbody></table>` : '<div class="empty">authorized_keys 里还没有公钥</div>'}
+    </div></div>`;
+
+  host.onclick = async (event) => {
+    const btn = event.target.closest('[data-act]');
+    if (!btn) return;
+    if (btn.dataset.act === 'ss-reload') { await ctx.open('ssh'); return; }
+    if (btn.dataset.act === 'ss-add') {
+      const line = $('#ss-line', host).value.trim();
+      if (!line) { toast('请先粘贴公钥', 'err'); return; }
+      try {
+        const res = await api.post('/api/panel/infra/ssh/keys', { line });
+        toast(res.message);
+        await ctx.open('ssh');
+      } catch (err) { toast(err.message, 'err'); }
+      return;
+    }
+    if (btn.dataset.act === 'ss-del') {
+      const key = data.keys[Number(btn.dataset.index)];
+      const ok = await confirmDialog({
+        title: '删除公钥', danger: true, confirmText: '删除',
+        message: `将精确删除这一行公钥（${esc(key.comment || key.type)}），之后用该私钥将无法登录。`,
+      });
+      if (!ok) return;
+      try {
+        const res = await api.delBody('/api/panel/infra/ssh/keys', { line: key.line });
+        toast(res.message);
+        await ctx.open('ssh');
+      } catch (err) { toast(err.message, 'err'); }
+    }
+  };
+  return null;
+}
+
+/* ---------- 网络工具 ---------- */
+
+async function opsNet(host) {
+  host.innerHTML = `
+    <div class="card">
+      <div class="toolbar" style="margin-bottom:10px">
+        <select class="input" id="net-tool" style="width:150px">
+          <option value="ping">ping</option><option value="traceroute">traceroute</option>
+          <option value="mtr">mtr</option><option value="curl">curl -I</option>
+        </select>
+        <input class="input mono" id="net-target" placeholder="目标：域名 / IP / IPv6" style="width:240px">
+        <button class="btn sm primary" data-act="net-run">执行</button>
+        <div class="spacer"></div>
+        <span class="dim">只允许字母、数字、. : - [ ]，禁止管道与重定向</span>
+      </div>
+      <div class="log-output" id="net-output" style="max-height:420px">选择工具并输入目标后执行</div>
+    </div>`;
+
+  host.onclick = async (event) => {
+    const btn = event.target.closest('[data-act]');
+    if (!btn || btn.dataset.act !== 'net-run') return;
+    const tool = $('#net-tool', host).value;
+    const target = $('#net-target', host).value.trim();
+    const out = $('#net-output', host);
+    if (!target) { toast('请填写目标地址', 'err'); return; }
+    out.textContent = `${tool} ${target} …`;
+    btn.disabled = true;
+    try {
+      const res = await api.post('/api/panel/infra/net/tool', { tool, target }, 60000);
+      out.textContent = res.output || '（无输出）';
+      if (!res.ok) toast(res.error || '命令返回非 0', 'err');
+    } catch (err) {
+      out.textContent = err.message;
+      toast(err.message, 'err');
+    } finally { btn.disabled = false; }
+  };
+  return null;
+}
+
+async function opsRecording(root) {
+  let timer = null;
+
+  const playRecording = async (name) => {
+    const data = await api.get(`/api/panel/recordings/${encodeURIComponent(name)}`);
+    const pre = document.createElement('pre');
+    pre.className = 'mono';
+    pre.style.cssText = 'margin:0;white-space:pre-wrap;word-break:break-all;max-height:60vh;'
+      + 'overflow:auto;background:#0b0d0f;color:#d7e0e6;padding:12px;border-radius:8px;font-size:12.5px;line-height:1.45';
+    pre.textContent = '（开始回放…）';
+    const handle = openModal({
+      title: `回放 · ${name}`,
+      body: pre,
+      size: 'wide',
+      // 无论点 ✕、点遮罩还是 Esc 关闭都要停掉回放定时器（以前只有 Esc 会清）
+      onClose: () => { if (timer) clearTimeout(timer); timer = null; },
+    });
+    const events = (data.events || []).filter((ev) => ev.kind === 'o');
+    if (!events.length) { pre.textContent = '（这段录制没有输出）'; return; }
+    pre.textContent = '';
+    let index = 0;
+    let text = '';
+    const tick = () => {
+      timer = null;
+      if (index >= events.length) { pre.textContent = text; pre.scrollTop = pre.scrollHeight; return; }
+      const current = events[index];
+      text += current.data;
+      // 单段过长时截掉头部，避免回放把内存吃满
+      if (text.length > 400000) text = text.slice(-300000);
+      pre.textContent = text;
+      pre.scrollTop = pre.scrollHeight;
+      index += 1;
+      if (index >= events.length) return;
+      // 间隔压缩到最多 0.6 秒，长停顿（装包、编译）不会让回放看着像卡死
+      const gap = Math.min(0.6, Math.max(0, events[index].time - current.time));
+      timer = setTimeout(tick, gap * 1000);
+    };
+    tick();
+  };
+
+  const render = async () => {
+    const data = await api.get('/api/panel/recordings');
+    const rows = data.items.length ? data.items.map((item) => `
+      <tr>
+        <td class="mono">${esc(item.name)}</td>
+        <td class="num">${bytes(item.size)}</td>
+        <td>${esc(new Date(item.time * 1000).toLocaleString())}</td>
+        <td class="row" style="justify-content:flex-end;gap:6px">
+          <button class="btn sm" data-play="${esc(item.name)}">回放</button>
+          <button class="btn sm danger" data-del="${esc(item.name)}">删除</button>
+        </td>
+      </tr>`).join('')
+      : '<tr><td colspan="4"><div class="empty">还没有录制。打开上面的开关后，新开的终端会话才会被记录。</div></td></tr>';
+    root.innerHTML = `
+      <div class="card">
+        <div class="row" style="justify-content:space-between;align-items:flex-start;gap:16px">
+          <div>
+            <h2 style="margin:0">会话录制</h2>
+            <div class="dim" style="margin-top:6px;line-height:1.7">
+              格式为 asciinema v2（JSONL），同一文件也能用 <span class="mono">asciinema play &lt;文件&gt;</span> 在命令行回放。
+              录制只对新开的终端会话生效；单文件超过设置里的体积上限会自动停止。<br>
+              目录：<span class="mono">${esc(data.dir)}</span>
+            </div>
+          </div>
+          <label class="row" style="gap:8px;align-items:center;white-space:nowrap">
+            <input type="checkbox" id="rec-enabled" ${data.enabled ? 'checked' : ''}>
+            <span>录制新会话</span>
+          </label>
+        </div>
+      </div>
+      <div class="card">
+        <div class="table-wrap">
+          <table class="data">
+            <thead><tr><th>文件</th><th class="num">大小</th><th>时间</th><th></th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </div>`;
+
+    const toggle = $('#rec-enabled', root);
+    toggle.addEventListener('change', async () => {
+      try {
+        await api.put('/api/panel/prefs', {
+          values: { 'terminal.record_sessions': toggle.checked },
+        });
+        toast(toggle.checked ? '已开启会话录制' : '已关闭会话录制');
+      } catch (err) {
+        toggle.checked = !toggle.checked;
+        toast(err.message, 'danger');
+      }
+    });
+    $$('[data-play]', root).forEach((button) => {
+      button.addEventListener('click', () => {
+        playRecording(button.dataset.play).catch((err) => toast(err.message, 'danger'));
+      });
+    });
+    $$('[data-del]', root).forEach((button) => {
+      button.addEventListener('click', async () => {
+        const name = button.dataset.del;
+        const ok = await confirmDialog({
+          title: '删除录制',
+          message: `确定删除 <span class="mono">${esc(name)}</span>？删除后不可恢复。`,
+          confirmText: '删除',
+          danger: true,
+        });
+        if (!ok) return;
+        try {
+          await api.del(`/api/panel/recordings/${encodeURIComponent(name)}`);
+          toast('已删除');
+          await render();
+        } catch (err) {
+          toast(err.message, 'danger');
+        }
+      });
+    });
+  };
+
+  await render();
+  return () => { if (timer) clearTimeout(timer); timer = null; };
+}
+
+const OPS_PANELS = {
+  cron: opsCron,
+  backup: opsBackup,
+  update: opsUpdate,
+  docker: opsDocker,
+  firewall: opsFirewall,
+  proxy: opsProxy,
+  db: opsDb,
+  ssh: opsSsh,
+  net: opsNet,
+  recording: opsRecording,
+};
+
+registerView('ops', {
+  title: '运维',
+  async render(root, res) {
+    root.innerHTML = `
+      <div class="card" style="margin-bottom:14px">
+        <div class="toolbar" id="ops-tabs" style="margin-bottom:0">
+          ${OPS_TABS.map((tab, index) => `<button class="btn sm${index === 0 ? ' primary' : ''}"
+            data-tab-id="${tab.id}">${tab.label}</button>`).join('')}
+        </div>
+      </div>
+      <div id="ops-body"><div class="empty">加载中…</div></div>`;
+
+    const body = $('#ops-body', root);
+    let cleanup = null;
+    let seq = 0;
+
+    const open = async (id) => {
+      const current = (seq += 1);
+      if (cleanup) {
+        try { cleanup(); } catch (err) { console.error(err); }
+        cleanup = null;
+      }
+      $$('#ops-tabs .btn', root).forEach((el) => {
+        el.classList.toggle('primary', el.dataset.tabId === id);
+      });
+      body.innerHTML = '<div class="empty">加载中…</div>';
+      let result = null;
+      try {
+        result = await OPS_PANELS[id](body, { open });
+      } catch (err) {
+        body.innerHTML = opsFail(err);
+      }
+      if (current !== seq) { if (typeof result === 'function') result(); return; }
+      // 登记到视图资源表：切换/离开视图时由路由统一回收（定时器/订阅同理）
+      cleanup = res.own(typeof result === 'function' ? result : null);
+    };
+
+    $('#ops-tabs', root).onclick = (event) => {
+      const btn = event.target.closest('[data-tab-id]');
+      if (btn) open(btn.dataset.tabId);
+    };
+    await open('cron');
+    return () => {
+      seq += 1;
+      if (cleanup) { try { cleanup(); } catch (err) { console.error(err); } cleanup = null; }
+    };
+  },
+});
+
 registerView('settings', {
   title: '设置',
   async render(root) {
@@ -3744,6 +5080,16 @@ registerView('settings', {
     let tz = {};
     let backups = [];
     let busy = false;
+    // 用户管理（2.0 M4）：仅内网模式 + admin 才拉取；其他人拿到空表也不会报错
+    let usersData = [];
+    let multiUser = false;
+    if (isInternal() && isAdmin()) {
+      try {
+        const res = await api.get('/api/panel/users');
+        usersData = res.users || [];
+        multiUser = !!res.multi_user;
+      } catch (err) { usersData = []; }
+    }
 
     async function loadQuick() {
       const [p, b, g] = await Promise.all([
@@ -3791,6 +5137,172 @@ registerView('settings', {
         <span><b>${esc(label)}</b>${danger ? ' <span class="badge danger">谨慎</span>' : ''}
           <div class="dim" style="font-size:11.5px;line-height:1.6">${esc(hint || field.note)}</div></span>
       </label>`;
+    }
+
+    function roleBadge(role) {
+      const meta = {
+        admin: ['danger', 'admin · 管理员'],
+        operator: ['warn', 'operator · 运维'],
+        viewer: ['info', 'viewer · 只读'],
+      };
+      const [cls, label] = meta[role] || ['', role];
+      return `<span class="badge ${cls}">${esc(label)}</span>`;
+    }
+
+    async function reloadUsers() {
+      try {
+        const res = await api.get('/api/panel/users');
+        usersData = res.users || [];
+        multiUser = !!res.multi_user;
+      } catch (err) { usersData = []; }
+      paint();
+    }
+
+    async function runUserAction(btn) {
+      const id = btn.dataset.userRole || btn.dataset.userReset
+        || btn.dataset.userToggle || btn.dataset.userDelete;
+      const user = usersData.find((u) => u.id === id);
+      if (!user) return;
+      try {
+        if (btn.dataset.userRole) {
+          const role = await promptRole(user.role);
+          if (!role || role === user.role) return;
+          const res = await api.put(`/api/panel/users/${id}`, { role });
+          toast(res.message || '角色已更新');
+        } else if (btn.dataset.userReset) {
+          const password = await promptDialog({
+            title: `重置 ${user.username} 的密码`,
+            label: '新密码（至少 12 位，不要用弱口令）', confirmText: '重置',
+          });
+          if (!password) return;
+          const res = await api.put(`/api/panel/users/${id}`, { password });
+          toast(res.message || '密码已重置');
+        } else if (btn.dataset.userToggle) {
+          const disabled = btn.dataset.disabled !== '1';
+          const ok = await confirmDialog({
+            title: disabled ? '禁用账号' : '启用账号', danger: disabled,
+            confirmText: disabled ? '禁用' : '启用',
+            message: `${disabled ? '禁用' : '启用'} <b>${esc(user.username)}</b>？${disabled
+              ? '<br><span class="dim">该账号的会话会立即失效，无法再登录。</span>' : ''}`,
+          });
+          if (!ok) return;
+          const res = await api.put(`/api/panel/users/${id}`, { disabled });
+          toast(res.message || '已更新');
+        } else if (btn.dataset.userDelete) {
+          const ok = await confirmDialog({
+            title: '删除用户', danger: true, confirmText: '删除', phrase: 'DELETE',
+            message: `将永久删除 <b>${esc(user.username)}</b>，其会话立即失效。`,
+          });
+          if (!ok) return;
+          const res = await api.del(`/api/panel/users/${id}`);
+          toast(res.message || '已删除');
+        }
+        await reloadUsers();
+      } catch (err) { toast(err.message, 'err'); }
+    }
+
+    function promptRole(current) {
+      return new Promise((resolve) => {
+        const body = document.createElement('div');
+        body.innerHTML = `<label class="field"><span>角色</span>
+          <select class="input" id="role-select">
+            ${[['viewer', 'viewer（只读）'], ['operator', 'operator（运维）'],
+              ['admin', 'admin（管理员）']]
+              .map(([value, label]) => `<option value="${value}"${value === current ? ' selected' : ''}>${label}</option>`)
+              .join('')}
+          </select></label>`;
+        const foot = document.createElement('div');
+        foot.className = 'row';
+        foot.innerHTML = '<button class="btn" data-cancel>取消</button>'
+          + '<button class="btn primary" data-ok>保存</button>';
+        const finish = (value) => { modal.close(); resolve(value); };
+        const modal = openModal({
+          title: '修改角色', body, footer: foot, size: 'narrow',
+          onEscape: () => finish(null),
+        });
+        $('[data-cancel]', foot).onclick = () => finish(null);
+        $('[data-ok]', foot).onclick = () => finish($('#role-select', modal.body).value);
+      });
+    }
+
+    function usersCard() {
+      if (!isInternal() || !isAdmin()) return '';
+      const rows = usersData.map((user) => `<tr>
+        <td class="cell-main">${esc(user.username)}</td>
+        <td>${roleBadge(user.role)}</td>
+        <td>${user.disabled ? '<span class="badge danger">已禁用</span>'
+          : '<span class="badge ok">启用</span>'}</td>
+        <td>${user.totp_enabled ? '<span class="badge ok">已开启</span>' : '<span class="dim">-</span>'}</td>
+        <td class="cell-sub">${datetime(user.created_at)}</td>
+        <td><div class="row" style="gap:6px;flex-wrap:wrap">
+          <button class="btn sm ghost" data-user-role="${esc(user.id)}">改角色</button>
+          <button class="btn sm ghost" data-user-reset="${esc(user.id)}">重置密码</button>
+          <button class="btn sm ghost" data-user-toggle="${esc(user.id)}"
+            data-disabled="${user.disabled ? '1' : '0'}">${user.disabled ? '启用' : '禁用'}</button>
+          <button class="btn sm danger" data-user-delete="${esc(user.id)}">删除</button>
+        </div></td></tr>`).join('');
+      return `<div class="card" style="grid-column:1/-1">
+        <h2>用户管理 <span class="spacer"></span>
+          <span class="dim" style="font-size:12px">${usersData.length} 个账号 ·
+            多用户模式${multiUser ? '已启用' : '未启用'}</span></h2>
+        <div class="dim" style="font-size:12px;line-height:1.7;margin:4px 0 12px">
+          角色：<b>viewer</b> 只读（GET）· <b>operator</b> 运维（文件写、应用启停、服务与任务，
+          但不能碰电源、令牌、用户、配置导入导出与面板升级）· <b>admin</b> 全部权限。
+          ${multiUser ? '' : '当前仍是<b>单密码模式</b>：创建第一个用户后，原密码会自动迁移成'
+            + ' <span class="mono">admin</span> 账号，仍可用原密码登录。'}
+        </div>
+        <div class="table-wrap"><table class="data">
+          <thead><tr><th>用户名</th><th>角色</th><th>状态</th><th>二次认证</th>
+            <th>创建时间</th><th>操作</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="6"><div class="empty">还没有额外用户</div></td></tr>'}</tbody>
+        </table></div>
+        <form id="user-create-form" class="row" style="margin-top:14px;gap:10px;flex-wrap:wrap">
+          <input class="input" id="user-name" placeholder="用户名（3~32 位字母数字 . _ -）"
+            autocomplete="off" style="max-width:240px">
+          <input class="input" id="user-password" type="password" autocomplete="new-password"
+            placeholder="初始密码（至少 12 位）" style="max-width:240px">
+          <select class="input" id="user-role" style="max-width:180px">
+            <option value="viewer">viewer（只读）</option>
+            <option value="operator">operator（运维）</option>
+            <option value="admin">admin（管理员）</option>
+          </select>
+          <button class="btn primary" type="submit">新建用户</button>
+        </form>
+      </div>`;
+    }
+
+    function localeCard() {
+      const option = (value, label) => `<option value="${value}"${
+        I18N.locale === value ? ' selected' : ''}>${label}</option>`;
+      return `<div class="card">
+        <h2>界面语言</h2>
+        <label class="field" style="max-width:300px"><span>语言 / Language</span>
+          <select class="input" id="locale-select">
+            ${option('zh-CN', '简体中文（zh-CN）')}${option('en-US', 'English (en-US)')}
+          </select></label>
+        <div class="dim" style="font-size:12px;margin-top:10px">
+          切换后立即生效：只重绘导航、标题与静态标签，不整页刷新。
+          未翻译的业务文案回退中文。
+        </div>
+      </div>`;
+    }
+
+    function platformCard() {
+      if (!isInternal()) return '';
+      return `<div class="card">
+        <h2>自诊断与接口文档</h2>
+        <div class="row" style="flex-wrap:wrap">
+          <button class="btn" data-act="diagnostics">下载自诊断包</button>
+          <a class="btn ghost" href="/api/docs" target="_blank" rel="noopener noreferrer">接口文档</a>
+          <a class="btn ghost" href="/api/openapi.json" target="_blank"
+             rel="noopener noreferrer">OpenAPI</a>
+        </div>
+        <div class="dim" style="font-size:12px;margin-top:10px;line-height:1.7">
+          诊断包含版本/脱敏配置/能力探测/最近指标与审计，
+          <b>不含密码哈希、TOTP 密钥与 Agent 令牌</b>。
+          接口文档为自包含页面（内联样式，不依赖 CDN），离线内网也能打开。
+        </div>
+      </div>`;
     }
 
     function bootCard() {
@@ -4004,6 +5516,12 @@ registerView('settings', {
           <button class="btn" data-act="goto-security">打开安全中心</button>
         </div>
 
+        ${localeCard()}
+
+        ${usersCard()}
+
+        ${platformCard()}
+
         <div class="card">
           <h2>运行环境</h2>
           <dl class="kv">
@@ -4073,7 +5591,7 @@ serverpanel --show-mode          # 查看当前模式</div>
         <div class="card">
           <h2>快捷操作</h2>
           <div class="row">
-            ${isInternal() ? '<button class="btn" data-act="terminal">打开终端</button>' : ''}
+            ${isInternal() && isAdmin() ? '<button class="btn" data-act="terminal">打开终端</button>' : ''}
             ${isInternal() ? `<button class="btn danger" data-act="reboot">重启系统</button>
             <button class="btn danger" data-act="shutdown">关机</button>` : ''}
             <button class="btn ghost" data-act="logout">退出登录</button>
@@ -4119,6 +5637,31 @@ serverpanel --show-mode          # 查看当前模式</div>
         } catch (err) { toast(err.message, 'err'); }
       };
 
+      const localeSelect = $('#locale-select');
+      if (localeSelect) {
+        localeSelect.onchange = async (event) => {
+          await applyLocale(event.target.value);
+          toast(`界面语言已切换：${I18N.locale}`);
+        };
+      }
+
+      const userForm = $('#user-create-form');
+      if (userForm) {
+        userForm.onsubmit = async (event) => {
+          event.preventDefault();
+          const username = $('#user-name').value.trim();
+          const password = $('#user-password').value;
+          const role = $('#user-role').value;
+          if (!username || !password) { toast('用户名和密码都要填', 'err'); return; }
+          try {
+            const res = await api.post('/api/panel/users', { username, password, role });
+            toast(res.message || '用户已创建', 'ok');
+            userForm.reset();
+            await reloadUsers();
+          } catch (err) { toast(err.message, 'err'); }
+        };
+      }
+
       $('#btn-self-update').onclick = async () => {
         const before = hz?.build || hz?.version || '';
         const ok = await confirmDialog({
@@ -4130,7 +5673,7 @@ serverpanel --show-mode          # 查看当前模式</div>
         btn.disabled = true;
         btn.textContent = '升级中…';
         try {
-          await api.post('/api/system/self-update', {});
+          await api.postConfirmed('/api/system/self-update', {}, 'update');
         } catch (err) {
           toast(err.message, 'err');
           btn.disabled = false;
@@ -4401,7 +5944,7 @@ serverpanel --show-mode          # 查看当前模式</div>
       const form = new FormData();
       form.append('file', file);
       try {
-        const res = await api.upload('/api/panel/config/import', form);
+        const res = await api.uploadConfirmed('/api/panel/config/import', form, 'config');
         toast(res.message, 'ok', 8000);
         await loadQuick();
         paint();
@@ -4422,10 +5965,18 @@ serverpanel --show-mode          # 查看当前模式</div>
       const bootBtn = event.target.closest('[data-boot-action]');
       if (bootBtn) { await runBootAction(bootBtn.dataset.bootAction); return; }
 
+      const userBtn = event.target.closest(
+        '[data-user-role],[data-user-reset],[data-user-toggle],[data-user-delete]');
+      if (userBtn) { await runUserAction(userBtn); return; }
+
       const action = event.target.dataset?.act || event.target.closest('[data-act]')?.dataset.act;
       if (!action) return;
+      if (action === 'diagnostics') {
+        location.href = '/api/panel/diagnostics';
+        return;
+      }
       if (action === 'mode-help') { showModeHelp(); return; }
-      if (action === 'terminal') { navigate('terminal'); return; }
+      if (action === 'terminal') { if (!isAdmin()) return; navigate('terminal'); return; }
       if (action === 'goto-security') { navigate('security'); return; }
       if (action === 'logout') { await api.post('/api/auth/logout', {}); location.reload(); return; }
       if (action === 'copy-termux') { copyText(bootInfo.termux_script, '已复制'); return; }
@@ -4438,7 +5989,7 @@ serverpanel --show-mode          # 查看当前模式</div>
         });
         if (!ok) return;
         try {
-          const res = await api.post('/api/system/power', { action, confirm: 'CONFIRM' });
+          const res = await api.postConfirmed('/api/system/power', { action, confirm: 'CONFIRM' }, 'power');
           toast(res.message, 'warn');
         } catch (err) { toast(err.message, 'err'); }
         return;
@@ -4485,5 +6036,298 @@ serverpanel --show-mode          # 查看当前模式</div>
     paint();
   },
 });
+
+
+/* ============================ 账号 / 语言 / PWA ============================ */
+
+const ROLE_LABEL = { admin: '管理员', operator: '运维', viewer: '只读' };
+
+function renderUserBadge() {
+  const badge = $('#user-badge');
+  if (!badge) return;
+  const role = ROLE_LABEL[authUser.role] || authUser.role;
+  badge.textContent = `${authUser.username} · ${role}`;
+  badge.className = `badge user-badge ${authUser.role}`;
+  badge.title = authUser.multiUser
+    ? `当前登录：${authUser.username}（${role}）`
+    : '单密码模式：内置管理员';
+}
+
+/** 切换界面语言：只刷新导航/标题/静态标签，不整页 reload。 */
+async function applyLocale(locale) {
+  await I18N.load(locale);
+  I18N.apply();
+  buildNav();
+  renderTabs();
+  if (currentView && views[currentView]) {
+    $('#page-title').textContent = I18N.t(`view.${currentView}`, views[currentView].title);
+  }
+  if (isInternal() && isAdmin()) {
+    try {
+      await api.put('/api/panel/prefs', { values: { 'ui.locale': I18N.locale } });
+    } catch (err) {
+      toast(`界面语言已切换，但未能保存到服务端：${err.message}`, 'warn');
+    }
+  }
+}
+
+/** 内网模式下把服务端的 ui.locale 同步到本地（公网模式读不到 prefs，用本地缓存）。 */
+async function syncLocale() {
+  if (!isInternal()) return;
+  try {
+    const data = await api.get('/api/panel/prefs', 8000);
+    const locale = data.values ? data.values['ui.locale'] : '';
+    if (locale && locale !== I18N.locale) await applyLocale(locale);
+  } catch (err) { /* 无权限 / 公网模式：保持本地语言 */ }
+}
+
+function registerServiceWorker() {
+  if (!('serviceWorker' in navigator)) return;
+  // 新版 SW 接管后自动刷新一次（仅在页面原本已受 SW 控制时）：
+  // 否则升级面板后用户可能一直停留在旧壳上，需要手动清缓存
+  const hadController = !!navigator.serviceWorker.controller;
+  let reloaded = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!hadController || reloaded) return;
+    reloaded = true;
+    location.reload();
+  });
+  // 失败静默：http 内网地址、隐私模式、部分 WebView 都会注册失败，
+  // 那只是"少一层离线壳"，不影响在线使用。
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/static/sw.js').catch(() => {});
+  });
+}
+
+/* ============================ 命令面板（Ctrl / ⌘ + K）============================ */
+
+let paletteOpen = false;
+
+function paletteActions() {
+  const actions = visibleNav().map((item) => ({
+    id: `nav-${item.id}`,
+    label: `前往 · ${item.label}`,
+    hint: I18N.t(`view.${item.id}`, item.label),
+    run: () => navigate(item.id),
+  }));
+  actions.push({
+    id: 'toggle-save-mode',
+    label: '切换低功耗模式',
+    hint: '性能采样 2s ↔ 10s',
+    run: () => toggleSaveMode(),
+  });
+  if (isInternal()) {
+    actions.push({
+      id: 'open-trash',
+      label: '打开回收站',
+      hint: '文件管理 → 回收站',
+      run: async () => {
+        await navigate('files');
+        setTimeout(() => $('[data-act="trash"]')?.click(), 400);
+      },
+    });
+  }
+  return actions;
+}
+
+/** 常用任务（按需拉取，失败不影响其它命令）。 */
+async function paletteTaskActions() {
+  if (!isInternal()) return [];
+  try {
+    const data = await api.get('/api/panel/tasks', 8000);
+    return (data.tasks || []).map((task) => ({
+      id: `task-${task.id}`,
+      label: `执行任务 · ${task.title}`,
+      hint: (task.description || '常用任务').slice(0, 40),
+      run: async () => {
+        try {
+          const res = await api.post(`/api/panel/tasks/${task.id}/run`, {});
+          toast(`${task.title}：${res.ok ? '成功' : `失败（退出码 ${res.code}）`}`,
+                res.ok ? 'ok' : 'err');
+        } catch (err) { toast(err.message, 'err'); }
+      },
+    }));
+  } catch (err) {
+    return [];
+  }
+}
+
+async function toggleSaveMode() {
+  try {
+    const data = await api.get('/api/panel/prefs', 8000);
+    const next = !(data.values && data.values['power.save_mode']);
+    const res = await api.put('/api/panel/prefs', { values: { 'power.save_mode': next } });
+    toast(res.message || `低功耗模式已${next ? '开启' : '关闭'}`, 'ok');
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+function runPaletteTarget(target) {
+  if (!target) return;
+  // 命令的 run() 几乎都是 async（导航、请求）：不 catch 会变成未捕获的
+  // Promise rejection，用户点完看不到任何反馈
+  Promise.resolve()
+    .then(() => target.run())
+    .catch((err) => toast(err.message || '命令执行失败', 'err'));
+}
+
+function openPalette() {
+  if (paletteOpen) return;
+  paletteOpen = true;
+  const overlay = document.createElement('div');
+  overlay.className = 'palette-overlay';
+  overlay.innerHTML = `
+    <div class="palette" role="dialog" aria-label="命令面板">
+      <input class="input palette-input" id="palette-input"
+        placeholder="搜索视图、任务或操作…" autocomplete="off">
+      <div class="palette-list" id="palette-list"></div>
+      <div class="dim palette-hint">↑↓ 选择 · Enter 执行 · Esc 关闭</div>
+    </div>`;
+  document.body.appendChild(overlay);
+  const input = $('#palette-input', overlay);
+  const list = $('#palette-list', overlay);
+  let items = paletteActions();
+  let matched = items;
+  let index = 0;
+
+  function close() {
+    overlay.remove();
+    paletteOpen = false;
+    document.removeEventListener('keydown', onKey, true);
+  }
+
+  function paint() {
+    index = Math.max(0, Math.min(index, matched.length - 1));
+    list.innerHTML = matched.length ? matched.map((item, i) => `
+      <button class="palette-item${i === index ? ' active' : ''}" data-index="${i}">
+        <span>${esc(item.label)}</span><span class="dim">${esc(item.hint || '')}</span>
+      </button>`).join('') : '<div class="dim" style="padding:14px">没有匹配的命令</div>';
+    $$('.palette-item', list).forEach((el) => {
+      el.onclick = () => {
+        const target = matched[Number(el.dataset.index)];
+        close();
+        runPaletteTarget(target);
+      };
+    });
+  }
+
+  function filter() {
+    const q = input.value.trim().toLowerCase();
+    matched = items.filter((item) => !q
+      || `${item.label} ${item.hint || ''}`.toLowerCase().includes(q));
+    index = 0;
+    paint();
+  }
+
+  function onKey(event) {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      close();
+      return;
+    }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (!matched.length) return;
+      index = (index + (event.key === 'ArrowDown' ? 1 : -1) + matched.length) % matched.length;
+      paint();
+      return;
+    }
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      const target = matched[index];
+      close();
+      runPaletteTarget(target);
+    }
+  }
+
+  document.addEventListener('keydown', onKey, true);
+  input.addEventListener('input', filter);
+  paint();
+  setTimeout(() => input.focus(), 10);
+  paletteTaskActions().then((extra) => {
+    if (!paletteOpen) return;
+    items = items.concat(extra);
+    filter();
+  });
+}
+
+document.addEventListener('keydown', (event) => {
+  if (!(event.ctrlKey || event.metaKey) || (event.key !== 'k' && event.key !== 'K')) return;
+  event.preventDefault();
+  openPalette();
+});
+$('#btn-palette')?.addEventListener('click', openPalette);
+
+/* ============================ 视图：应用市场 ============================ */
+
+registerView('market', {
+  title: '应用市场',
+  async render(root) {
+    const data = await api.get('/api/panel/market');
+    const cards = data.apps.map((item) => `
+      <div class="card market-card">
+        <div class="row" style="align-items:baseline;gap:8px">
+          <h2 style="margin:0">${esc(item.name)}</h2>
+          <span class="badge ${item.installed ? 'ok' : ''}">${item.installed ? '已注册' : '未注册'}</span>
+          <div class="spacer"></div>
+          <span class="badge info">:${esc(item.port)}</span>
+        </div>
+        <p class="dim" style="font-size:12.5px;line-height:1.7;margin:8px 0">
+          ${esc(item.description)}</p>
+        <div class="market-cmd mono">${esc(item.command)}</div>
+        <div class="row" style="margin-top:12px">
+          ${item.installed
+            ? `<button class="btn sm ghost" data-goto-app>查看应用</button>`
+            : `<button class="btn sm primary" data-install="${esc(item.id)}">一键注册</button>`}
+          <button class="btn sm ghost" data-copy="${esc(item.id)}">复制命令</button>
+          <a class="btn sm ghost" href="${esc(item.docs)}" target="_blank"
+             rel="noopener noreferrer">文档</a>
+        </div>
+        ${(item.requires || []).length
+          ? `<div class="dim" style="font-size:11.5px;margin-top:8px">依赖：${
+            item.requires.map((r) => `<span class="mono">${esc(r)}</span>`).join('、')}</div>`
+          : ''}
+      </div>`).join('');
+    root.innerHTML = `
+      <div class="card" style="margin-bottom:14px">
+        <h2>应用市场 <span class="spacer"></span>
+          <span class="dim" style="font-size:12px">已注册 ${data.installed} / ${data.total}</span></h2>
+        <div class="dim" style="font-size:12px;line-height:1.8">
+          这里只做<b>提示与注册</b>：命令来自仓库内置清单（不接受手工输入），
+          注册后与「常驻应用」同构——<b>不会自动下载、也不会自动启动</b>。
+          先在服务器上装好依赖，再到「常驻应用」试运行即可。
+        </div>
+      </div>
+      <div class="grid c2">${cards || '<div class="card"><div class="empty">清单为空</div></div>'}</div>`;
+
+    root.onclick = async (event) => {
+      const installBtn = event.target.closest('[data-install]');
+      if (installBtn) {
+        const item = data.apps.find((a) => a.id === installBtn.dataset.install);
+        if (!item) return;
+        const ok = await confirmDialog({
+          title: '注册常驻应用', confirmText: '注册',
+          message: `将把 <b>${esc(item.name)}</b> 注册为常驻应用（不立即启动）。<br>
+            <span class="dim mono">${esc(item.command)}</span>`,
+        });
+        if (!ok) return;
+        try {
+          const res = await api.post(`/api/panel/market/${item.id}/install`, {});
+          toast(res.message || '已注册', 'ok', 6000);
+          await navigate('market');
+        } catch (err) { toast(err.message, 'err'); }
+        return;
+      }
+      const copyBtn = event.target.closest('[data-copy]');
+      if (copyBtn) {
+        const item = data.apps.find((a) => a.id === copyBtn.dataset.copy);
+        if (item) copyText(item.command, '命令已复制');
+        return;
+      }
+      if (event.target.closest('[data-goto-app]')) navigate('apps');
+    };
+  },
+});
+
 
 boot();

@@ -17,27 +17,37 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__
+from . import __version__, confirm
+from .alerts import alerts as alert_manager
 from .apps import supervisor
 from .audit import audit
-from .auth import require_auth
+from .auth import extract_token, request_denial, require_auth
 from .config import MODE_INTERNAL, MODE_LABELS, MODE_PUBLIC, config
 from .metrics import metrics
+from .metrics_store import store as metrics_store
+from .notify import notify
+from .prefs import prefs
 from .routes import (
     agent_routes,
     app_routes,
     apps_routes,
     auth_routes,
     file_routes,
+    infra_routes,
     log_routes,
+    maintenance_routes,
+    market_routes,
     panel_routes,
+    platform_routes,
     process_routes,
+    recording_routes,
     service_routes,
     snippets_routes,
     storage_routes,
     system_routes,
     tasks_routes,
     terminal_routes,
+    user_routes,
 )
 
 logger = logging.getLogger("serverpanel")
@@ -46,23 +56,40 @@ STATIC_DIR = BASE_DIR / "static"
 
 
 async def _sampler() -> None:
-    """每 2 秒采集一次性能数据，供历史图表使用。"""
+    """周期性采样并落盘；2.0 起低功耗模式自动把间隔放宽到 10 秒。
+
+    顺带每 6 小时清理一次过期审计文件（以前只在 import 时扫一次，
+    长期不重启的部署等于永不清理）。
+    """
     last_error: tuple[str, float] | None = None
+    next_audit_cleanup = 0.0
     while True:
         try:
-            await asyncio.to_thread(metrics.sample)
+            now = asyncio.get_running_loop().time()
+            if now >= next_audit_cleanup:
+                await asyncio.to_thread(audit.cleanup_old)
+                next_audit_cleanup = now + 6 * 3600
+            snapshot = await asyncio.to_thread(metrics.sample, True)
+            for text in alert_manager.evaluate(snapshot):
+                # 通知是阻塞 HTTP，必须下线程池（notify 内部失败只记审计）
+                await asyncio.to_thread(notify, "alert", text)
         except Exception as exc:  # 采集失败不应影响服务，但要留下线索（限频防日志洪水）
             now = asyncio.get_running_loop().time()
             if last_error is None or last_error[0] != repr(exc) or now - last_error[1] > 300:
                 logger.warning("性能采样失败: %r", exc)
                 last_error = (repr(exc), now)
-        await asyncio.sleep(2)
+        await asyncio.sleep(10 if prefs.get("power.save_mode") else 2)
 
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 幂等：同一进程多次进出 lifespan（测试/嵌入）时恢复审计落盘线程
+    audit.start()
     # 清扫历史遗留的下载打包临时目录（进程上次被杀时的残留）
     await asyncio.to_thread(file_routes.cleanup_stale_archives)
+    # 审计历史清理同样是同步 IO（可能扫上千个文件），移到启动后执行；
+    # 长期不重启的部署由 _sampler 每 6 小时复跑一次
+    await asyncio.to_thread(audit.cleanup_old)
     task = asyncio.create_task(_sampler())
     # 常驻应用守护：拉起 autostart 应用，并接管崩溃重启
     await supervisor.serve()
@@ -73,6 +100,11 @@ async def lifespan(app: FastAPI):
     # 面板停止时一并结束托管应用（托管进程与面板同生命周期；升级不中断靠守护的只 TERM 面板进程）
     with contextlib.suppress(Exception):
         await supervisor.shutdown()
+    # 收尾：指标库关闭（WAL checkpoint），避免下次启动残留 -wal/-shm。
+    # 注意审计不在这里 close：它是进程级单例，同一进程可能再次启动 lifespan
+    # （测试/嵌入），停了就再也开不回来。审计每条事件都立即 flush+close，无需收尾。
+    with contextlib.suppress(Exception):
+        await asyncio.to_thread(metrics_store.close)
 
 
 app = FastAPI(
@@ -106,6 +138,42 @@ def _origin_ok(request: Request) -> bool:
     if host and origin in (f"http://{host}", f"https://{host}"):
         return True
     return origin in config.allowed_origins
+
+
+@app.middleware("http")
+async def confirm_guard(request: Request, call_next):
+    """高危操作的服务端确认令牌（2.0 M1）。
+
+    路径命中矩阵时，必须带 ``X-Confirm-Token``（由 ``/api/panel/confirm`` 签发、
+    2 分钟有效、绑定动作）。前端确认框只是引导，真正的门禁在这里。
+    """
+    action = confirm.action_for(request.method, request.url.path)
+    # 公网模式下这些端点本来就会被 403 拦下，确认令牌只在允许执行的内网模式生效，
+    # 避免把"模式不允许"误报成"缺少确认令牌"。
+    # 令牌绑定申请者会话并一次性消费（防止同一令牌被重放/被其他人复用）。
+    if action and config.mode == MODE_INTERNAL and not confirm.verify(
+            request.headers.get("x-confirm-token", ""), action,
+            extract_token(request)):
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "危险操作需要服务端确认令牌（请在面板中确认后重试）"},
+        )
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def rbac_guard(request: Request, call_next):
+    """方法级 RBAC（2.0 M4）：只在启用多用户后才生效。
+
+    放在 security_headers 内层，是为了让 403 响应同样带上完整的安全响应头。
+    判定集中在 ``auth.rbac_denial``：viewer 的非 GET 一律拒绝（白名单
+    ``/api/auth/*`` 的自身账号操作），operator 对管理员专属路径拒绝；
+    未启用多用户时直接放行——单密码部署的行为与 M3 完全一致。
+    """
+    denial = request_denial(request)
+    if denial:
+        return JSONResponse(status_code=403, content={"detail": denial})
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -152,8 +220,17 @@ for module in (
     tasks_routes,
     snippets_routes,
     panel_routes,
+    maintenance_routes,
+    infra_routes,
+    user_routes,
+    market_routes,
+    platform_routes,
+    recording_routes,
 ):
     app.include_router(module.router)
+
+# 日志实时跟随的 WS 路由不带 require_auth（WS 内部自查会话）
+app.include_router(log_routes.stream_router)
 
 
 @app.get("/healthz")

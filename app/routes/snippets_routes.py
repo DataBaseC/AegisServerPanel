@@ -11,7 +11,6 @@ import sys
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from ..auth import require_internal
-from ..config import config
 from ..snippets import TOKEN_PLACEHOLDER, public_snippets, render_text, snippet_by_id
 
 router = APIRouter(prefix="/api/snippets", tags=["snippets"])

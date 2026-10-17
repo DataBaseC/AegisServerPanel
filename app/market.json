@@ -1,0 +1,86 @@
+{
+  "version": 1,
+  "updated_at": "2026-01-01",
+  "apps": [
+    {
+      "id": "nginx",
+      "name": "nginx",
+      "description": "轻量高性能的 HTTP / 反向代理服务器，适合做静态站点与前端入口。",
+      "command": "nginx -g 'daemon off;'",
+      "cwd": "/etc/nginx",
+      "port": 80,
+      "docs": "https://nginx.org/en/docs/",
+      "requires": ["nginx"]
+    },
+    {
+      "id": "uptime-kuma",
+      "name": "uptime-kuma",
+      "description": "自托管监控与状态页：HTTP / TCP / Ping 探活、告警通知、对外状态页。",
+      "command": "docker run --rm --name uptime-kuma -p 3001:3001 -v uptime-kuma:/app/data louislam/uptime-kuma:1",
+      "cwd": "",
+      "port": 3001,
+      "docs": "https://github.com/louislam/uptime-kuma/wiki",
+      "requires": ["docker"]
+    },
+    {
+      "id": "grafana",
+      "name": "grafana",
+      "description": "可视化与看板平台，可接 Prometheus / InfluxDB / Loki 等数据源。",
+      "command": "grafana-server --homepath=/usr/share/grafana",
+      "cwd": "",
+      "port": 3000,
+      "docs": "https://grafana.com/docs/grafana/latest/",
+      "requires": ["grafana-server"]
+    },
+    {
+      "id": "nextcloud",
+      "name": "nextcloud",
+      "description": "私有网盘与协作套件：文件同步、日历、联系人、在线文档。",
+      "command": "docker run --rm --name nextcloud -p 8080:80 -v nextcloud:/var/www/html nextcloud:stable",
+      "cwd": "",
+      "port": 8080,
+      "docs": "https://docs.nextcloud.com/server/latest/admin_manual/",
+      "requires": ["docker"]
+    },
+    {
+      "id": "n8n",
+      "name": "n8n",
+      "description": "可视化工作流自动化（低代码 iPaas），把各种服务串成自动化流程。",
+      "command": "n8n start",
+      "cwd": "",
+      "port": 5678,
+      "docs": "https://docs.n8n.io/hosting/",
+      "requires": ["n8n"]
+    },
+    {
+      "id": "minio",
+      "name": "minio",
+      "description": "兼容 S3 的对象存储，适合备份归档与自建图床、附件存储。",
+      "command": "minio server /var/lib/minio --console-address :9001",
+      "cwd": "",
+      "port": 9000,
+      "docs": "https://min.io/docs/minio/linux/index.html",
+      "requires": ["minio"]
+    },
+    {
+      "id": "gitea",
+      "name": "gitea",
+      "description": "轻量自托管 Git 服务：仓库、Issue、PR、CI，资源占用很低。",
+      "command": "gitea web --config /etc/gitea/app.ini",
+      "cwd": "/var/lib/gitea",
+      "port": 3000,
+      "docs": "https://docs.gitea.com/installation/install-from-binary",
+      "requires": ["gitea"]
+    },
+    {
+      "id": "portainer",
+      "name": "portainer",
+      "description": "Docker 图形化管理界面：容器、镜像、网络、卷的可视化操作。",
+      "command": "docker run --rm --name portainer -p 9443:9443 -v /var/run/docker.sock:/var/run/docker.sock portainer/portainer-ce:latest",
+      "cwd": "",
+      "port": 9443,
+      "docs": "https://docs.portainer.io/start/install-ce/server/docker/linux",
+      "requires": ["docker"]
+    }
+  ]
+}

@@ -1,0 +1,64 @@
+{
+  "locale": "en-US",
+  "nav": {
+    "overview": "Overview",
+    "performance": "Performance",
+    "terminal": "Web Terminal",
+    "apps": "Managed Apps",
+    "market": "App Market",
+    "logs": "Logs",
+    "storage": "Storage",
+    "processes": "Processes",
+    "services": "Services",
+    "ops": "Operations",
+    "apps-port": "Apps & Ports",
+    "files": "Files",
+    "agent": "Agent Access",
+    "security": "Security",
+    "settings": "Settings"
+  },
+  "view": {
+    "overview": "Overview",
+    "performance": "Performance",
+    "terminal": "Web Terminal",
+    "apps": "Managed Apps",
+    "market": "App Market",
+    "logs": "Logs",
+    "storage": "Storage",
+    "processes": "Processes",
+    "services": "Services",
+    "ops": "Operations",
+    "apps-port": "Apps & Ports",
+    "files": "Files",
+    "agent": "Agent Access",
+    "security": "Security",
+    "settings": "Settings"
+  },
+  "btn": {
+    "refresh": "Refresh",
+    "save": "Save",
+    "cancel": "Cancel",
+    "ok": "OK",
+    "delete": "Delete",
+    "create": "Create",
+    "login": "Sign in",
+    "logout": "Sign out",
+    "search": "Search",
+    "close": "Close",
+    "copy": "Copy",
+    "install": "Register",
+    "docs": "Docs"
+  },
+  "login": {
+    "password": "Panel password",
+    "username": "Username (empty = built-in admin)",
+    "submit": "Sign in",
+    "totp": "2FA code"
+  },
+  "common": {
+    "loading": "Loading…",
+    "empty": "No data",
+    "console": "System console",
+    "connected": "Connected"
+  }
+}

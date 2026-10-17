@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -155,14 +156,23 @@ class Trash:
             dest = stored / (os.path.basename(src.rstrip("/")) or "root")
             try:
                 os.rename(src, dest)  # 同盘 rename：瞬间完成
-            except OSError:
-                # 跨文件系统（如 /tmp 在 tmpfs）：退化为复制后删除
-                if is_dir:
-                    shutil.copytree(src, dest, symlinks=True)
-                    shutil.rmtree(src)
-                else:
-                    shutil.copy2(src, dest)
-                    os.remove(src)
+            except OSError as exc:
+                # 只有跨文件系统（EXDEV）才值得退化为复制。磁盘满（ENOSPC）、
+                # 权限不足时继续 copytree 只会留下索引外的半成品并掩盖真实原因
+                if exc.errno != errno.EXDEV:
+                    shutil.rmtree(stored, ignore_errors=True)
+                    raise
+                try:
+                    if is_dir:
+                        shutil.copytree(src, dest, symlinks=True)
+                        shutil.rmtree(src)
+                    else:
+                        shutil.copy2(src, dest)
+                        os.remove(src)
+                except Exception:
+                    # 复制中途失败：清掉半成品，别让回收站里出现无索引的残骸
+                    shutil.rmtree(stored, ignore_errors=True)
+                    raise
             entry = TrashEntry(entry_id=entry_id, original=src, stored=str(dest),
                                size=size, is_dir=is_dir, reason=reason)
             self._entries.insert(0, entry)

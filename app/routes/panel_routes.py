@@ -25,6 +25,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from .. import boot as boot_mod
+from .. import confirm
 from ..apps import supervisor
 from ..audit import AuditEvent, audit
 from ..auth import client_ip, extract_token, require_internal
@@ -318,7 +319,12 @@ def _wanted_files() -> list[tuple[Path, str]]:
 
 
 def _scrub(data: dict, include_secrets: bool) -> tuple[dict, list[str]]:
-    """按需剔除凭据。返回 ``(处理后的数据, 被剔除的键名)``。"""
+    """按需剔除凭据。返回 ``(处理后的数据, 被剔除的键名)``。
+
+    2.0 M4 起 ``users`` 里的凭据单独处理：即使显式导出密钥，多用户密码
+    哈希也不随配置导出（各账号的凭据只留在本机），但保留用户名/角色便于
+    迁移后重建账号。
+    """
     removed: list[str] = []
     if include_secrets:
         return data, removed
@@ -332,7 +338,25 @@ def _scrub(data: dict, include_secrets: bool) -> tuple[dict, list[str]]:
             if key in SECRET_KEYS:
                 prefs_node.pop(key)
                 removed.append(f"prefs.{key}")
+    removed.extend(_scrub_users(data))
     return data, removed
+
+
+def _scrub_users(data: dict) -> list[str]:
+    """抹掉多用户记录里的凭据字段（用户名/角色保留，便于迁移后重建账号）。"""
+    removed: list[str] = []
+    users = data.get("users")
+    if not isinstance(users, list):
+        return removed
+    for user in users:
+        if not isinstance(user, dict):
+            continue
+        for key in ("password_hash", "totp_secret", "totp_enabled",
+                    "recovery_hashes", "totp_enabled_at"):
+            if key in user:
+                user.pop(key)
+                removed.append(f"users.{key}")
+    return removed
 
 
 def _mask_env(apps_data: dict) -> int:
@@ -386,10 +410,23 @@ async def export_config(include_secrets: bool = False,
     )
 
 
+def _keep_local_users(incoming: dict) -> None:
+    """多用户记录（2.0 M4）只认本机。
+
+    导出包里的 ``users`` 已脱敏（哈希被剔除），若整体替换，所有账号会失去
+    可用哈希——等于把所有人锁在门外。与密码哈希、Agent 令牌同等对待。
+    """
+    if config.data.get("users"):
+        incoming["users"] = config.data["users"]
+    else:
+        incoming.pop("users", None)
+
+
 @router.post("/config/import")
 async def import_config(file: UploadFile = File(...),
                         _session: dict = Depends(require_internal)):
-    raw = await file.read()
+    # 先限长再读：直接 read() 会把整个上传体读进内存，几 GB 文件足以 OOM
+    raw = await file.read(2 * 1024 * 1024 + 1)
     if len(raw) > 2 * 1024 * 1024:
         raise HTTPException(400, "文件过大（上限 2MB）")
     try:
@@ -401,7 +438,12 @@ async def import_config(file: UploadFile = File(...),
             for name in ("config.json", "apps.json", "install.json"):
                 if name in names:
                     try:
-                        payload[name] = json.loads(bundle.read(name).decode("utf-8"))
+                        # 用 open()+限长读，避免 zip 炸弹成员被一次性解压进内存
+                        with bundle.open(name) as member:
+                            blob = member.read(2 * 1024 * 1024 + 1)
+                        if len(blob) > 2 * 1024 * 1024:
+                            raise HTTPException(400, f"{name} 过大（上限 2MB）")
+                        payload[name] = json.loads(blob.decode("utf-8"))
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         raise HTTPException(400, f"{name} 不是合法 JSON")
     except zipfile.BadZipFile:
@@ -420,6 +462,7 @@ async def import_config(file: UploadFile = File(...),
     for key in SECRET_KEYS:
         if key not in kept:
             merged.pop(key, None)
+    _keep_local_users(merged)
     # 运行模式同理：模式只能由服务器本机命令决定（README 安全模型基石），导入不得触碰
     if "mode" in config.data:
         merged["mode"] = config.data["mode"]
@@ -546,6 +589,19 @@ def _write_backup(reason: str) -> Path | None:
 # ---------------------------------------------------------------- 安全中心（1.4.0）
 
 
+class ConfirmBody(BaseModel):
+    action: str
+
+
+@router.post("/confirm")
+async def issue_confirm(body: ConfirmBody, request: Request,
+                        _session: dict = Depends(require_internal)):
+    """签发高危操作确认令牌（2.0 M1）：2 分钟有效、绑定动作与会话、一次性。"""
+    result = confirm.issue(body.action, extract_token(request))
+    record("confirm", f"签发确认令牌：{body.action}")
+    return result
+
+
 @router.get("/security")
 async def security_summary(request: Request, _session: dict = Depends(require_internal)):
     """安全中心摘要：2FA 状态、防爆破状态、会话与令牌概况、审计统计。"""
@@ -553,6 +609,10 @@ async def security_summary(request: Request, _session: dict = Depends(require_in
 
     # 审计统计要扫最近 7 天的 JSONL，同样是同步 I/O → 下线程池
     audit_counts = await asyncio.to_thread(audit.actions_summary, 7)
+    from ..prefs import TRASH_MAX_BYTES_DEFAULT
+
+    trash_usage = trash.usage()
+    trash_limit = int(prefs.all().get("security.trash_max_bytes", TRASH_MAX_BYTES_DEFAULT))
     return {
         "totp": {
             "enabled": config.totp_enabled,
@@ -568,8 +628,87 @@ async def security_summary(request: Request, _session: dict = Depends(require_in
             "full": sum(1 for t in config.agent_tokens if t.get("scope") == "full"),
         },
         "audit": audit_counts,
-        "trash": trash.usage(),
+        "trash": {**trash_usage,
+                  "over_limit": int(trash_usage.get("bytes") or 0) > trash_limit},
     }
+
+
+def _human_bytes(value: int) -> str:
+    """把字节数格式化成便于阅读的单位（巡检详情用）。"""
+    size = float(max(0, value))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{int(size)} B" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TiB"
+
+
+@router.get("/security/checkup")
+async def security_checkup(request: Request, _session: dict = Depends(require_internal)):
+    """一键安全巡检（1.6.0 U1）：汇总"当前该修什么"。
+
+    数据全部来自现有配置/接口（config、失败计数、回收站 usage、prefs），
+    不新增存储；前端按 ``target`` 跳转对应卡片。
+    """
+    from ..auth import failures
+    from ..prefs import TRASH_MAX_BYTES_DEFAULT
+
+    lock = failures.status(client_ip(request))
+    tokens = [t for t in config.agent_tokens if isinstance(t, dict)]
+    full_count = sum(1 for t in tokens if t.get("scope") == "full")
+    idle_cutoff = time.time() - 30 * 86400
+    idle_count = sum(
+        1 for t in tokens
+        if not int(t.get("last_used_at") or 0)
+        or int(t.get("last_used_at") or 0) < idle_cutoff
+    )
+    used = trash.usage()
+    limit = int(prefs.all().get("security.trash_max_bytes", TRASH_MAX_BYTES_DEFAULT))
+
+    items: list[dict] = []
+    if not config.totp_enabled:
+        items.append({
+            "level": "bad", "title": "未启用二次认证",
+            "detail": "面板密码即 root shell，建议启用 TOTP（密码 + 6 位动态码）",
+            "target": "security-totp",
+        })
+    if config.password_weak:
+        items.append({
+            "level": "warn", "title": "密码强度偏弱",
+            "detail": "当前密码长度不足 12 位或字符类别少于 3 类，建议尽快更换",
+            "target": "settings",
+        })
+    if full_count:
+        items.append({
+            "level": "warn", "title": f"存在 {full_count} 个完整权限令牌",
+            "detail": "完整权限令牌等价 root shell，建议按最小权限改为 custom / readonly",
+            "target": "security-tokens",
+        })
+    if idle_count:
+        items.append({
+            "level": "warn", "title": f"存在 {idle_count} 个闲置令牌",
+            "detail": "从未使用或超过 30 天未使用，建议吊销",
+            "target": "security-tokens",
+        })
+    if int(used.get("bytes") or 0) > limit:
+        items.append({
+            "level": "warn", "title": "回收站占用超过水位",
+            "detail": f"当前 {_human_bytes(int(used.get('bytes') or 0))}，"
+                      f"阈值 {_human_bytes(limit)}，建议清理或调高阈值",
+            "target": "security-trash",
+        })
+    if int(lock.get("locked_seconds") or 0) > 0:
+        items.append({
+            "level": "bad", "title": "当前来源 IP 处于锁定状态",
+            "detail": f"剩余 {lock['locked_seconds']} 秒自动解锁",
+            "target": "security-lockout",
+        })
+    if not items:
+        items.append({
+            "level": "ok", "title": "未发现待处理项",
+            "detail": "当前安全配置未发现明显短板", "target": "",
+        })
+    return {"items": items}
 
 
 @router.get("/audit/log")
@@ -578,6 +717,30 @@ async def audit_log(days: int = 7, action: str = "", source: str = "", q: str = 
     """统一审计日志查询（安全中心 → 审计日志）。"""
     events = await asyncio.to_thread(audit.query, days, action, source, q, limit)
     return {"events": events}
+
+
+class AuditExportBody(BaseModel):
+    count: int = 0
+    filters: str = ""
+
+
+@router.post("/audit/export")
+async def audit_export(body: AuditExportBody, request: Request,
+                       _session: dict = Depends(require_internal)):
+    """记录一次审计日志导出（1.6.0 U2）。
+
+    导出数据本身由前端用已查询到的结果生成 Blob（不新增数据端点）；
+    这个接口只把"导出了多少条、当时什么筛选条件"写进审计，保证导出可追溯。
+    """
+    count = max(0, int(body.count or 0))
+    summary = f"导出 {count} 条审计记录"
+    if body.filters:
+        summary += f"（筛选：{body.filters[:120]}）"
+    audit.record(AuditEvent(
+        action="audit_export", summary=summary, source="web",
+        ip=client_ip(request), extra={"count": count, "filters": body.filters[:120]},
+    ))
+    return {"ok": True}
 
 
 @router.get("/sessions")

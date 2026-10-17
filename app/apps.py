@@ -842,8 +842,11 @@ def probe(app: dict, seconds: float = 5.0) -> dict:
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=5)
         code = proc.returncode
-        sink.seek(0)
-        raw = sink.read()
+        # 只读尾部 16KB：探针最长观察 30 秒，命令若狂刷输出（yes / tail -f）
+        # 临时文件可能涨到 GB 级，整体 read() 会把内存打满
+        size = sink.tell()
+        sink.seek(max(0, size - 16_000))
+        raw = sink.read(16_000)
     text = (raw or b"").decode("utf-8", "replace")
     return {
         "ok": True,

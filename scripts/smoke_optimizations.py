@@ -72,7 +72,10 @@ def main():
     os.makedirs(files_dir, exist_ok=True)
     FILES = files_dir
     cfg = os.path.join(conf_dir, "config.json")
-    env = dict(os.environ, SERVERPANEL_CONFIG=cfg)
+    # 常驻应用注册表也必须隔离：否则临时实例会认领生产注册表里的应用，
+    # 退出时把它们当自己的托管进程收走（实测把 hermes-dashboard/gateway 停掉）。
+    env = dict(os.environ, SERVERPANEL_CONFIG=cfg,
+               SERVERPANEL_APPS_DIR=os.path.join(WORK, "apps"))
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "app.main:app", "--port", str(PORT), "--host", "127.0.0.1"],
         cwd=BASE, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

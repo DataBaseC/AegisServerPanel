@@ -451,14 +451,53 @@ OPERATOR_FORBIDDEN_PREFIXES = (
     "/api/terminal",
     "/api/panel/maintenance/cron",
     "/api/panel/maintenance/updates",
+    # 会话录制是 root 终端的输入输出原文（可能含密码/密钥），属于终端能力的一部分
+    "/api/panel/recordings",
 )
 
-# operator 禁止的“方法与路径正则”组合：Docker 删除、防火墙写、反代重载
-_OPERATOR_FORBIDDEN_ROUTES = (
+# operator 禁止的“方法与路径正则”组合。
+# 2.1.0 起按**能力类别**收口，而不是按功能名：路径黑名单只能堵已知入口，
+# 上一版 2.0.1 就出现了「堵了 HTTP 终端、漏了 WS 终端 / 常驻应用 / 文件写」。
+# 分类口径（任一成立即 admin-only）：
+#   A. 能执行任意命令（终端、常驻应用、市场安装）
+#   B. 能以 root 持久化（SSH 公钥、开机/守护任务）
+#   C. 能把 root 文件带出去（备份打包）
+#   D. 能改系统级状态（挂载、删除容器、防火墙、反代、Docker 删除）
+# 新增端点若落进这些类别，**必须**在这里显式登记，并在 tests/test_rbac_capabilities.py
+# 的能力矩阵里补一行——那条测试是防止下一轮再漏的闸门。
+_ADMIN_ONLY_ROUTES = (
+    # ---- D：系统级状态变更（沿用 2.0.1 既有条目）----
     (re.compile(r"^/api/panel/infra/docker/containers/[^/]+$"), ("DELETE",), "Docker 容器删除"),
     (re.compile(r"^/api/panel/infra/firewall/[^/]+$"), ("POST",), "防火墙规则变更"),
     (re.compile(r"^/api/panel/infra/proxy/reload$"), ("POST",), "反向代理重载"),
+    # ---- A：能执行任意命令 ----
+    (re.compile(r"^/api/panel/apps$"), ("POST",), "常驻应用注册（命令即 shell）"),
+    (re.compile(r"^/api/panel/apps/[^/]+$"), ("PUT", "DELETE"), "常驻应用修改/删除"),
+    (re.compile(r"^/api/panel/apps/[^/]+/(?:start|stop|restart|probe)$"), ("POST",),
+     "常驻应用启停（执行其命令）"),
+    (re.compile(r"^/api/panel/apps/[^/]+/logs$"), ("DELETE",), "常驻应用日志清理"),
+    (re.compile(r"^/api/panel/market/[^/]+/install$"), ("POST",), "应用市场安装"),
+    # ---- B：以 root 持久化 ----
+    (re.compile(r"^/api/panel/infra/ssh/keys$"), ("POST", "DELETE"), "SSH 公钥写入"),
+    (re.compile(r"^/api/panel/boot(?:/.*)?$"), ("POST", "PUT", "DELETE", "PATCH"),
+     "开机/守护任务变更"),
+    # ---- C：把 root 文件带出去（备份可打包 /etc、/root 任意文件）----
+    (re.compile(r"^/api/panel/maintenance/backups(?:/.*)?$"), ("POST", "PUT", "DELETE"),
+     "备份创建/上传/删除"),
+    # ---- D：系统级状态变更（继续）----
+    (re.compile(r"^/api/storage(?:/.*)?$"), ("POST", "PUT", "DELETE", "PATCH"),
+     "存储挂载变更"),
 )
+
+# 说明（为什么不把下面这些也划成 admin-only）：
+# - `/api/services/<unit>/action`：单元名受限于本机已有服务，属有界、可回退的运维动作，
+#   operator 的职责正是这类操作，故保留；
+# - `/api/panel/infra/net/tool`：固定 argv 白名单，无法注入参数；
+# - `/api/panel/infra/databases/probe`：只读探测；
+# - `/api/panel/tasks/<id>/run`：任务命令由 admin 在配置里定义，operator 只能触发，不能改；
+# - `/api/panel/confirm`：确认令牌不是权限边界，operator 能触达的动作已在上面被拒，
+#   自签令牌拿不到额外能力（保留它是为了前端二次确认流程统一）。
+
 
 
 def session_username(session: dict | None) -> str:
@@ -508,7 +547,7 @@ def rbac_denial(method: str, path: str, role: str) -> str:
         for prefix in OPERATOR_FORBIDDEN_PREFIXES:
             if path == prefix or path.startswith(prefix + "/"):
                 return "该操作仅限管理员（admin）"
-        for pattern, methods, label in _OPERATOR_FORBIDDEN_ROUTES:
+        for pattern, methods, label in _ADMIN_ONLY_ROUTES:
             if method in methods and pattern.match(path):
                 return f"{label}仅限管理员（admin）"
         return ""
@@ -671,15 +710,33 @@ def origin_allowed(request: Request | WebSocket) -> bool:
     return origin in config.allowed_origins
 
 
-async def authenticate_ws(websocket: WebSocket, internal_only: bool = False) -> bool:
-    """WebSocket 握手鉴权，失败时关闭连接。internal_only 要求内网模式。"""
+async def authenticate_ws(websocket: WebSocket, internal_only: bool = False,
+                          min_role: str | None = None) -> bool:
+    """WebSocket 握手鉴权，失败时关闭连接。
+
+    - ``internal_only``：要求内网模式；
+    - ``min_role``：要求会话角色不低于该档（2.1.0 新增）。
+
+    2.1.0 修：RBAC 中间件只处理 HTTP 作用域（``@app.middleware("http")`` 不覆盖
+    WebSocket），所以 WS 端点必须在这里自己做角色判定——2.0.1 的
+    ``/api/terminal/ws`` 就是这样绕过了前缀黑名单，operator 连上即 root PTY。
+    """
     if not origin_allowed(websocket):
         await websocket.close(code=1008, reason="Origin 不被允许")
         return False
-    if sessions.validate(extract_token(websocket)) is None:
+    session = sessions.validate(extract_token(websocket))
+    if session is None:
         await websocket.close(code=4401, reason="未登录")
         return False
     if internal_only and config.mode != MODE_INTERNAL:
         await websocket.close(code=4403, reason="内网模式未激活")
         return False
+    if min_role is not None:
+        role = resolve_role(session)
+        if role is None:
+            await websocket.close(code=4401, reason="账号已被删除或禁用")
+            return False
+        if ROLE_RANK.get(role, 0) < ROLE_RANK.get(min_role, ROLE_RANK[ROLE_ADMIN]):
+            await websocket.close(code=4403, reason=f"该连接需要 {min_role} 权限")
+            return False
     return True

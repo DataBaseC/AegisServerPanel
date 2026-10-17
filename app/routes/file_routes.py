@@ -29,7 +29,9 @@ from pydantic import BaseModel
 
 from .. import shell
 from ..audit import AuditEvent, audit
-from ..auth import client_ip, require_internal
+from ..auth import ROLE_ADMIN, client_ip, require_internal, resolve_role
+from ..config import config
+from ..prefs import prefs
 from ..ssrf import assert_url_allowed
 from ..trash import trash
 
@@ -105,6 +107,106 @@ def _validate_write_target(path: str) -> None:
     if os.path.islink(path):
         # 编辑一个链接会让写入落到链路目标（可能是 /etc/shadow）
         raise HTTPException(400, "目标是符号链接，拒绝写入（请先删除链接或直接编辑目标文件）")
+
+
+# ---------------------------------------------------------------- 写根守卫（2.0.1 P0）
+#
+# 多用户模式下 operator 过去能经文件写接口往任意路径落地（/etc/cron.d、
+# /root/.ssh/authorized_keys、面板自己的 config.json），面板以 root 跑，
+# 等于交出一个 root shell。现在：
+#
+# - 单密码模式（config.has_users 为 False）完全沿用旧行为，不影响现网；
+# - admin 不受写根限制；
+# - operator / viewer 只能写 prefs["files.write_roots"] 之内的路径（默认空 =
+#   任何写操作都被拒）；
+# - 下面几处固定禁区**任何角色（含 admin）都拒绝**：写进去就等于 root，属于
+#   面板自身的自伤面，不交给配置决定。
+WRITE_SCOPE_HINT = "该目录不在可写范围（管理员可在 设置→偏好 里配置 files.write_roots）"
+WRITE_DENIED_COMPONENTS = frozenset({".ssh", ".gnupg"})  # 凭据目录，任何位置都拒写
+_CODE_ROOT = Path(__file__).resolve().parents[2]          # 仓库根（面板代码目录）
+
+
+def _write_denied_dirs() -> list[str]:
+    """固定禁区目录：面板配置目录 + 面板代码根（每次实时取，测试里路径会变）。"""
+    dirs: list[str] = []
+    for candidate in (Path(config.path).parent, _CODE_ROOT):
+        try:
+            dirs.append(os.path.realpath(str(candidate)))
+        except (OSError, ValueError):
+            continue
+    return dirs
+
+
+def _resolved_write_path(path: str) -> str:
+    """把写盘目标解析成真实路径：已存在的解析自身（跟随链接），新建的解析父目录。
+
+    只做字符串归一化不够：``allowed/../``、父目录是符号链接、Windows 盘符
+    大小写都能把「检查时」与「落盘时」的路径变成两个位置。
+    """
+    full = os.path.abspath(path)
+    try:
+        if os.path.lexists(full):
+            return os.path.realpath(full)
+        parent = os.path.dirname(full) or os.sep
+        return os.path.join(os.path.realpath(parent), os.path.basename(full))
+    except (OSError, ValueError):
+        raise HTTPException(400, "路径不合法")
+
+
+def _path_within(root: str, path: str) -> bool:
+    """path 是否等于 root 或位于其下。
+
+    用 ``commonpath`` 而不是字符串 startswith：它天然处理 ``/root`` 与
+    ``/root2`` 的前缀边界；Windows 下不同盘符抛 ValueError，按「不在根内」处理。
+    """
+    try:
+        common = os.path.commonpath([root, path])
+    except ValueError:
+        return False
+    return os.path.normcase(common) == os.path.normcase(root)
+
+
+def _write_denied_reason(target: str) -> str:
+    """固定禁区判定：返回拒绝原因，空串表示不命中。target 需已 realpath。"""
+    parts = {part.lower() for part in Path(target).parts}
+    if parts & WRITE_DENIED_COMPONENTS:
+        return "用户凭据目录（.ssh / .gnupg）禁止通过文件管理写入"
+    for denied in _write_denied_dirs():
+        if _path_within(denied, target):
+            return "面板自身的配置目录与代码目录禁止通过文件管理写入（写进去等于 root）"
+    return ""
+
+
+def _authorize_write(session: dict | None, *paths: str) -> None:
+    """文件写入口守卫（2.0.1 P0）。
+
+    必须在任何副作用之前调用（尤其 ``/write`` 把原文件备份进回收站之前）。
+    越权时抛 403；固定禁区对 admin 同样拒绝。
+    """
+    targets = [path for path in paths if path]
+    if not targets:
+        return
+    resolved = [_resolved_write_path(target) for target in targets]
+
+    for target in resolved:
+        reason = _write_denied_reason(target)
+        if reason:
+            raise HTTPException(403, reason)
+
+    # 单密码模式 = 人人都是 admin：不做写根限制，保持 2.0 现有部署行为。
+    if not config.has_users:
+        return
+    role = resolve_role(session)
+    if role == ROLE_ADMIN:
+        return
+    if role is None:
+        raise HTTPException(403, "账号已被删除或禁用，请重新登录")
+
+    roots = [os.path.realpath(str(root)) for root in (prefs.get("files.write_roots") or [])]
+    for target in resolved:
+        if any(_path_within(root, target) for root in roots):
+            continue
+        raise HTTPException(403, WRITE_SCOPE_HINT)
 
 
 def _safe_write(path: str, content: str) -> None:
@@ -281,8 +383,11 @@ async def read_file(path: str, max_bytes: int = EDIT_LIMIT):
 
 
 @router.post("/write")
-async def write_file(body: WriteBody, request: Request):
+async def write_file(body: WriteBody, request: Request,
+                     _session: dict = Depends(require_internal)):
     full = _abs(body.path)
+    # 写根守卫必须在乐观锁检查与「备份到回收站」之前：越权写不能产生任何副作用
+    _authorize_write(_session, full)
     _validate_write_target(full)
     if len(body.content.encode()) > EDIT_LIMIT:
         raise HTTPException(413, "内容过大，请改用上传方式")
@@ -338,8 +443,10 @@ async def write_file(body: WriteBody, request: Request):
 
 
 @router.post("/mkdir")
-async def make_dir(body: PathBody, request: Request):
+async def make_dir(body: PathBody, request: Request,
+                   _session: dict = Depends(require_internal)):
     full = _abs(body.path)
+    _authorize_write(_session, full)
     if os.path.exists(full):
         raise HTTPException(400, "路径已存在")
     try:
@@ -352,11 +459,15 @@ async def make_dir(body: PathBody, request: Request):
 
 
 @router.post("/rename")
-async def rename(body: RenameBody, request: Request):
+async def rename(body: RenameBody, request: Request,
+                 _session: dict = Depends(require_internal)):
     source = _abs(body.path)
     _guard_delete(source)
     target = body.target if os.path.isabs(body.target) else os.path.join(os.path.dirname(source), body.target)
     target = os.path.abspath(target)
+    # 重命名会「移走源 + 创建目标」：两个路径都必须可写。只校验目标的话，
+    # operator 能把可写根之外的文件改名搬进根内，等价于绕过 /delete 的写根守卫。
+    _authorize_write(_session, source, target)
     if not os.path.lexists(source):
         raise HTTPException(404, "源路径不存在")
     if os.path.exists(target):
@@ -376,9 +487,11 @@ async def rename(body: RenameBody, request: Request):
 
 
 @router.post("/copy")
-async def copy(body: RenameBody, request: Request):
+async def copy(body: RenameBody, request: Request,
+               _session: dict = Depends(require_internal)):
     source = _abs(body.path)
     target = os.path.abspath(body.target)
+    _authorize_write(_session, target)  # 目标路径守卫
     if not os.path.lexists(source):
         raise HTTPException(404, "源路径不存在")
     if os.path.exists(target):
@@ -401,9 +514,13 @@ async def copy(body: RenameBody, request: Request):
 
 
 @router.post("/delete")
-async def delete(body: DeleteBody, request: Request):
+async def delete(body: DeleteBody, request: Request,
+                 _session: dict = Depends(require_internal)):
     if not body.paths:
         raise HTTPException(400, "未指定要删除的路径")
+    # 先整体过写根守卫：任一项越界 → 整个请求 403，且不会出现「合法项已删、
+    # 越权项报错」的半吊子结果（守卫必须在任何删除动作之前）
+    _authorize_write(_session, *[_abs(item) for item in body.paths])
 
     def _delete() -> tuple[list, list]:
         removed, failed = [], []
@@ -563,11 +680,13 @@ def _pack_archive(selected: list[tuple[str, str]]) -> tuple[str, str]:
 
 
 @router.post("/move")
-async def move(body: MoveBody, request: Request):
+async def move(body: MoveBody, request: Request,
+               _session: dict = Depends(require_internal)):
     """批量移动到目标目录：部分成功语义，逐条返回成功/失败明细（与 /delete 一致）。"""
     if not body.paths:
         raise HTTPException(400, "未指定要移动的路径")
     dest = _abs(body.dest)
+    _authorize_write(_session, dest)  # 目标目录守卫
     if not os.path.isdir(dest):
         raise HTTPException(400, "目标必须是已存在的目录")
 
@@ -577,6 +696,8 @@ async def move(body: MoveBody, request: Request):
             full = _abs(item)
             try:
                 _guard_delete(full)          # 系统关键目录本身禁止操作
+                # 移动会移走源：源在可写根之外同样是越权写，按部分失败语义拒绝该项
+                _authorize_write(_session, full)
                 if not os.path.lexists(full):
                     failed.append({"path": full, "error": "不存在"})
                     continue
@@ -608,11 +729,15 @@ async def move(body: MoveBody, request: Request):
 
 
 @router.post("/archive")
-async def archive(body: ArchiveBody, background: BackgroundTasks, request: Request):
+async def archive(body: ArchiveBody, background: BackgroundTasks, request: Request,
+                  _session: dict = Depends(require_internal)):
     """把选中的多个文件/目录打包成一个 zip 下载（1.6.0 F2）。"""
     if not body.paths:
         raise HTTPException(400, "未指定要打包的路径")
     selected = _collect_archive_paths(body.paths)
+    # 注意：批量打包的产物落在**服务端自选**的系统临时目录（客户端拿响应体下载），
+    # 不是用户指定的落点，因此不套写根白名单——否则 operator 连「打包下载」都会被 403。
+    # 选中的源路径已由 _collect_archive_paths 做过读取范围校验。
     total = await asyncio.to_thread(_tree_size, [p for p, _ in selected], ARCHIVE_MAX_BYTES)
     if total > ARCHIVE_MAX_BYTES:
         raise HTTPException(
@@ -640,8 +765,10 @@ async def upload(
     path: str = Form(...),
     overwrite: bool = Form(True),
     files: List[UploadFile] = File(...),
+    _session: dict = Depends(require_internal),
 ):
     target_dir = _abs(path)
+    _authorize_write(_session, target_dir)  # 上传目标目录守卫（落盘前）
     if not os.path.isdir(target_dir):
         raise HTTPException(400, "上传目标必须是已存在的目录")
     saved, failed = [], []
@@ -652,6 +779,18 @@ async def upload(
             failed.append({"name": raw_name, "error": "文件名不合法"})
             continue
         destination = os.path.join(target_dir, *parts)
+        # 落点必须真的在 target_dir 之下：Windows 下形如 "D:/x" 的文件名是
+        # drive-relative，os.path.join 会直接换盘，绕过「只校验目标目录」的守卫。
+        if not _within(target_dir, destination):
+            failed.append({"name": raw_name, "error": "文件名解析出的路径越界，已拒绝"})
+            continue
+        # 每个文件的实际落点也要过写根守卫：目录放行不代表子路径放行
+        # （.ssh / .gnupg 这类固定禁区可能藏在合法目录里）。
+        try:
+            _authorize_write(_session, destination)
+        except HTTPException as exc:
+            failed.append({"name": raw_name, "error": exc.detail})
+            continue
         # 符号链接逃逸防护（1.4.1 修）：中间目录或最终目标若是指向
         # target_dir 之外的链接，落盘位置会跑到用户看到的目录之外。
         # 原实现在这里调 _within(target_dir, target_dir)——按定义恒为真，
@@ -849,11 +988,13 @@ def _extract(source: str, dest: str) -> int:
 
 
 @router.post("/extract")
-async def extract(body: PathBody, request: Request):
+async def extract(body: PathBody, request: Request,
+                  _session: dict = Depends(require_internal)):
     source = _abs(body.path)
     if not os.path.isfile(source):
         raise HTTPException(404, "压缩包不存在或不是普通文件")
     dest = _archive_dest(source)
+    _authorize_write(_session, dest)  # 解压目标守卫（必须在 makedirs 之前）
     os.makedirs(dest)
     try:
         count = await asyncio.to_thread(_extract, source, dest)
@@ -948,7 +1089,8 @@ def _fetch_sync(url: str, dest_file: str) -> int:
 
 
 @router.post("/fetch")
-async def fetch_url(body: FetchBody, request: Request):
+async def fetch_url(body: FetchBody, request: Request,
+                    _session: dict = Depends(require_internal)):
     dest_dir = _abs(body.dest_dir)
     if not os.path.isdir(dest_dir):
         raise HTTPException(400, "目标必须是已存在的目录")
@@ -957,6 +1099,7 @@ async def fetch_url(body: FetchBody, request: Request):
     if not name or name in (".", ".."):
         raise HTTPException(400, "无法从 URL 判断文件名，请手动指定")
     dest_file = os.path.join(dest_dir, name)
+    _authorize_write(_session, dest_file)  # 目标路径守卫（必须在下载落盘前）
     if os.path.exists(dest_file):
         raise HTTPException(400, f"目标已存在：{dest_file}")
     # 符号链接逃逸防护（1.4.1 修）：原实现在这里比的是
@@ -975,8 +1118,10 @@ async def fetch_url(body: FetchBody, request: Request):
 # ---------------------------------------------------------------- 权限
 
 @router.post("/chmod")
-async def chmod_path(body: ChmodBody, request: Request):
+async def chmod_path(body: ChmodBody, request: Request,
+                     _session: dict = Depends(require_internal)):
     full = _abs(body.path)
+    _authorize_write(_session, full)  # 权限变更也是写操作：受写根约束
     if not os.path.lexists(full):
         raise HTTPException(404, "路径不存在")
     if not OCTAL_RE.fullmatch(body.mode):
@@ -1027,7 +1172,14 @@ class TrashIdBody(BaseModel):
 
 
 @router.post("/trash/restore")
-async def trash_restore(body: TrashIdBody, request: Request):
+async def trash_restore(body: TrashIdBody, request: Request,
+                        _session: dict = Depends(require_internal)):
+    # 还原会把文件写回 original：先按索引查出还原目标并过写根守卫，再执行还原
+    # （守卫必须在 trash.restore 之前，否则越权路径已经被写回去了）
+    entries = await asyncio.to_thread(trash.list)
+    entry = next((item for item in entries if item.get("id") == body.id), None)
+    if entry is not None:
+        _authorize_write(_session, str(entry.get("original") or ""))
     try:
         original = await asyncio.to_thread(trash.restore, body.id)
     except KeyError:

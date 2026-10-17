@@ -130,6 +130,41 @@ def _log_dirs(value: Any) -> list[str]:
     return result
 
 
+def _write_roots(value: Any) -> list[str]:
+    """文件写根白名单（2.0.1 P0）：绝对路径、realpath 规范化，**允许为空列表**。
+
+    语义：operator 角色只允许写入这些根目录之内的路径；默认空 = operator
+    没有任何可写根，文件写操作全被拒（只有 admin 能写）。单密码模式
+    （``config.has_users`` 为 False）下该项不参与判定。
+
+    与 ``security.log_dirs`` 的区别：这里**不**在配置层剔除敏感目录。
+    固定禁区（面板配置目录 / 面板代码根 / 路径中含 ``.ssh`` 或 ``.gnupg``）
+    由 ``file_routes`` 在写盘时对**任何角色**无条件拒绝，改配置也绕不过去，
+    因此没必要在保存时把管理员配的合法根误伤掉。
+    """
+    if isinstance(value, str):
+        items = [line.strip() for line in value.splitlines() if line.strip()]
+    elif isinstance(value, (list, tuple)):
+        items = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        raise PrefsError("需要是目录列表")
+    result: list[str] = []
+    for item in items:
+        if not os.path.isabs(item):
+            raise PrefsError(f"必须是绝对路径：{item}")
+        try:
+            normalized = os.path.realpath(os.path.abspath(item))
+        except (OSError, ValueError) as exc:
+            raise PrefsError(f"路径不合法：{item}（{exc}）")
+        if normalized == os.path.dirname(normalized):  # 文件系统根
+            raise PrefsError("不能把文件系统根目录加入文件写白名单")
+        if normalized not in result:
+            result.append(normalized)
+    if len(result) > 20:
+        raise PrefsError("文件写根最多 20 条")
+    return result
+
+
 def _webhook_url(value: Any) -> str:
     """Webhook 地址：留空表示关闭；否则必须是 http/https 且带主机名。"""
     text = str(value or "").strip()
@@ -223,6 +258,13 @@ FIELDS: dict[str, tuple[Any, Callable[[Any], Any], str, str]] = {
         _int_range(64 * 1024 * 1024, 10 * 1024 ** 3, "字节"),
         EFFECT_IMMEDIATE,
         "回收站占用超过该值后，在安全中心与概览页显示告警",
+    ),
+    # 文件写根白名单（2.0.1 P0）：operator 角色允许写入的根目录前缀（绝对路径列表）；
+    # 默认空 = 只有 admin 能写文件；单密码模式下该项无意义（RBAC 整体旁路）。
+    "files.write_roots": (
+        [], _write_roots, EFFECT_IMMEDIATE,
+        "operator 角色允许写入的根目录前缀（绝对路径列表）；"
+        "默认空 = 只有 admin 能写文件；单密码模式下该项无意义",
     ),
     "notify.webhook_url": (
         "", _webhook_url, EFFECT_IMMEDIATE,

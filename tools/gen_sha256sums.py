@@ -52,7 +52,8 @@ def _git_names() -> list[str] | None:
 
 def _git_blobs(names: list[str]) -> dict[str, bytes] | None:
     """一次性批量读 blob 内容（git cat-file --batch），避免逐文件起进程。"""
-    request = "".join(f"{name}\n" for name in names).encode("utf-8")
+    # `:<path>` = 索引里的 blob；直接给路径会被当成对象名，批量读取全部 missing
+    request = "".join(f":{name}\n" for name in names).encode("utf-8")
     try:
         proc = subprocess.run(
             ["git", "cat-file", "--batch"], cwd=ROOT, input=request,

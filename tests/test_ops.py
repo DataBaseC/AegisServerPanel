@@ -15,6 +15,8 @@ import os
 import stat
 from types import SimpleNamespace
 
+import sys
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -318,6 +320,8 @@ def test_backup_create_list_delete(authed, internal_mode, tmp_path, monkeypatch)
     assert r.status_code in (400, 404)
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="受保护路径断言基于 POSIX 路径语义（/、/etc）")
 def test_backup_rejects_protected_and_missing_paths(authed, internal_mode, tmp_path, monkeypatch):
     from app.routes import maintenance_routes
 

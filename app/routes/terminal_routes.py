@@ -14,7 +14,8 @@ from pydantic import BaseModel
 
 from .. import recording, shell
 from ..audit import AuditEvent, audit
-from ..auth import authenticate_ws, require_exec_auth, require_internal, sessions
+from ..auth import (ROLE_ADMIN, authenticate_ws, require_exec_auth,
+                    require_internal, sessions)
 from ..config import MODE_INTERNAL, config
 from ..prefs import prefs
 from ..utils import is_root
@@ -233,7 +234,8 @@ async def terminal_socket(websocket: WebSocket):
         await websocket.send_text("\x1b[31m当前平台不支持 PTY 终端\x1b[0m")
         await websocket.close(code=1011)
         return
-    if not await authenticate_ws(websocket, internal_only=True):
+    # 2.1.0：WS 不走 HTTP 中间件，RBAC 必须在这里显式做——终端 = root shell，仅 admin。
+    if not await authenticate_ws(websocket, internal_only=True, min_role=ROLE_ADMIN):
         return
     await websocket.accept()
     # 空闲超时（2.0 M1）：按 prefs 每分钟检查，0 = 不限制

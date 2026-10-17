@@ -28,7 +28,7 @@ from .. import boot as boot_mod
 from .. import confirm
 from ..apps import supervisor
 from ..audit import AuditEvent, audit
-from ..auth import client_ip, extract_token, require_internal
+from ..auth import client_ip, extract_token, require_internal, session_username
 from ..auth import sessions as sessions_mod
 from ..config import config
 from ..prefs import PrefsError, prefs
@@ -602,6 +602,41 @@ async def issue_confirm(body: ConfirmBody, request: Request,
     return result
 
 
+def _totp_state(session: dict | None) -> dict:
+    """当前身份看到的 2FA 状态（与 ``/api/auth/totp/*`` 的执行侧同源）。
+
+    2.0 起多用户模式把 TOTP 存在**每个用户记录**里（字段
+    ``totp_enabled`` / ``totp_secret`` / ``recovery_hashes``），单密码模式
+    仍用全局配置。展示与巡检必须用同一套判定，否则多用户下会永久误报
+    「未启用二次认证」；单密码模式（``config.users`` 为空）保持原有语义。
+
+    用户记录按会话里的 ``user_id`` 精确取，取不到再按用户名回查——与
+    :class:`app.routes.auth_routes._TotpScope` 的顺序一致；仍未命中时
+    （救援用的内置 admin 无记录等）回退全局配置。
+    """
+    session = session or {}
+    if config.has_users:
+        user = None
+        user_id = str(session.get("user_id") or "")
+        if user_id:
+            user = config.user_by_id(user_id)
+        if user is None:
+            user = config.find_user(session_username(session))
+        if user is not None:
+            enabled = bool(user.get("totp_enabled"))
+            return {
+                "enabled": enabled,
+                "pending": bool(user.get("totp_secret")) and not enabled,
+                "recovery_left": len([h for h in (user.get("recovery_hashes") or [])
+                                      if isinstance(h, str) and h]),
+            }
+    return {
+        "enabled": config.totp_enabled,
+        "pending": bool(config.totp_secret) and not config.totp_enabled,
+        "recovery_left": len(config.totp_recovery_hashes),
+    }
+
+
 @router.get("/security")
 async def security_summary(request: Request, _session: dict = Depends(require_internal)):
     """安全中心摘要：2FA 状态、防爆破状态、会话与令牌概况、审计统计。"""
@@ -614,11 +649,8 @@ async def security_summary(request: Request, _session: dict = Depends(require_in
     trash_usage = trash.usage()
     trash_limit = int(prefs.all().get("security.trash_max_bytes", TRASH_MAX_BYTES_DEFAULT))
     return {
-        "totp": {
-            "enabled": config.totp_enabled,
-            "pending": bool(config.totp_secret) and not config.totp_enabled,
-            "recovery_left": len(config.totp_recovery_hashes),
-        },
+        # 多用户模式按当前会话用户取，单密码模式回退全局配置
+        "totp": _totp_state(_session),
         "lockout": failures.status(client_ip(request)),
         "sessions": {
             "active": sessions_mod.active_count(),
@@ -666,7 +698,8 @@ async def security_checkup(request: Request, _session: dict = Depends(require_in
     limit = int(prefs.all().get("security.trash_max_bytes", TRASH_MAX_BYTES_DEFAULT))
 
     items: list[dict] = []
-    if not config.totp_enabled:
+    # 2FA 状态按当前会话用户判定（多用户），单密码模式回退全局配置
+    if not _totp_state(_session)["enabled"]:
         items.append({
             "level": "bad", "title": "未启用二次认证",
             "detail": "面板密码即 root shell，建议启用 TOTP（密码 + 6 位动态码）",

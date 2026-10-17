@@ -212,7 +212,9 @@ def test_admin_can_reach_privileged_paths(admin):
     assert admin.get("/api/panel/users").status_code == 200
     # 2.0.1：终端/定时任务/更新对 admin 放行（info 200；exec 在测试环境无 PTY
     # 时可能 500，但绝不是 RBAC 的 403）
-    assert admin.get("/api/terminal/info").status_code == 200
+    # 2.1.0 修：Windows 等无 PTY 平台 info 恒为 501，这里放宽为「200 或 501」——
+    # 断言「不是 403」才是这条用例的本意，翻车点在于把平台限制写成了结论。
+    assert admin.get("/api/terminal/info").status_code in (200, 501)
     assert admin.get("/api/panel/maintenance/cron").status_code == 200
     assert admin.post("/api/terminal/exec",
                       json={"command": "id"}).status_code != 403

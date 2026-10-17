@@ -508,13 +508,15 @@ const NAV = [
   { id: 'overview', label: '概览', icon: '▤' },
   { id: 'performance', label: '性能监控', icon: '◉' },
   { id: 'terminal', label: '网页终端', icon: '▶', internalOnly: true, adminOnly: true },
-  { id: 'apps', label: '常驻应用', icon: '⏱', internalOnly: true },
-  { id: 'market', label: '应用市场', icon: '⌸', internalOnly: true },
+  // 2.1.0：常驻应用的启动 = 执行 shell 命令，属「等同 root」能力，仅 admin
+  { id: 'apps', label: '常驻应用', icon: '⏱', internalOnly: true, adminOnly: true },
+  { id: 'market', label: '应用市场', icon: '⌸', internalOnly: true, adminOnly: true },
   { id: 'logs', label: '控制台 / 日志', icon: '☰' },
   { id: 'storage', label: '存储空间', icon: '⛁' },
   { id: 'processes', label: '进程管理', icon: '⚙' },
   { id: 'services', label: '服务管理', icon: '⏻' },
-  { id: 'ops', label: '运维', icon: '⛭', internalOnly: true },
+  // 运维页全是系统级变更（cron / 备份 / 更新 / Docker / 防火墙 / SSH / 挂载），仅 admin
+  { id: 'ops', label: '运维', icon: '⛭', internalOnly: true, adminOnly: true },
   { id: 'apps-port', label: '应用与端口', icon: '⧉', internalOnly: true },
   { id: 'files', label: '文件管理', icon: '▦', internalOnly: true },
   { id: 'agent', label: 'Agent 接入', icon: '⌘', internalOnly: true, adminOnly: true },
@@ -5246,8 +5248,11 @@ registerView('settings', {
           <span class="dim" style="font-size:12px">${usersData.length} 个账号 ·
             多用户模式${multiUser ? '已启用' : '未启用'}</span></h2>
         <div class="dim" style="font-size:12px;line-height:1.7;margin:4px 0 12px">
-          角色：<b>viewer</b> 只读（GET）· <b>operator</b> 运维（文件写、应用启停、服务与任务，
-          但不能碰电源、令牌、用户、配置导入导出与面板升级）· <b>admin</b> 全部权限。
+          角色：<b>viewer</b> 只读（GET）· <b>operator</b> 有界运维（服务启停、任务触发、
+          容器启停、网络工具、只读浏览；文件写入需管理员在「快捷设置 → 文件管理写权限」里配置可写根）·
+          <b>admin</b> 全部权限。凡是能拿到命令执行 / root 持久化 / 备份外带 /
+          系统级变更的能力（网页终端、常驻应用、市场安装、SSH 公钥、开机任务、
+          备份、挂载、防火墙、反代）都仅限 admin。
           ${multiUser ? '' : '当前仍是<b>单密码模式</b>：创建第一个用户后，原密码会自动迁移成'
             + ' <span class="mono">admin</span> 账号，仍可用原密码登录。'}
         </div>
@@ -5446,6 +5451,19 @@ registerView('settings', {
         </div>
       </div>`;
 
+      const writeRootsCard = `<div class="card">
+        <h2>文件管理写权限（operator）</h2>
+        <label class="field"><span>operator 可写入的根目录（每行一个绝对路径，留空 = 只有管理员能写文件）</span>
+          <textarea class="input" rows="3" data-pref-list="files.write_roots"
+            data-original="${esc((prefsValues['files.write_roots'] || []).join('\n'))}"
+            placeholder="/srv/website">${esc((prefsValues['files.write_roots'] || []).join('\n'))}</textarea></label>
+        <div class="dim" style="font-size:11.5px;line-height:1.7">
+          只对 operator 角色生效（viewer 与单密码模式不受影响）。面板配置目录、代码根目录、
+          以及路径里含 <span class="mono">.ssh</span> / <span class="mono">.gnupg</span> 的位置
+          对任何角色都禁止写入——写进去就等于 root。
+        </div>
+      </div>`;
+
       const listenCard = `<div class="card">
         <h2>监听地址 <span class="spacer"></span><span class="badge warn">改完需重启面板</span></h2>
         <div class="row">
@@ -5484,7 +5502,8 @@ registerView('settings', {
             <td class="cell-sub">${datetime(b.time)}</td></tr>`).join('')}</tbody></table></div>` : ''}
       </div>`;
 
-      return autostartCard + sessionCard + logCard + tzCard + proxyCard + logDirsCard + listenCard + backupCard;
+      return autostartCard + sessionCard + logCard + tzCard + proxyCard + logDirsCard
+        + (isAdmin() ? writeRootsCard : '') + listenCard + backupCard;
     }
 
     function generalTab() {

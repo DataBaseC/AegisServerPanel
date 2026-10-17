@@ -760,7 +760,12 @@ serverpanel --host 0.0.0.0 --port 8787 --ssl-certfile /path/cert.pem --ssl-keyfi
 - **保留本仓库自己的东西**：1.5.0 的工业战术风界面（碳黑 + 单一点缀色 + 切角几何）与前端视图资源回收修复、1.4.1 的四个验收修复，全部原样保留（逐条已核对：`makeViewResources` 块逐字节相同，1.4.1 的 10 个回归测试函数名一个不少）
 - **版本号归一**：内容等同外包 `2.0.1`，但本仓库版本号记为 `2.0`（便于和外包的 2.0.1 区分来源）；下方 2.0.1 / 2.0.0 / 1.6.0 小节是外包方的原始记录，保留作来源说明
 - **零新增运行时依赖**：`requirements.txt` / `constraints.txt` 与 1.5.0 逐字节相同，离线 wheel 包无需重做
-- **已知问题（开多用户前必须修）**：多用户模式下 RBAC 仍有 4 条「等同 root」的直通路径（WebSocket 终端不过 RBAC、`/api/files` 无根白名单、`/api/panel/apps` 任意命令、`/api/panel/infra/ssh/keys` 写 root `authorized_keys`）；多用户 2FA 的展示与巡检仍读全局开关。当前部署是单密码模式（`users` 为空时 RBAC 完全旁路），不受影响；修复版记 `2.1.0`
+- **RBAC 能力级收口（本仓库加固，针对外包 2.0.1 遗留的 4 条 P0）**：
+  - 判定口径从「operator 路径黑名单」改为**能力分级**：能执行任意命令（常驻应用、市场安装、网页终端）、能以 root 持久化（SSH 公钥、开机/守护任务）、能把 root 文件带出去（备份打包）、能改系统级状态（挂载、容器删除、防火墙、反代）一律 admin-only，集中在 `app/auth.py` 的 `_ADMIN_ONLY_ROUTES`
+  - **WebSocket 也过 RBAC**：`authenticate_ws()` 新增 `min_role`，`/api/terminal/ws` 要求 admin（WS 不走 HTTP 中间件，上一版正是这样被绕过的）
+  - **文件管理写根白名单**：`files.write_roots`（默认空 = 只有 admin 能写）；面板配置目录、代码根、`.ssh`/`.gnupg` 对**任何角色**无条件禁写
+  - **多用户 2FA 展示/巡检**改按当前会话用户判定（不再误报「未启用二次认证」）
+  - 新增 `tests/test_rbac_capabilities.py`：能力矩阵 + **写端点覆盖率闸门**（新增写接口没登记就红），防止下一轮再漏
 
 ### 2.0.1（operator 权限收口补丁）
 

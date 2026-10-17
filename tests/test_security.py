@@ -15,6 +15,8 @@ import shutil
 import struct
 import time
 
+import sys
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -1034,7 +1036,13 @@ def test_lockout_triggers_webhook(authed, internal_mode):
 
 # ---------- 1.6.0 F2 文件批量移动 / 打包 ----------
 
+# Windows 上这些用例的前提不成立：`/etc`、`/` 的「受保护目录」语义是 POSIX 路径语义
+# （Windows 下 abspath 会变成 D:\etc，与 PROTECTED 字面量对不上）。
+_win = pytest.mark.skipif(sys.platform == "win32",
+                          reason="依赖 POSIX 路径语义，Windows 开发机跳过")
 
+
+@_win
 def test_files_batch_move(authed, internal_mode, tmp_path):
     """批量移动：内容一致、部分成功有明细、目标非法与受保护目录被拒。"""
     src = tmp_path / "src"
@@ -1080,6 +1088,7 @@ def test_files_batch_move(authed, internal_mode, tmp_path):
     assert events, "移动动作应写审计"
 
 
+@_win
 def test_files_batch_archive(authed, internal_mode, tmp_path):
     """批量打包：zip 结构/内容正确、符号链接不跟随、关键目录与超限被拒。"""
     import io
@@ -1312,6 +1321,8 @@ def test_power_save_mode_interval(authed, internal_mode):
 # ---------- 2.0 M2 日志实时跟随 ----------
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="Windows 无 tail 的文本流语义（CRLF），且本机不跑 POSIX 日志跟随")
 def test_log_stream_ws(authed, internal_mode, tmp_path):
     """WebSocket 实时跟随：先回放末尾，再推送新写入的行。"""
     log = tmp_path / "app.log"

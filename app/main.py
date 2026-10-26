@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import __version__, confirm
 from .alerts import alerts as alert_manager
-from .apps import supervisor
+from .apps import consume_survive, supervisor
 from .audit import audit
 from .auth import extract_token, request_denial, require_auth
 from .config import MODE_INTERNAL, MODE_LABELS, MODE_PUBLIC, config
@@ -97,12 +97,19 @@ async def lifespan(app: FastAPI):
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
-    # 面板停止时一并结束托管应用（托管进程与面板同生命周期；升级不中断靠守护的只 TERM 面板进程）
+    # 托管应用的去留由交接标记决定：
+    # - 升级 / 重启（CLI 先写了标记）→ 保留应用与 pidfile，新实例 adopt_all() 接管；
+    # - 其余（--stop、崩溃、Ctrl-C）→ 一并结束，避免留下无人认领的孤儿。
+    keep_apps = consume_survive()
     with contextlib.suppress(Exception):
-        await supervisor.shutdown()
+        await supervisor.shutdown(keep_apps=keep_apps)
+    # 审计队列是有界缓冲：正常退出要排空，否则重启前最后一批事件会丢。
+    # 用 drain() 而不是 close()：单例不能停，停了这个进程后续的审计会被丢弃。
+    with contextlib.suppress(Exception):
+        await asyncio.to_thread(audit.drain)
     # 收尾：指标库关闭（WAL checkpoint），避免下次启动残留 -wal/-shm。
-    # 注意审计不在这里 close：它是进程级单例，同一进程可能再次启动 lifespan
-    # （测试/嵌入），停了就再也开不回来。审计每条事件都立即 flush+close，无需收尾。
+    # 两个单例都是"可重启"的：审计由本函数开头的 start() 复活，指标库下次用
+    # 会重新 open，所以同一进程再次进出 lifespan（测试/嵌入）不会留下死对象。
     with contextlib.suppress(Exception):
         await asyncio.to_thread(metrics_store.close)
 
@@ -188,6 +195,10 @@ async def security_headers(request: Request, call_next):
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     if request.url.path.startswith("/api/"):
         response.headers["Cache-Control"] = "no-store"
+    if request.url.path.endswith("/sw.js"):
+        # Service Worker 的默认最大作用域是脚本所在目录（/static/）。不显式放开，
+        # PWA 的离线壳与根页面 fetch 处理都不生效（manifest 的 scope 写的是 /）。
+        response.headers["Service-Worker-Allowed"] = "/"
     # TLS 部署（含反代终止）时下发 HSTS
     proto = request.url.scheme
     if config.trust_proxy:
@@ -234,10 +245,15 @@ app.include_router(log_routes.stream_router)
 
 
 @app.get("/healthz")
-async def healthz():
+async def healthz(request: Request):
     # 1.4.0 起最小化：不再对外暴露版本号与构建号（便于攻击者匹配已知漏洞），
-    # 也不暴露 initialized（探测"是否已设置密码"）。升级流程的版本观察
-    # 改走登录后的 /api/system/version。
+    # 也不暴露 initialized（探测"是否已设置密码"）。
+    # 2.0 审查修复：只对**本机回环**请求附带 version —— 否则 upgrade 流程的
+    # `expect_version` 永远匹配不上，等于"新版本真的起来了吗"从来没被验证过
+    # （manage.health_check 只能看到服务在响应，旧版进程照样算通过）。
+    client = request.client.host if request.client else ""
+    if client in ("127.0.0.1", "::1", "localhost"):
+        return {"ok": True, "version": __version__}
     return {"ok": True}
 
 
@@ -376,8 +392,16 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.config:
-        config.path = Path(args.config).expanduser()
-        config.load()
+        # 正常路径下 config 单例在**导入期**就已按 argv 解析（app/config.py 的
+        # cli_config_path）：audit / metrics_store / trash / 应用注册表都是模块级
+        # 单例，目录在导入时按 config.path 推导，晚赋值会让它们全留在默认目录。
+        # 这里只兜底"库内嵌调用（不经 argv）"的场景，并明确提示状态目录不会跟随。
+        requested = Path(args.config).expanduser()
+        if requested != config.path:
+            print(f"警告：--config 只在进程启动时生效；当前已导入的状态目录仍基于 "
+                  f"{config.path}（审计/指标/回收站/应用注册表不会改写）", file=sys.stderr)
+            config.path = requested
+            config.load()
 
     # ---- 生命周期命令 ----
     if any((args.install, args.start, args.stop, args.restart, args.status, args.update)):

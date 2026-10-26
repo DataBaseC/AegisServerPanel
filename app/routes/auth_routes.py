@@ -232,7 +232,13 @@ async def login(body: LoginBody, request: Request, response: Response):
     secret = scope.secret
     if scope.enabled and secret:
         if totp_mod.verify(secret, body.code):
-            pass  # 动态码正确
+            # 动态码正确 → 还要防重放：同一个码在 30 秒窗口内只能用一次
+            if not totp_mod.verify_once(secret, body.code):
+                sessions.record_failure(ip)
+                audit.record(AuditEvent(action="login_failed", summary="TOTP 动态码重放",
+                                        source="web", ip=ip, ok=False))
+                await _notify_lockout(ip)
+                raise HTTPException(401, "该动态码已被使用，请等 App 刷新出下一个码")
         elif scope.consume(body.code):
             audit.record(AuditEvent(action="totp_recovery_used", source="web", ip=ip))
         else:
@@ -408,10 +414,12 @@ async def totp_disable(body: PasswordBody, request: Request,
                        session: dict = Depends(require_auth)):
     """关闭 2FA：需要验证当前密码（防会话被劫持后直接拆防护）。"""
     current_user = config.user_by_id(session.get("user_id") or "") if config.has_users else None
+    # PBKDF2 60 万轮约 100~400ms：必须下线程池，否则关一次 2FA 就冻住整个面板
+    # （其它入口都已经是 to_thread，这里原先漏了）
     if current_user is not None:
-        ok = config.verify_user_password(current_user, body.password)
+        ok = await asyncio.to_thread(config.verify_user_password, current_user, body.password)
     else:
-        ok = config.verify_password(body.password)
+        ok = await asyncio.to_thread(config.verify_password, body.password)
     if not ok:
         raise HTTPException(401, "当前密码不正确")
     _totp_scope(session).disable()

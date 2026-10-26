@@ -518,9 +518,11 @@ const NAV = [
   // 运维页全是系统级变更（cron / 备份 / 更新 / Docker / 防火墙 / SSH / 挂载），仅 admin
   { id: 'ops', label: '运维', icon: '⛭', internalOnly: true, adminOnly: true },
   { id: 'apps-port', label: '应用与端口', icon: '⧉', internalOnly: true },
-  { id: 'files', label: '文件管理', icon: '▦', internalOnly: true },
+  // 文件管理 = 任意文件读写；安全中心里是令牌/会话/审计 —— viewer 访问会被后端 403，
+  // 与其给他一个报错的页面，不如直接按权限隐藏（服务端才是真正的拦截）
+  { id: 'files', label: '文件管理', icon: '▦', internalOnly: true, adminOnly: true },
   { id: 'agent', label: 'Agent 接入', icon: '⌘', internalOnly: true, adminOnly: true },
-  { id: 'security', label: '安全中心', icon: '◈', internalOnly: true },
+  { id: 'security', label: '安全中心', icon: '◈', internalOnly: true, adminOnly: true },
   { id: 'settings', label: '设置', icon: '⚒' },
 ];
 
@@ -643,6 +645,11 @@ function initTabs() {
 
 let viewSeq = 0;  // 视图代际：每次导航自增，过期的异步渲染结果一律丢弃
 let inflightResources = null;  // 正在渲染（还没 return cleanup）的那次导航的资源登记表
+// 当前**已渲染完成**视图的资源表。必须留着：视图常见写法是「定时器/WS 用 res.own
+// 登记、return 的 cleanup 只管一部分」。以前这里渲染完就把 resources 丢掉，导致
+// 只登记在 own() 里的东西（日志页的 tail WebSocket、安全中心的 30s 轮询）在正常
+// 切视图时永远不回收——WS 不断、tail 进程留在服务端。
+let currentResources = null;
 
 /**
  * 视图资源登记表：render 想随视图一起销毁、但**必须在渲染期间就登记**的东西
@@ -689,6 +696,8 @@ async function navigate(id) {
     try { currentCleanup(); } catch (err) { console.error(err); }
     currentCleanup = null;
   }
+  // 上一个视图用 res.own() 登记的资源（dispose 可重复调用，与 cleanup 重叠无害）
+  if (currentResources) { currentResources.dispose(); currentResources = null; }
   // 上一次导航的 render 可能还没结算（首屏请求很慢、甚至永远不结算）：
   // 它的 cleanup 还没拿到，但它已经登记的资源现在就回收，不能无限期等它
   if (inflightResources) { inflightResources.dispose(); inflightResources = null; }
@@ -721,6 +730,7 @@ async function navigate(id) {
       return;
     }
     currentCleanup = cleanup;
+    currentResources = resources;  // 渲染成功：own() 登记的资源交给路由，切视图时统一回收
   } catch (err) {
     if (inflightResources === resources) inflightResources = null;
     // render 抛错也必须回收它已经登记的资源：视图没起来，定时器却活着会一直报错
@@ -748,6 +758,15 @@ let authState = { initialized: false, authenticated: false };
 
 function showLogin(expired = false) {
   live.stop();
+  // 会话失效/被踢下线时同样要把当前视图拆干净：否则它的定时器与 WS 会在登录页背后
+  // 继续打接口，每个 401 都再触发一次 showLogin（登录框反复重绘、焦点被抢）。
+  viewSeq += 1;  // 让在途渲染的结果过期，别再往已隐藏的容器里写
+  if (currentCleanup) {
+    try { currentCleanup(); } catch (err) { console.error(err); }
+    currentCleanup = null;
+  }
+  if (currentResources) { currentResources.dispose(); currentResources = null; }
+  if (inflightResources) { inflightResources.dispose(); inflightResources = null; }
   $('#app').classList.add('hidden');
   $('#login-screen').classList.remove('hidden');
   const initialized = authState.initialized;
@@ -4665,7 +4684,7 @@ function opsProxyBlock(data) {
       <button class="btn sm primary" data-act="px-reload">重载配置</button>
     </div>
     <div class="dim mono" style="margin-bottom:6px">${esc(data.nginx.dir || '')}</div>
-    <div class="dim mono">${(data.nginx.sites || []).join(' · ') || '（站点目录为空或不存在）'}</div>
+    <div class="dim mono">${(data.nginx.sites || []).map(esc).join(' · ') || '（站点目录为空或不存在）'}</div>
     ${test.output ? `<div class="log-output" style="max-height:180px;margin-top:10px">${esc(test.output)}</div>` : ''}
   </div>`;
 }
@@ -5067,7 +5086,9 @@ registerView('ops', {
 registerView('settings', {
   title: '设置',
   async render(root) {
-    const canQuick = isInternal();
+    // 快捷设置读写的是面板级参数（prefs / 守护 / 备份）：viewer 会被后端 403，
+    // 所以只给 admin 显示这个 tab（管理员看到的仍是原来的行为）
+    const canQuick = isInternal() && isAdmin();
     let tab = localStorage.getItem('sp-settings-tab') === 'quick' && canQuick ? 'quick' : 'general';
     const caps = live.capabilities || {};
     const info = await api.get('/api/system/info').catch(() => ({}));
@@ -6129,13 +6150,16 @@ function paletteActions() {
     hint: I18N.t(`view.${item.id}`, item.label),
     run: () => navigate(item.id),
   }));
-  actions.push({
-    id: 'toggle-save-mode',
-    label: '切换低功耗模式',
-    hint: '性能采样 2s ↔ 10s',
-    run: () => toggleSaveMode(),
-  });
-  if (isInternal()) {
+  // prefs 与文件管理都是 admin-only（viewer 会 403），命令面板也不该给出入口
+  if (isAdmin()) {
+    actions.push({
+      id: 'toggle-save-mode',
+      label: '切换低功耗模式',
+      hint: '性能采样 2s ↔ 10s',
+      run: () => toggleSaveMode(),
+    });
+  }
+  if (isInternal() && isAdmin()) {
     actions.push({
       id: 'open-trash',
       label: '打开回收站',
@@ -6157,8 +6181,18 @@ async function paletteTaskActions() {
     return (data.tasks || []).map((task) => ({
       id: `task-${task.id}`,
       label: `执行任务 · ${task.title}`,
-      hint: (task.description || '常用任务').slice(0, 40),
+      hint: `${task.danger ? '危险 · ' : ''}${(task.description || '常用任务').slice(0, 40)}`,
       run: async () => {
+        // 命令面板必须和任务卡片走同一道确认：以前 Ctrl+K 直接 POST 就能跑
+        // 「重启面板 / 清理 /tmp」这类标记 danger 的任务（审查 6.8）
+        if (task.danger) {
+          const ok = await confirmDialog({
+            title: `危险操作 · ${task.title}`, danger: true, confirmText: '确认执行',
+            message: `该任务会修改系统状态，请确认：<b>${esc(task.title)}</b><br>
+              <span class="dim">${esc(task.description || '')}</span>`,
+          });
+          if (!ok) return;
+        }
         try {
           const res = await api.post(`/api/panel/tasks/${task.id}/run`, {});
           toast(`${task.title}：${res.ok ? '成功' : `失败（退出码 ${res.code}）`}`,

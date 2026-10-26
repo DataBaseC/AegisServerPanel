@@ -134,11 +134,17 @@ class Recorder:
 
 
 def load_events(name: str) -> list | None:
-    """读取录制文件为事件数组；文件不存在或格式错误返回 None。"""
+    """读取录制文件为事件数组；文件不存在、过大或格式错误返回 None。
+
+    上限在这里也判一次（路由层已判）：这个函数是模块级入口，CLI / 将来的调用方
+    不该因为绕过路由就把几十 MB 的录制整个读进内存。
+    """
     if not NAME_RE.fullmatch(name or ""):
         return None
     path = recordings_dir() / name
     try:
+        if path.stat().st_size > MAX_REPLAY_BYTES:
+            return None
         events = []
         with open(path, encoding="utf-8") as fh:
             for index, line in enumerate(fh):

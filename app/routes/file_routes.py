@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import errno
 import os
 import re
 import shutil
@@ -209,24 +208,36 @@ def _authorize_write(session: dict | None, *paths: str) -> None:
         raise HTTPException(403, WRITE_SCOPE_HINT)
 
 
-def _safe_write(path: str, content: str) -> None:
-    """写盘时拒绝跟随符号链接（2.0 M1 / P1-7）。
+def _stage_write(path: str, content: str) -> str:
+    """把新内容写进同目录的临时文件并 fsync，返回临时路径。
 
-    父目录先取 ``realpath``（路径中间的正常目录链接仍可解析），最终文件用
-    ``O_NOFOLLOW`` 打开：即使"检查是否为链接"与"打开"之间被换成链接，
-    内核也会拒绝，从而堵住 TOCTOU。
+    不再"先 move 原文件、再 O_TRUNC 直写目标"：进程在两步之间或写到一半被
+    SIGKILL，目标就会消失或只剩半截，原内容虽在回收站但路径上已经是坏的。
+    现在磁盘上任何时刻都有一份完整文件：临时文件写完 → 原文件进回收站 →
+    ``os.replace`` 原子替换。
+
+    父目录取 ``realpath``（路径中间的正常目录链接仍可解析）；最终目标是否
+    符号链接由调用方在 ``_validate_write_target`` 里先行拒绝。
     """
     parent = os.path.realpath(os.path.dirname(path) or "/")
-    target = os.path.join(parent, os.path.basename(path))
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".serverpanel-write-", dir=parent)
     try:
-        fd = os.open(target, flags, 0o644)
-    except OSError as exc:
-        if getattr(exc, "errno", None) == errno.ELOOP:
-            raise HTTPException(400, "目标是符号链接，拒绝写入（请先删除链接或直接编辑目标文件）")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:
+            # 保住原文件权限位（mkstemp 默认 0600，直接替换会把 0644 的配置变 0600）
+            mode = stat.S_IMODE(os.stat(os.path.join(parent, os.path.basename(path))).st_mode)
+        except OSError:
+            mode = 0o644      # 新文件沿用旧行为的默认权限
+        os.chmod(tmp, mode)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
         raise
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(content)
+    return tmp
 
 
 def cleanup_stale_archives() -> None:
@@ -410,25 +421,31 @@ async def write_file(body: WriteBody, request: Request,
             raise HTTPException(409, f"文件在编辑期间已被修改（磁盘版本更新于 {when}），"
                                      f"直接保存会覆盖它")
 
-    # 覆盖写前自动进回收站（1.4.0）：误操作可从「文件管理 → 回收站」还原
+    # 1. 先把新内容落到同目录临时文件（fsync）：这一步失败，磁盘上的原文件毫发无伤
+    try:
+        tmp_path = await asyncio.to_thread(_stage_write, full, body.content)
+    except OSError as exc:
+        raise HTTPException(500, f"保存失败: {exc}")
+
+    # 2. 覆盖写前自动进回收站（1.4.0）：误操作可从「文件管理 → 回收站」还原
     trashed = None
     if os.path.isfile(full):
         try:
             trashed = await asyncio.to_thread(trash.move, full, "overwrite")
         except OSError as exc:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
             raise HTTPException(500, f"备份原文件到回收站失败，已取消保存: {exc}")
 
-    def _save() -> None:
-        os.makedirs(os.path.dirname(full) or "/", exist_ok=True)
-        _safe_write(full, body.content)
-
+    # 3. 原子替换：目标路径上要么是旧内容、要么是完整的新内容，不存在半截文件
     try:
-        await asyncio.to_thread(_save)  # 写盘不阻塞事件循环
+        await asyncio.to_thread(os.replace, tmp_path, full)
     except OSError as exc:
-        # 保存失败：把刚备份的原文件放回去，不留"改了半截"的现场
         if trashed:
             with contextlib.suppress(Exception):
                 trash.restore(trashed.entry_id)
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
         raise HTTPException(500, f"保存失败: {exc}")
     audit.record(AuditEvent(
         action="file_write",

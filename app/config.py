@@ -12,6 +12,7 @@ import json
 import os
 import re
 import secrets
+import sys
 import threading
 import time
 from pathlib import Path
@@ -104,6 +105,26 @@ def default_config_path() -> Path:
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         return Path("/etc/serverpanel/config.json")
     return Path.home() / ".config" / "serverpanel" / "config.json"
+
+
+def cli_config_path(argv: list[str] | None = None) -> Path | None:
+    """从命令行参数里解析 ``--config``（``--config X`` 与 ``--config=X`` 两种写法）。
+
+    为什么要在**创建 config 单例之前**解析：``audit`` / ``metrics_store`` /
+    ``trash`` / ``apps.Registry`` 都是模块级单例，它们的目录是在**导入期**按
+    ``config.path`` 推导出来的。以前 ``--config`` 在 ``main()`` 里才赋值，
+    此时这些单例早已按默认目录定型——于是"自定义配置路径"只换了主配置，
+    审计、指标、注册表、回收站仍写默认目录（多实例部署会互相混写）。
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    for index, item in enumerate(args):
+        if item == "--config" and index + 1 < len(args):
+            return Path(args[index + 1]).expanduser()
+        if item.startswith("--config="):
+            value = item.split("=", 1)[1].strip()
+            if value:
+                return Path(value).expanduser()
+    return None
 
 
 class Config:
@@ -705,4 +726,6 @@ class Config:
                 return
 
 
-config = Config()
+# 注意：这里就要把 --config 定下来——单例（audit / metrics_store / trash / apps）的
+# 目录都在导入期按 config.path 推导，晚一步就全落到默认目录（见 cli_config_path）。
+config = Config(cli_config_path())

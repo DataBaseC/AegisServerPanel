@@ -542,7 +542,8 @@ NET_COMMANDS = {
     "ping": lambda target: ["ping", "-c", "4", "-W", "2", target],
     "traceroute": lambda target: ["traceroute", "-n", "-m", "15", target],
     "mtr": lambda target: ["mtr", "-r", "-c", "5", target],
-    "curl": lambda target: ["curl", "-sS", "-I", "--max-time", "8", target],
+    # curl 支持 ``--`` 终止选项解析：即使目标校验被绕过，也不会被当成选项
+    "curl": lambda target: ["curl", "-sS", "-I", "--max-time", "8", "--", target],
 }
 
 

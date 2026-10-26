@@ -123,8 +123,11 @@ def test_multi_user_totp_status_follows_session_user():
     """多用户模式：2FA 状态取自会话对应用户记录，两个账号互不影响。"""
     config.disable_totp()  # 全局 2FA 关闭，且下面创建用户时不会再迁移出启用的 admin
     assert config.has_users is False
-    config.create_user("alice", ALICE_PASSWORD, role="viewer")
-    config.create_user("bob", BOB_PASSWORD, role="viewer")
+    # 用 operator 而不是 viewer：安全中心（/api/panel/security*）自 2026-10-26 起
+    # 对 viewer 关闭（读权限改成白名单），而这里要验证的是「2FA 展示跟随会话用户」，
+    # 与角色无关；operator 仍能读安全中心。
+    config.create_user("alice", ALICE_PASSWORD, role="operator")
+    config.create_user("bob", BOB_PASSWORD, role="operator")
     assert config.has_users is True
     assert config.totp_enabled is False  # 全局仍关闭：证明判定不是全局字段
 

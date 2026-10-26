@@ -85,7 +85,7 @@ systemd 服务列表与状态、启停 / 重启 / 重载、开机自启开关、
 
 - **真正的持久化**：托管进程用 `start_new_session` 独立成会话组，关掉浏览器、断开终端、网络抖动都不会中断；面板自身升级重启也不会连带杀死它
 - **崩溃自动拉起**：按策略重启（`never` / `on-failure` / `always`），可配重启间隔与「5 分钟内最多重启次数」，超过上限标记 `failed` 并停止重试，避免崩溃循环把机器拖垮
-- **输出可追溯**：`stdout`/`stderr` 合流落盘到 `logs/apps/<名称>.log`（超 4MB 自动转 `.1`），页面按字节偏移增量跟随，断线重连不丢历史；也可一键清空
+- **输出可追溯**：`stdout`/`stderr` **由子进程直接追加**到 `logs/apps/<名称>.log`（不再经过面板管道），页面按字节偏移增量跟随，断线重连不丢历史；也可一键清空。超过上限时就地截断保留尾部（rename 轮转会打断子进程正在写的 inode，故不采用）
 - **先试后启**：注册后默认不启动，点「试运行」跑 6 秒抓输出，确认命令与工作目录正确再正式保活
 - **开机自启**：勾选 `autostart` 的应用在面板启动 2 秒后被拉起；无 systemd 环境配合 `panel-supervisor.sh` 即实现容器重启后自动恢复
 - **面板全挂也能救火**：`serverpanel --apps list/start/stop/restart/logs/remove` 直接在服务器本机操作，不依赖服务进程
@@ -269,7 +269,7 @@ flowchart TB
 
 ### 权限模型（三层）
 
-1. **身份层**：`require_auth` —— 校验会话 Cookie。密码用 PBKDF2-HMAC-SHA256（260,000 轮 + 16 字节随机盐）存储，会话有效期 12 小时，Cookie 为 HttpOnly。
+1. **身份层**：`require_auth` —— 校验会话 Cookie。密码用 PBKDF2-HMAC-SHA256（**600,000 轮** + 16 字节随机盐，1.4.0 起）存储，会话有效期默认 12 小时（可在快捷设置里改），Cookie 为 HttpOnly。
 2. **模式层**：`require_internal` —— 在身份层之上要求当前处于内网模式，否则 403。所有写操作与敏感读操作都挂在它下面。
 3. **令牌层**：`require_exec_auth` —— 供命令执行接口使用，接受「面板会话」或「Agent 令牌」两种身份，且同样要求内网模式；令牌比对用 `hmac.compare_digest` 防时序侧信道。
 
@@ -298,7 +298,7 @@ panel-supervisor.sh / systemd
               └── /api/panel/apps/*（全部要求内网模式）
 ```
 
-- **升级不断服**：升级流程只 TERM 面板服务进程本身，由守护重新拉起；托管应用处于独立会话组，不受进程组 TERM 影响
+- **升级不断服**：升级 / 重启前 CLI 先写一个带 TTL 的**交接标记**（`<注册表目录>/.apps-survive`），面板 lifespan 退出时读到它就不结束托管应用；新实例启动时按每个应用的 `logs/apps/<名称>.pid` 认领仍在运行的那些（校验命令行防 PID 复用），既不重复拉起也不留孤儿。`serverpanel --stop` 会清掉标记并结束应用——「停面板 = 停应用」的语义不变
 - **停止即收尾**：`serverpanel --stop` / 面板 lifespan 退出时显式结束所有托管进程（含它们 fork 的子进程），避免无人认领的孤儿
 - **重启可对账**：面板重启后内存状态丢失，但注册表与日志都在磁盘上；CLI 会按注册表反查命令行，把"上个面板实例拉起的应用"重新纳入管理
 - **递归防护**：注册时拒绝把面板自身命令（`-m app.main`）作为托管应用，否则会出现「应用重启 → 面板重启 → 应用重启」的雪崩
@@ -754,6 +754,29 @@ serverpanel --host 0.0.0.0 --port 8787 --ssl-certfile /path/cert.pem --ssl-keyfi
 
 ## 十、更新记录
 
+### 2.0 审查修复（2026-10-26，未发布）
+
+对第三方审查报告（基线 `16776ad`）逐条核验后落地的修复，版本号仍记 `2.0`：
+
+- **P0 数据丢失**：`shell.run(stdin=...)` 从未建立 stdin 管道 → `crontab -` 在 systemd 下读到 EOF，可能安装空 crontab（随后"读回校验失败→恢复"也走同一坏路径）。已补 `stdin=PIPE`，并加真实子进程回归（不再只靠 fake shell）。
+- **只读作用域提权**：`/proc/<pid>/root|cwd|fd` 是魔法链接，`cat /proc/self/root/etc/shadow` 能读真实根目录文件；`scopes._path_denied` 现在无条件拒绝（cat 与 wc/stat/file/du 共用）。
+- **升级不打断托管应用**：应用输出改为**直写日志文件**（管道读端随面板消失会让应用下次写日志就 EPIPE 被杀，此前"只 TERM 面板进程"实际保不住）；新增 `logs/apps/<名称>.pid` + `adopt_all()` 接管（校验命令行防 PID 复用）+ `.apps-survive` 交接标记（TTL 180s）；`--stop` 仍连带结束应用。日志上限改为就地截断（rename 会切断子进程正在写的 inode）。
+- **`--config` 真正隔离**：在创建 config 单例**之前**解析 argv —— 审计 / 指标 / 回收站 / 应用注册表全部跟随（此前只有主配置跟着走，多实例会混写状态）。
+- **前端资源回收**：`res.own()` 登记的资源在**正常切视图**与掉登录时也会 dispose（此前只在渲染失败/渲染期切走时回收，日志页的 `tail` WebSocket 与安全中心 30s 轮询会残留）。
+- **覆盖写原子化**：临时文件 + `fsync` + `os.replace`，并保留原文件权限位；写到一半被 SIGKILL 不再留下半截文件。
+- **并发启动**：每个应用一把 `asyncio.Lock`，双击 / 客户端重试 / 自启并发只拉起一个进程。
+- **长连接鉴权**：终端 WebSocket 每 2 秒复核会话与角色（`auth.session_still_valid`），踢出会话 / 降权立即断开并回 4403。
+- **SSRF 收口**：「常用操作 → HTTP 探测」的 URL 执行前过 `ssrf.assert_url_allowed`；网络工具目标拒绝 `-` 开头（`-x…` 对 curl 是 `--proxy`），curl 追加 `--` 终止选项。
+- **viewer 读权限白名单**：只读账号的 GET 也按白名单（fail-closed），只放监控类；配置导出（含密码哈希 / TOTP）、任意文件读写、终端录制原文、审计、会话、用户、常驻应用、常用操作、Agent 令牌一律 403。进程详情的 `environ` 只对 admin 返回。
+- **TOTP 防重放**：登录改用 `totp.verify_once()`，同一个 30 秒窗口内的同一个动态码只能用一次（启用 / 重生成恢复码这类已登录操作仍用 `verify`）。
+- **前端**：命令面板对 `danger` 任务补上任务页同一道确认（此前 Ctrl+K 可直接执行「重启面板」）；nginx 站点名补 `esc()`；文件管理 / 安全中心按角色隐藏，快捷设置 tab 仅 admin。
+- **Service Worker 作用域**：`/static/sw.js` 响应补 `Service-Worker-Allowed: /` —— 否则 SW 最大作用域被限在 `/static/`，PWA 的离线壳与根页面 fetch 处理完全不生效。
+- **阻塞调用下线程池**：关闭 2FA 的 PBKDF2 校验、时区查询（`timedatectl` 10s 超时）、监听端口探测。
+- **审计排空**：lifespan 退出调用 `audit.drain()`（刷盘但**不停**线程）——用 `close()` 会让本进程后续审计被静默丢弃。
+- **升级校验真正生效**：`/healthz` 只对**本机回环**请求附带 `version`（远端仍是 `{"ok": true}`，指纹不外泄），`manage.health_check` 版本不符一律判失败。此前 `expect_version` 永远匹配不上，旧进程还在响应就被当成"升级成功"，也无法证明回滚后跑的是哪一版。
+- **依赖**：`opentelemetry-api` 1.45.0 → 1.45.1（CVE-2026-114603）。
+- **验证**：`pytest` 全绿（Windows 开发机，含本轮新增回归）；`gen_sha256sums.py --check` 88 文件通过；`node --check static/app.js` 通过。
+
 ### 2.0（本仓库合入版：外包 1.6.0 + 2.0.0 + 2.0.1）
 
 - **合入外包平台化三条线**：1.6.0（安全巡检 + 通知出口 + 文件批量操作）、2.0.0（监控备份 / 运维扩展 / 多用户 RBAC / 平台化 / 会话录制）、2.0.1（operator 权限收口补丁），一次性并到本仓库
@@ -898,7 +921,10 @@ serverpanel --host 0.0.0.0 --port 8787 --ssl-certfile /path/cert.pem --ssl-keyfi
 - 常驻应用**不做资源隔离**（暂无 cgroup / 内存上限）：托管进程与面板同为 root，命令写错同样能搞坏系统——注册前先用「试运行」确认，并优先使用绝对路径
 - 常驻应用的重启上限按「5 分钟窗口内重启次数」计算，窗口外的历史崩溃不计入；`failed` 状态只表示已放弃自动拉起，手动启动仍可用
 - 「常用操作」内置任务以 Ubuntu / Debian 的命令集为准（`ss`、`du`、`journalctl`、`find -printf` 等），在 Alpine / BusyBox 上部分任务会失败并原样回显错误，不会静默成功
-- 未做多用户与权限分级，所有登录者共享同一个面板密码与 root 权限
+- 多用户 RBAC 是**可选的第二道收口**（2.0 起）：`users` 为空时仍是「单密码 = admin」；建了用户后按 admin / operator / viewer 三档限制。
+  - **viewer 的读权限也是白名单**（2026-10-26 起）：只放监控类数据——系统信息 / 指标 / 进程列表（不含 environ）/ 服务与日志 / 存储只读 / 应用端口发现 / 自身账号。文件管理、配置导出、终端录制、审计、会话、用户、常驻应用、常用操作、Agent 令牌一律 403。
+  - 因此 viewer 前端只能看到「概览 / 性能 / 控制台日志 / 存储 / 进程 / 服务 / 应用与端口 / 设置（一般）」；用 viewer 做运维请改用 operator
+- 常驻应用的日志上限是**就地截断**（保留尾部）而非 rename 轮转：托管进程直接持有日志文件句柄，rename 会让它继续写旧 inode。代价是截断瞬间可能丢几行，与 logrotate 的 copytruncate 同样的取舍
 
 ---
 

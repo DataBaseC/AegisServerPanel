@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from ..audit import AuditEvent, audit
-from ..auth import client_ip, require_auth, require_internal
+from ..auth import ROLE_ADMIN, client_ip, require_auth, require_internal
 from ..config import MODE_INTERNAL, config
 
 router = APIRouter(prefix="/api/processes", tags=["processes"], dependencies=[Depends(require_auth)])
@@ -100,7 +100,7 @@ async def list_processes(sort: str = "cpu", limit: int = 60, q: str = "", user: 
 
 
 @router.get("/{pid}")
-async def process_detail(pid: int):
+async def process_detail(pid: int, session: dict = Depends(require_auth)):
     def _detail() -> dict:
         try:
             proc = psutil.Process(pid)
@@ -128,8 +128,9 @@ async def process_detail(pid: int):
             except (psutil.Error, OSError):
                 detail["connections"] = []
             # 进程环境变量里常见 DATABASE_URL、API key 之类密钥：
-            # 只在内网模式返回，公网只读模式登录用户看不到（防信息泄露）
-            if config.mode == MODE_INTERNAL:
+            # 除内网模式外还要求 **admin**——viewer / operator 即使在内网模式
+            # 也不该从这里摸到 root 进程的密钥（审查 P1-1）
+            if config.mode == MODE_INTERNAL and session.get("role") == ROLE_ADMIN:
                 try:
                     detail["environ"] = dict(list(proc.environ().items())[:40])
                 except (psutil.Error, OSError):

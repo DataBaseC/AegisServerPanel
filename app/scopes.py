@@ -105,6 +105,17 @@ _IP_ACTIONS = frozenset({"show", "list", "ls", "sh", "get"})
 _CAT_DENY_NAMES = frozenset({"kcore", "mem", "environ", "keys", "kmsg"})
 _CAT_DENY_SUBSTR = ("/sysrq-trigger", "/self/fd/")
 
+# /proc 的「魔法链接」：/proc/<pid>/root 指向该进程的根目录、/proc/<pid>/cwd 指向它的
+# 工作目录、/proc/<pid>/fd/* 是它打开的文件描述符。它们读出来的是**链接目标**的内容，
+# 所以只按字符串前缀判 /proc 会被绕过：`cat /proc/self/root/etc/hostname` 的 basename
+# 是 hostname（不在敏感名单里），实际读的却是真实根目录下的文件；换成
+# `/proc/1/root/etc/shadow`、`/proc/1/root/root/.ssh/id_rsa` 同理。
+# readonly 令牌因此能从「只看只读命令」退化成任意敏感文件读取，故在这里统一拒掉，
+# 对 cat 与 wc/stat/file/du 共用（两者都走 _path_denied）。
+_PROC_MAGIC_RE = re.compile(
+    r"^/proc/(?:\d+|self|thread-self)/(?:task/(?:\d+|self)/)?(?:root|cwd|fd)(?:/|$)"
+)
+
 # 敏感系统文件/目录（1.6.0 S2）：wc / stat / file / du 这类"只看元信息"的命令
 # 同样会泄露敏感文件的体量、行数、链接目标、属主，或暴露敏感目录是否存在。
 # 与 cat 共用同一套判定机制（basename 精确匹配 + 路径片段匹配），但名单不同：
@@ -132,8 +143,13 @@ def _path_denied(path: str, deny_names: frozenset[str], deny_substr: tuple[str, 
     ``/sysrq-trigger`` 这类出现在路径中段的片段；``True``（文件类命令用）按
     目录边界匹配，使 ``/etc/ssh`` 命中该目录本身及其下内容，又不误伤
     ``/etc/ssh_config``。
+
+    ``/proc`` 的魔法链接（root / cwd / fd）在**任何**名单之前无条件拒绝：
+    它们指向的是链接目标，名单本身兜不住（见 :data:`_PROC_MAGIC_RE`）。
     """
     normalized = posixpath.normpath(path)
+    if _PROC_MAGIC_RE.match(normalized):
+        return True
     if posixpath.basename(normalized) in deny_names:
         return True
     if dir_prefixes:

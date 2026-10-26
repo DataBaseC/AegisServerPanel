@@ -14,8 +14,8 @@ from pydantic import BaseModel
 
 from .. import recording, shell
 from ..audit import AuditEvent, audit
-from ..auth import (ROLE_ADMIN, authenticate_ws, require_exec_auth,
-                    require_internal, sessions)
+from ..auth import (ROLE_ADMIN, authenticate_ws, extract_token, require_exec_auth,
+                    require_internal, session_still_valid, sessions)
 from ..config import MODE_INTERNAL, config
 from ..prefs import prefs
 from ..utils import is_root
@@ -237,6 +237,8 @@ async def terminal_socket(websocket: WebSocket):
     # 2.1.0：WS 不走 HTTP 中间件，RBAC 必须在这里显式做——终端 = root shell，仅 admin。
     if not await authenticate_ws(websocket, internal_only=True, min_role=ROLE_ADMIN):
         return
+    # 会话令牌留着给下面的长连接复核用（握手通过 ≠ 之后一直有效）
+    session_token = extract_token(websocket)
     await websocket.accept()
     # 空闲超时（2.0 M1）：按 prefs 每分钟检查，0 = 不限制
     idle_seconds = _idle_seconds()
@@ -348,13 +350,24 @@ async def terminal_socket(websocket: WebSocket):
             _record(recorder, "i", text)
 
     async def watch_mode() -> None:
-        """内网模式被关闭后，立即终止已建立的终端会话。"""
-        while config.mode == MODE_INTERNAL:
+        """每 2 秒复核一次：内网模式是否关闭、会话是否失效、角色是否仍是 admin。
+
+        只在握手时校验是不够的——**踢出会话、禁用账号、角色降级对已经建立的
+        root shell 全都无效**（审查 P1-3 实测：撤销 session 后继续执行命令仍成功）。
+        """
+        while True:
             await asyncio.sleep(2)
-        try:
-            await websocket.send_text("\r\n\x1b[33m内网模式已关闭，终端会话已终止。\x1b[0m\r\n")
-        except Exception:
-            pass
+            if config.mode != MODE_INTERNAL:
+                note = "\r\n\x1b[33m内网模式已关闭，终端会话已终止。\x1b[0m\r\n"
+                break
+            if not session_still_valid(session_token, ROLE_ADMIN):
+                note = ("\r\n\x1b[33m会话已失效或被降权，终端会话已终止"
+                        "（请重新登录）。\x1b[0m\r\n")
+                break
+        with contextlib.suppress(Exception):
+            await websocket.send_text(note)
+            # 4401/4403 让前端停止自动重连（它对"认证类关闭码"不再重试）
+            await websocket.close(code=4403)
 
     output_task = asyncio.create_task(pump_output())
     input_task = asyncio.create_task(pump_input())

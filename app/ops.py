@@ -436,10 +436,19 @@ NET_TOOLS = ("ping", "traceroute", "mtr", "curl")
 
 
 def check_target(value: str) -> str:
-    """网络工具目标校验：只允许域名 / IP / IPv6，禁掉一切 shell 元字符。"""
+    """网络工具目标校验：只允许域名 / IP / IPv6，禁掉一切 shell 元字符。
+
+    额外拒绝 ``-`` 开头的值（2026-10-26 审查）：目标会被原样追加到固定 argv
+    的**最后一个位置**，但 argv 是列表不代表安全——``-x127.0.0.1:8888`` 对
+    ``curl -I`` 是合法的 ``--proxy``，``-f``/``-s65000`` 对 ``ping`` 是泛洪与
+    巨型包，``-H...`` 能改请求头。这条路径按设计留给 operator，等于把"固定
+    argv 无法注入参数"的前提推翻了。
+    """
     text = (value or "").strip()
     if not text:
         raise OpsError("目标不能为空")
+    if text.startswith("-"):
+        raise OpsError("目标不合法（不能以 - 开头：那会被当成命令行选项）")
     if not TARGET_RE.match(text):
         raise OpsError("目标不合法（只能包含字母、数字、点、冒号、连字符与方括号）")
     if ".." in text:

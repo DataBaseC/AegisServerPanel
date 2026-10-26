@@ -69,6 +69,17 @@ async def run_task(task_id: str, request: Request, body: RunBody | None = None,
     missing = [p.label for p in task.params if not str(values.get(p.name) or p.default).strip()]
     if missing:
         raise HTTPException(400, f"缺少参数：{', '.join(missing)}")
+    # URL 类参数（net-http）执行前必须过 SSRF 校验：任务命令走 shell=True，
+    # 参数正则只约束字符集，挡不住「探测回环/内网/云元数据」（审查 6.1）。
+    if task.url_params:
+        from ..ssrf import assert_url_allowed
+
+        for name in task.url_params:
+            raw = str(values.get(name) or next(
+                (p.default for p in task.params if p.name == name), "")).strip()
+            if raw:
+                # 校验里要做 DNS 解析（阻塞）：下线程池，别冻住事件循环
+                await asyncio.to_thread(assert_url_allowed, raw)
     try:
         command = render(task, values)
     except ValueError as exc:

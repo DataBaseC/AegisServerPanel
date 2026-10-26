@@ -41,6 +41,9 @@ class Task:
     params: tuple[Param, ...] = ()
     readonly: bool = True       # 只读任务在公网模式下也允许运行（本模块整体要求内网，此项供未来放宽）
     kind: str = "cmd"           # cmd = 交给 shell；panel = 面板自身动作
+    # 这些参数的取值是 URL，执行前必须过 SSRF 校验（见 routes/tasks_routes.run_task）。
+    # 任务命令走 shell=True，光靠正则挡不住"访问内网/云元数据"这一类。
+    url_params: tuple[str, ...] = ()
 
 
 TASKS: tuple[Task, ...] = (
@@ -158,6 +161,7 @@ TASKS: tuple[Task, ...] = (
         command="curl -sS -o /dev/null -D - --max-time 15 '{{url}}' 2>&1 | head -20",
         params=(Param("url", "URL", "https://www.baidu.com", r"https?://[\w.\-:/?&=#%+~]{1,180}", "https://…"),),
         timeout=30,
+        url_params=("url",),
     ),
     Task(
         id="net-dns", group="网络", title="DNS 解析",

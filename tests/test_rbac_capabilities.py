@@ -81,7 +81,8 @@ OPERATOR_ALLOWED_WRITES = [
     (r"^/api/panel/tasks/[^/]+/run$", "触发任务：命令由 admin 定义，operator 不能改"),
     (r"^/api/panel/tasks/recent$", "清空任务运行记录（仅本地记录）"),
     (r"^/api/panel/infra/docker/containers/[^/]+/action$", "启动/停止已有容器（镜像由 admin 创建）"),
-    (r"^/api/panel/infra/net/tool$", "网络工具：固定 argv 白名单，无法注入"),
+    (r"^/api/panel/infra/net/tool$",
+     "网络工具：固定 argv + ops.check_target 拒 '-' 开头，无法注入选项"),
     (r"^/api/panel/infra/databases/probe$", "数据库只读探测"),
     (r"^/api/snippets(/.*)?$", "代码片段：纯文本存储，不自动执行"),
     (r"^/api/files(/.*)?$", "文件管理：路径级写根白名单在 file_routes 里另做一层判定"),
@@ -212,6 +213,74 @@ def test_operator_keeps_bounded_ops(operator):
     # 服务列表在 Windows 上因缺少 systemctl 返回 400，这里只关心「不是 RBAC 拦的」
     assert operator.get("/api/services").status_code != 403
     assert operator.get("/api/logs/sources").status_code != 403
+
+
+# ---------------------------------------------------------------- 3) viewer 读权限
+#
+# 2.0 的 viewer 是「除写以外全放行」：能导配置（含密码哈希/TOTP）、读任意文件、
+# 读终端录制原文、翻审计日志。这里把读权限也改成白名单（fail-closed），
+# 下面两组分别锁住「该给的」和「不该给的」。
+
+VIEWER_READ_ALLOWED = [
+    ("/api/system/info", "系统信息"),
+    ("/api/system/metrics", "实时指标"),
+    ("/api/system/version", "版本（登录后）"),
+    ("/api/processes", "进程列表"),
+    ("/api/services", "服务列表"),
+    ("/api/logs/sources", "日志来源"),
+    ("/api/logs/file", "日志文件内容"),
+    ("/api/storage/overview", "磁盘概览"),
+    ("/api/apps", "应用与端口发现"),
+    ("/api/auth/status", "自身登录态"),
+]
+
+VIEWER_READ_DENIED = [
+    ("/api/panel/config/export", "配置导出（含密码哈希 / TOTP / 令牌哈希）"),
+    ("/api/panel/config/backups", "配置备份列表"),
+    ("/api/files/read", "任意文件读取"),
+    ("/api/files/download", "任意文件下载"),
+    ("/api/files/list", "目录列举"),
+    ("/api/files/roots", "文件管理入口"),
+    ("/api/panel/recordings", "终端录制原文（常含明文密码）"),
+    ("/api/panel/audit/log", "审计日志"),
+    ("/api/panel/sessions", "会话列表"),
+    ("/api/panel/users", "用户列表"),
+    ("/api/panel/prefs", "面板参数"),
+    ("/api/panel/diagnostics", "自诊断包"),
+    ("/api/agent/info", "Agent 令牌与执行记录"),
+    ("/api/panel/apps", "常驻应用（命令即 shell）"),
+    ("/api/panel/tasks", "常用操作（命令执行）"),
+    ("/api/terminal/info", "终端环境信息"),
+    ("/api/panel/maintenance/backups", "备份打包 / 外传"),
+]
+
+
+@pytest.mark.parametrize("path,label", VIEWER_READ_ALLOWED)
+def test_viewer_monitoring_reads_allowed(path, label):
+    assert rbac_denial("GET", path, ROLE_VIEWER) == "", f"viewer 应能读 {path}（{label}）"
+
+
+@pytest.mark.parametrize("path,label", VIEWER_READ_DENIED)
+def test_viewer_sensitive_reads_denied(path, label):
+    assert rbac_denial("GET", path, ROLE_VIEWER), f"viewer 不应能读 {path}（{label}）"
+
+
+def test_viewer_read_policy_over_http(viewer):
+    """真发请求：凭据类 403，监控类 200。"""
+    assert viewer.get("/api/panel/config/export").status_code == 403
+    assert viewer.get("/api/files/list", params={"path": "/"}).status_code == 403
+    assert viewer.get("/api/panel/recordings").status_code == 403
+    assert viewer.get("/api/panel/audit/log").status_code == 403
+    assert viewer.get("/api/system/info").status_code == 200
+    assert viewer.get("/api/processes").status_code == 200
+
+
+def test_viewer_process_detail_hides_environ(viewer):
+    """进程详情里的 environ 有 DATABASE_URL / API key 之类：仅 admin 可见。"""
+    import os as os_mod
+
+    body = viewer.get(f"/api/processes/{os_mod.getpid()}").json()
+    assert "environ" not in body, body.keys()
 
 
 def test_viewer_still_read_only(viewer):

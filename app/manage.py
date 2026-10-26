@@ -374,6 +374,14 @@ def _panel_pids(target_dir: Path) -> list[int]:
 
 
 def _restart_service(target_dir: Path) -> None:
+    # 交接标记：升级/重启**不打断托管应用**。面板 lifespan 退出时读到它就跳过
+    # supervisor.shutdown()，应用与 pidfile 都留着，新实例启动时按 pidfile 接管。
+    try:
+        from .apps import mark_survive
+
+        mark_survive()
+    except Exception:  # 标记失败只影响"应用随面板一起停"，不影响重启本身
+        pass
     if _systemd_available():
         subprocess.run(["systemctl", "restart", "serverpanel"], check=False)
     else:
@@ -405,7 +413,12 @@ def _health_targets(host: str) -> list[str]:
 def health_check(port: int, host: str = "127.0.0.1",
                  expect_version: str | None = None,
                  tries: int | None = None, delay: float | None = None) -> dict | None:
-    """轮询 /healthz。expect_version 给定时，返回旧版本视为未就绪。"""
+    """轮询 /healthz。``expect_version`` 给定时，版本不符一律视为**未就绪**（返回 None）。
+
+    原实现超时后返回最后一次响应（truthy），调用方只在 ``None`` 时回滚 —— 于是
+    "版本不符"被当成升级成功，无法证明新代码真的在跑（旧进程还在响应时尤其危险）。
+    `/healthz` 现在对本机回环请求返回 version，这里的断言才有意义。
+    """
     tries = HEALTH_TRIES if tries is None else tries
     delay = HEALTH_DELAY if delay is None else delay
     deadline = time.time() + tries * delay
@@ -421,7 +434,9 @@ def health_check(port: int, host: str = "127.0.0.1",
             except (OSError, ValueError):
                 pass
         time.sleep(delay)
-    return last  # 不为 None 说明服务在跑但版本不符，调用方据此回滚
+    # 指定了版本却始终没匹配上 → 视为未就绪（调用方据此回滚）。
+    # 不指定版本时返回最后一次响应，仅用于"服务在不在"的判断。
+    return None if expect_version else last
 
 
 # ---------- 子命令实现 ----------
@@ -492,6 +507,14 @@ def cmd_start(target_dir: Path) -> int:
 
 
 def cmd_stop(target_dir: Path) -> int:
+    # --stop 的语义是"面板与托管应用一起停"：先清掉交接标记，避免残留标记让
+    # 退出中的面板误以为这次是升级而不收应用
+    try:
+        from .apps import clear_survive
+
+        clear_survive()
+    except Exception:
+        pass
     if _systemd_available():
         subprocess.run(["systemctl", "stop", "serverpanel"], check=False)
         print("服务已停止")

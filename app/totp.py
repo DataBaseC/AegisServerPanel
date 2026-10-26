@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import secrets
 import struct
+import threading
 import time
 import urllib.parse
 
@@ -25,6 +26,14 @@ _STEP = 30           # 秒
 _DIGITS = 6
 _WINDOW = 1          # 容忍 ±1 步（约 ±30s）时钟漂移
 _RECOVERY_COUNT = 10
+
+# 已用过的 (secret 摘要, 时间步)：同一个动态码只能用一次（防重放，审查 6.2）。
+# 进程级、有界、5 分钟自清：面板是单进程，重启后要重放还得让这个码落在
+# 30~90 秒的有效窗口内，收益极低，属可接受取舍（不引入磁盘状态）。
+_USED: dict[tuple[str, int], float] = {}
+_USED_LOCK = threading.Lock()
+_USED_TTL = 300.0
+_USED_MAX = 4096
 
 
 def generate_secret() -> str:
@@ -63,6 +72,41 @@ def verify(secret_b32: str, candidate: str, at: float | None = None) -> bool:
         if hmac.compare_digest(_hotp(secret_b32, counter + drift), candidate):
             return True
     return False
+
+
+def verify_once(secret_b32: str, candidate: str, at: float | None = None) -> bool:
+    """像 :func:`verify` 一样校验，但**同一个时间步的动态码只能用一次**。
+
+    RFC 6238 的码在 30 秒内是常量：不记账的话，抓到一个码（肩窥、日志、
+    中间人）就能在同一窗口内再建一个会话，"一次性"只是错觉。登录用这个；
+    启用 / 重生成恢复码这类已登录后的操作仍用 ``verify``（重放无额外收益）。
+    """
+    if not secret_b32:
+        return False
+    cand = (candidate or "").strip().replace(" ", "")
+    if len(cand) != _DIGITS or not cand.isdigit():
+        return False
+    now = at if at is not None else time.time()
+    counter = int(now // _STEP)
+    matched: int | None = None
+    for drift in range(-_WINDOW, _WINDOW + 1):
+        if hmac.compare_digest(_hotp(secret_b32, counter + drift), cand):
+            matched = counter + drift
+            break
+    if matched is None:
+        return False
+    key = (hashlib.sha256(secret_b32.encode("utf-8")).hexdigest()[:16], matched)
+    with _USED_LOCK:
+        for stale, exp in list(_USED.items()):
+            if exp < now:
+                del _USED[stale]
+        if key in _USED:
+            return False
+        if len(_USED) >= _USED_MAX:
+            for stale in sorted(_USED, key=_USED.get)[: _USED_MAX // 4]:
+                del _USED[stale]
+        _USED[key] = now + _USED_TTL
+    return True
 
 
 def provisioning_uri(secret_b32: str, account: str = "serverpanel",

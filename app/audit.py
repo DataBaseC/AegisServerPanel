@@ -92,6 +92,15 @@ class AuditEvent:
         return data
 
 
+class _DrainMarker:
+    """``drain()`` 的栅栏：排到它时说明之前的事件都已落盘。"""
+
+    __slots__ = ("done",)
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+
+
 class AuditLog:
     """JSONL 审计日志：后台线程落盘 + 内存速览 + 按日期查询。"""
 
@@ -99,7 +108,7 @@ class AuditLog:
         self._dir = Path(directory) if directory else self._default_dir()
         # 有界队列：磁盘卡住/写满时落盘线程会变慢，无界队列会把内存吃光。
         # 满了就丢事件并计数（业务绝不能因为审计写不进去而阻塞）。
-        self._queue: queue.Queue[AuditEvent | None] = queue.Queue(maxsize=20000)
+        self._queue: queue.Queue[AuditEvent | _DrainMarker | None] = queue.Queue(maxsize=20000)
         self.dropped = 0
         # RLock：_append 持锁期间 _recent_lock_guard 会重入同一把锁
         self._lock = threading.RLock()
@@ -146,6 +155,9 @@ class AuditLog:
             event = self._queue.get()
             if event is None:
                 return
+            if isinstance(event, _DrainMarker):
+                event.done.set()
+                continue
             try:
                 self._append(event)
             except Exception:
@@ -312,6 +324,23 @@ class AuditLog:
                     continue
         except OSError:
             pass
+
+    def drain(self, timeout: float = 2.0) -> None:
+        """把已排队的事件刷盘，但**不停线程**（lifespan 退出用）。
+
+        不能在这里调 ``close()``：它是进程级单例，同一进程可能再次进入 lifespan
+        （测试 / 嵌入运行），``start()`` 虽然能复活线程，但"关闭—复活"之间的
+        事件会被静默丢弃（``record`` 见到 ``_stopped`` 直接 return），
+        在测试里表现为后续的审计断言随机失败。
+        """
+        if self._stopped:
+            return
+        marker = _DrainMarker()
+        try:
+            self._queue.put(marker, timeout=timeout)
+        except queue.Full:
+            return
+        marker.done.wait(timeout)
 
     def close(self) -> None:
         if self._stopped:

@@ -495,9 +495,18 @@ def test_app_lifecycle_and_logs(authed, internal_mode, tmp_path):
     content = log_data["content"]
     assert "tick" in content, f"托管应用的输出没有被收集：{content!r} memory={log_data.get('memory')!r}"
     offset = log_data["next_offset"]
-    time.sleep(1.2)
-    delta = authed.get(f"/api/panel/apps/{app_id}/logs", params={"offset": offset}).json()
-    assert "tick" in delta["content"], "增量读取应拿到新输出"
+    # 托管进程的输出是直接 append 到日志文件的（不再经过面板管道），Linux 上写入
+    # 立刻可见；Windows 开发机上 NTFS 的写入可见性有几秒延迟，所以这里轮询等待，
+    # 而不是固定睡 1.2 秒后只断言一次（那会变成平台相关的假失败）。
+    deadline = time.time() + 10
+    delta: dict = {}
+    while time.time() < deadline:
+        delta = authed.get(f"/api/panel/apps/{app_id}/logs",
+                           params={"offset": offset}).json()
+        if "tick" in (delta.get("content") or ""):
+            break
+        time.sleep(0.3)
+    assert "tick" in delta["content"], f"增量读取应拿到新输出：{delta!r}"
 
     # 列表里能看到运行状态与 PID
     listed = authed.get("/api/panel/apps").json()["apps"]
@@ -1421,8 +1430,11 @@ def test_write_expected_mtime_accepts_ns_and_seconds(authed, internal_mode, tmp_
                                              "expected_mtime": mtime_ns})
     assert r.status_code == 200, r.text
 
-    # 秒级精度：同秒内应视作"没变"而放行（老客户端）
-    mtime_s = mtime_ns // 1_000_000_000
+    # 秒级精度：老客户端只会传秒。按**当前**磁盘 mtime 折算成秒来断言，
+    # 不能拿上一次写入前的值——两次写之间跨过整秒边界就会变成假失败
+    # （覆盖写改成 tmp+fsync+replace 后耗时略增，这个窗口被放大过）。
+    now_ns = authed.get("/api/files/read", params={"path": str(target)}).json()["mtime"]
+    mtime_s = now_ns // 1_000_000_000
     r = authed.post("/api/files/write", json={"path": str(target), "content": "v3",
                                              "expected_mtime": mtime_s})
     assert r.status_code == 200, f"秒级 expected_mtime 应被接受，实际 {r.status_code} {r.text}"

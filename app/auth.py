@@ -433,6 +433,35 @@ ROLE_RANK = {ROLE_VIEWER: 1, ROLE_OPERATOR: 2, ROLE_ADMIN: 3}
 # 只读账号唯一放行的写操作：自己账号的密码 / TOTP / 退出登录
 VIEWER_WRITE_ALLOWED_PREFIXES = ("/api/auth/",)
 
+# viewer（只读账号）**能读**的路径白名单：只放监控类数据，其余一律 403。
+#
+# 2.0 的做法是「viewer 的 GET 全部放行」，结果 viewer 能 `GET
+# /api/panel/config/export?include_secrets=1` 拿到密码哈希与 TOTP 密钥、
+# 能读任意文件（`/api/files/read|download`）、能读终端录制原文（里面常有
+# 明文密码）、能翻审计日志。等于把「只读」做成了「能拿到 root 的一切」。
+#
+# 这里改成白名单（fail-closed）：新增端点默认对 viewer 关闭，不会因为漏登记
+# 而裸奔——operator 那套前缀黑名单在 2.0.1 就被绕过两次，黑名单不可靠。
+VIEWER_READ_ALLOWED = (
+    "/api/auth/",          # 自身账号：登录态、改密、2FA、退出
+    "/api/system/",        # 系统信息 / 指标 / 历史 / 网络 / 能力 / 版本
+    "/api/processes",      # 进程列表与详情（详情里的 environ 仅 admin，见 process_routes）
+    "/api/services",       # 服务列表与单元日志
+    "/api/logs",           # 日志白名单目录内的读取与跟随
+    "/api/apps",           # 应用与端口发现（只读）
+    "/api/storage/",       # 磁盘 / 挂载 / 目录体积 / S.M.A.R.T.（只读）
+    "/api/snippets",       # 代码片段（令牌只渲染占位符）
+    "/api/panel/market",   # 应用市场模板（只读）
+)
+
+
+def viewer_can_read(path: str) -> bool:
+    """viewer 的读权限判定（前缀匹配，fail-closed）。"""
+    for prefix in VIEWER_READ_ALLOWED:
+        if path == prefix.rstrip("/") or path.startswith(prefix):
+            return True
+    return False
+
 # operator 一律禁止的路径前缀（读也不行）：令牌、用户、配置导入导出、面板级参数
 # 以及三类「等同 root」的能力——网页终端（exec/PTY = 直接 shell）、
 # crontab 写入（= root 计划任务）、apt 应用更新（= 任意新代码以 root 落地）。
@@ -539,7 +568,10 @@ def rbac_denial(method: str, path: str, role: str) -> str:
         return ""
     if role == ROLE_VIEWER:
         if method in ("GET", "HEAD", "OPTIONS"):
-            return ""
+            # 读也按白名单：凭据类 / 文件类 / 审计 / 录制 / 用户与配置读取一律拒
+            if viewer_can_read(path):
+                return ""
+            return "只读账号（viewer）不能读取该数据（此项仅限管理员）"
         if any(path.startswith(p) for p in VIEWER_WRITE_ALLOWED_PREFIXES):
             return ""
         return "只读账号（viewer）不能执行状态变更操作"
@@ -708,6 +740,25 @@ def origin_allowed(request: Request | WebSocket) -> bool:
     if host and origin in (f"http://{host}", f"https://{host}"):
         return True
     return origin in config.allowed_origins
+
+
+def session_still_valid(token: str | None, min_role: str | None = None) -> bool:
+    """长连接续期校验：会话还在、账号未被删/禁用、角色不低于 ``min_role``。
+
+    握手时校验一次是不够的：**踢出会话、禁用账号、角色降级对已建立的 root
+    shell 全都无效**（审查 P1-3 实测：撤销 session 后已连的终端仍能继续执行）。
+    长连接循环必须周期调用这里，失效就主动关闭。
+    """
+    session = sessions.validate(token, renew=False)
+    if session is None:
+        return False
+    role = resolve_role(session)
+    if role is None:
+        return False
+    if min_role is not None:
+        if ROLE_RANK.get(role, 0) < ROLE_RANK.get(min_role, ROLE_RANK[ROLE_ADMIN]):
+            return False
+    return True
 
 
 async def authenticate_ws(websocket: WebSocket, internal_only: bool = False,

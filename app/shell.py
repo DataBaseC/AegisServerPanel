@@ -100,6 +100,11 @@ async def run(
         return Result(127, "", f"命令不存在: {args[0]}")
 
     kwargs = dict(stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    if stdin is not None:
+        # 必须显式建管道：不设 stdin 时子进程继承面板自身的 stdin（systemd 下是
+        # /dev/null），传进来的内容会被**静默丢弃**。crontab 写入（crontab -）
+        # 正是靠这条管道，缺了它等于安装空 crontab，是数据丢失级缺陷。
+        kwargs["stdin"] = asyncio.subprocess.PIPE
     if os.name == "posix":
         # 独立会话 = 独立进程组，超时可以整组清理（含管道里的孙进程）
         kwargs["start_new_session"] = True

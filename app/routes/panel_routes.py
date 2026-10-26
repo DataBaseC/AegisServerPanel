@@ -211,8 +211,10 @@ async def get_prefs(_session: dict = Depends(require_internal)):
         "fields": prefs.describe(),
         "values": prefs.all(),
         "pending_restart": False,
-        "listen": boot_mod.listen_status(),
-        "timezone": boot_mod.timezone_status(),
+        "listen": await asyncio.to_thread(boot_mod.listen_status),
+        # timezone_status 里要跑 timedatectl 子进程（10s 超时）并遍历 zoneinfo 目录：
+        # 直接在事件循环里调，打开一次设置页就能把终端 WS 与采样一起冻住数秒
+        "timezone": await asyncio.to_thread(boot_mod.timezone_status),
         # 读审计文件（含 apps/task 视图）是同步 I/O，下线程池（1.4.1）
         "audit": await asyncio.to_thread(recent_audit),
     }
@@ -240,7 +242,7 @@ async def trim_logs(_session: dict = Depends(require_internal)):
 
 @router.get("/timezone")
 async def get_timezone(_session: dict = Depends(require_internal)):
-    return boot_mod.timezone_status()
+    return await asyncio.to_thread(boot_mod.timezone_status)
 
 
 @router.post("/timezone")
@@ -249,7 +251,7 @@ async def set_timezone(body: TimezoneBody, _session: dict = Depends(require_inte
         raise HTTPException(403, "切换时区需要 root 权限（要写入 /etc/timezone 与 /etc/localtime）")
     result = await asyncio.to_thread(_guard, boot_mod.set_timezone, body.zone, body.enable_ntp)  # timedatectl 子进程
     record("timezone", result["message"])
-    return {**result, "status": boot_mod.timezone_status()}
+    return {**result, "status": await asyncio.to_thread(boot_mod.timezone_status)}
 
 
 # ---------------------------------------------------------------- 监听地址
@@ -267,7 +269,8 @@ async def set_listen(body: ListenBody, _session: dict = Depends(require_internal
     port = int(body.port if body.port is not None else current["port"])
 
     if port != current["port"] and not body.force:
-        busy = _port_busy(host, port)
+        # 端口探测要连 socket + 全量 psutil.net_connections()：同步跑会卡住事件循环
+        busy = await asyncio.to_thread(_port_busy, host, port)
         if busy:
             raise HTTPException(409, f"端口 {port} 已被占用（{busy}）；确认要强制切换请再次提交")
     if host in ("127.0.0.1", "::1") and current["host"] not in ("127.0.0.1", "::1") and not body.force:

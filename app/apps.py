@@ -53,6 +53,14 @@ MEM_LINES = 2000                  # 内存环形缓冲保留行数
 LOG_MAX_BYTES = 4 * 1024 * 1024   # 日志上限的出厂默认值（实际以「快捷设置」里的 prefs 为准）
 READ_CHUNK = 256 * 1024           # 单次日志读取上限
 
+# 「升级 / 重启不杀托管应用」的交接协议：
+# 重启前由 CLI 写一个带时间戳的标记文件，lifespan 退出时读到它就不结束应用；
+# 新进程启动时按每个应用的 pidfile 接管仍在运行的那些（见 Supervisor.adopt_all）。
+# 标记带 TTL：重启最终没发生（升级失败/命令被打断）时不会让后面的 --stop 漏杀。
+PID_SUFFIX = ".pid"
+SURVIVE_MARKER = ".apps-survive"
+SURVIVE_TTL = 180.0
+
 # 面板自身的启动特征：禁止把面板注册成"常驻应用"，
 # 否则会出现「应用重启 → 面板重启 → 应用重启」的递归雪崩。
 SELF_MARKERS = ("-m app.main", "app.main --host", "panel-supervisor.sh")
@@ -327,9 +335,14 @@ class AppLog:
     因此在界面把上限调小后无需重启、也无需重建已有实例即可生效。
     """
 
-    def __init__(self, path: Path, max_bytes: int | None = None) -> None:
+    def __init__(self, path: Path, max_bytes: int | None = None,
+                 rotate: bool = True) -> None:
         self.path = Path(path)
         self._fixed_max = max_bytes
+        # 托管应用的输出由**子进程自己 append 到这个文件**（见 Supervisor._spawn），
+        # rename 轮转会让子进程继续写旧 inode、新 .log 只剩面板提示行。因此这类实例
+        # 用就地截断（rotate=False）；其他调用方（CLI/测试）保持 rename 语义。
+        self._rotate_by_rename = rotate
         self._buffer: deque[str] = deque(maxlen=MEM_LINES)
         self._lock = threading.Lock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -360,18 +373,40 @@ class AppLog:
 
     def _rotate_if_needed(self) -> None:
         try:
-            if self.path.stat().st_size <= self.max_bytes:
-                return
+            size = self.path.stat().st_size
         except OSError:
             return
+        limit = self.max_bytes
+        if size <= limit:
+            return
+        if self._rotate_by_rename:
+            with contextlib.suppress(OSError):
+                os.replace(self.path, self.path.with_suffix(self.path.suffix + ".1"))
+            return
+        # 就地截断：保留尾部 1/4（至少 64KB）。托管进程持有 O_APPEND 的 fd，截断后
+        # 它的下一次写入直接落在新 EOF 上，不需要重开文件。代价是截断瞬间的在途
+        # 写入可能丢几行——与 logrotate 的 copytruncate 同样的取舍。
+        keep = max(64 * 1024, limit // 4)
         with contextlib.suppress(OSError):
-            os.replace(self.path, self.path.with_suffix(self.path.suffix + ".1"))
+            with open(self.path, "rb") as fh:
+                fh.seek(max(0, size - keep))
+                tail = fh.read()
+            with open(self.path, "wb") as fh:
+                fh.write(tail)
+            self._buffer.clear()
 
     def clear(self) -> None:
         with self._lock:
             self._buffer.clear()
-            with contextlib.suppress(OSError):
-                self.path.unlink()
+            # 托管进程持有这个文件的 fd（输出直接 append 落盘）：unlink 在 Linux 上
+            # 会让它继续写一个已删除的 inode——磁盘白占、日志从界面上"消失"；
+            # Windows 上则直接删不掉。截断才既能清空又能让后续输出继续可见。
+            try:
+                with open(self.path, "wb"):
+                    pass
+            except OSError:
+                with contextlib.suppress(OSError):
+                    self.path.unlink()
 
     @property
     def size(self) -> int:
@@ -431,13 +466,23 @@ class ManagedRuntime:
     fails: deque[float] = field(default_factory=deque)   # 窗口内失败/重启时间戳
     log: AppLog | None = None
     desired: str = "stopped"         # 用户意图：running | stopped
+    pid: int | None = None           # 进程 PID（接管的进程没有 asyncio.Process 对象）
+    adopted: bool = False            # True = 上个面板实例拉起、由本实例按 pidfile 接管
+    _lock: asyncio.Lock | None = None   # start/stop 串行化（见 Supervisor._app_lock）
     _monitor: asyncio.Task | None = None
-    _pump: asyncio.Task | None = None
     _stop_timer: asyncio.Task | None = None
+
+    def live_pid(self) -> int | None:
+        """当前仍在运行的 PID；None 表示没有活着的进程。"""
+        if self.proc is not None and self.proc.returncode is None:
+            return self.proc.pid
+        if self.adopted and self.pid:
+            return self.pid
+        return None
 
     def snapshot(self, app: dict) -> dict:
         """给前端/CLI 的运行时视图。"""
-        pid = self.proc.pid if self.proc and self.proc.returncode is None else None
+        pid = self.live_pid()
         rss, cpu = 0, 0.0
         if pid:
             try:
@@ -474,23 +519,130 @@ class Supervisor:
         self._lock = threading.RLock()
 
     # ---- 生命周期 ----
+    def _log_path(self, app: dict) -> Path:
+        return self.log_dir / f"{a_name(app)}.log"
+
+    def _pid_path(self, app: dict) -> Path:
+        return self.log_dir / f"{a_name(app)}{PID_SUFFIX}"
+
+    def _write_pidfile(self, app: dict, pid: int) -> None:
+        """记录托管进程 PID（原子替换），供下一个面板实例接管。"""
+        path = self._pid_path(app)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps({"pid": pid, "started_at": time.time()}), "utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
+
+    def _read_pidfile(self, app: dict) -> dict:
+        try:
+            data = json.loads(self._pid_path(app).read_text("utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _clear_pidfile(self, app: dict | None) -> None:
+        if app is None:
+            return
+        with contextlib.suppress(OSError):
+            self._pid_path(app).unlink(missing_ok=True)
+
+    @staticmethod
+    def _pid_alive(pid: int | None) -> bool:
+        """PID 是否还活着。
+
+        用 psutil 而不是 ``os.kill(pid, 0)``：Windows 上的 ``os.kill`` 除
+        CTRL_C_EVENT/CTRL_BREAK_EVENT 外会直接 TerminateProcess——传 0 等于杀人。
+        """
+        if not pid:
+            return False
+        try:
+            import psutil
+            return bool(psutil.pid_exists(int(pid)))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _process_argv(pid: int) -> list[str]:
+        try:
+            import psutil
+            return list(psutil.Process(int(pid)).cmdline())
+        except Exception:
+            return []
+
+    @staticmethod
+    def _command_matches(app: dict, argv: list[str]) -> bool:
+        """PID 复用防护：命令行里必须还能看到该应用的命令，才认这个进程是我们拉起的。"""
+        command = str(app.get("command") or "")
+        if not command:
+            return False
+        joined = " ".join(argv)
+        return command in joined or joined.endswith(command)
+
+    def adopt_all(self) -> int:
+        """接管上个面板实例拉起的托管进程，返回接管数量。
+
+        升级/重启时面板进程会退出，但托管进程在独立会话里继续跑（输出已直接落盘，
+        不再经过面板的管道——管道读端随面板消失会让应用下一次写日志就 EPIPE 被杀）。
+        新实例启动时按 pidfile 认领它们：既能避免"重启后同一个应用被拉起两份"，
+        也不再把它们变成没人管的孤儿。
+        """
+        adopted = 0
+        for app in self.registry.all():
+            runtime = self._runtime(app)
+            if runtime.proc is not None and runtime.proc.returncode is None:
+                continue
+            record = self._read_pidfile(app)
+            pid = int(record.get("pid") or 0)
+            if not pid or not self._pid_alive(pid):
+                self._clear_pidfile(app)   # pidfile 陈旧
+                continue
+            argv = self._process_argv(pid)
+            if not argv or not self._command_matches(app, argv):
+                # PID 已被内核回收给别的进程：绝不能把别人的进程当自己的管
+                self._clear_pidfile(app)
+                continue
+            runtime.adopted = True
+            runtime.pid = pid
+            runtime.status = "running"
+            runtime.desired = "running"
+            runtime.started_at = float(record.get("started_at") or 0) or time.time()
+            self._note(runtime, app, f"接管上个面板实例的进程（PID {pid}）")
+            adopted += 1
+        return adopted
+
     async def serve(self) -> None:
-        """面板启动时调用：进入守护循环并拉起 autostart 应用。"""
+        """面板启动时调用：接管遗留进程、进入守护循环并拉起 autostart 应用。"""
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.adopt_all()
         self._tick = asyncio.create_task(self._tick_loop())
         self._boot = asyncio.create_task(self._boot_autostart())
 
-    async def shutdown(self) -> None:
-        """面板退出：终止所有托管进程，避免留下无人认领的孤儿。
+    async def shutdown(self, keep_apps: bool = False) -> None:
+        """面板退出：默认终止所有托管进程，避免留下无人认领的孤儿。
 
-        托管进程与面板同生命周期（面板停 = 应用停），"面板升级不杀应用"靠的是
-        升级流程只 TERM 服务进程本身、由守护拉起（见 manage.py），而不是靠这里放手。
+        ``keep_apps=True`` 用于**升级 / 重启**（由 CLI 写交接标记触发）：应用继续
+        在独立会话里运行，进程与 pidfile 都留着，下一个面板实例 ``adopt_all()``
+        接管。``--stop`` 永远是 False（停面板 = 停应用）。
         """
         for task in (self._boot, self._tick):
             if task:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+        for runtime in list(self.runtimes.values()):
+            if runtime._stop_timer:
+                runtime._stop_timer.cancel()
+                runtime._stop_timer = None
+        if keep_apps:
+            # 不 stop、不清 pidfile：交接给下一个实例（不清 runtimes 是为了让
+            # 进程对象在退出阶段被回收时不再触发 transport 清理）
+            self.runtimes.clear()
+            gc.collect()
+            return
         for app_id in list(self.runtimes):
             with contextlib.suppress(Exception):
                 await self.stop(app_id, timeout=3)
@@ -505,8 +657,8 @@ class Supervisor:
             if not app.get("autostart"):
                 continue
             runtime = self._runtime(app)
-            if runtime.proc and runtime.proc.returncode is None:
-                continue
+            if runtime.live_pid():
+                continue  # 已被 adopt_all 接管：绝不重复拉起第二份
             with contextlib.suppress(AppError):
                 await self.start(app["id"], autostart=True)
 
@@ -521,6 +673,9 @@ class Supervisor:
     async def _reap(self) -> None:
         """回收已退出的进程并按策略决定是否重启。"""
         for runtime in list(self.runtimes.values()):
+            if runtime.adopted:
+                await self._reap_adopted(runtime)
+                continue
             proc = runtime.proc
             if proc is None or proc.returncode is None:
                 continue
@@ -529,15 +684,14 @@ class Supervisor:
                 self.runtimes.pop(runtime.app_id, None)
                 continue
             code = proc.returncode
-            # 先让输出泵收尾再关管道：否则管道里最后一段输出会丢，
-            # 且 asyncio 的 transport 不释放会在解释器退出时刷 "unclosed transport"
-            await self._finish_pump(runtime)
+            # 输出直接落盘（没有管道可排空），只需释放 transport 与 pidfile
             self._close_pipe(proc)
+            self._clear_pidfile(app)
             runtime.proc = None
+            runtime.pid = None
             runtime.last_code = code
             runtime.exited_at = time.time()
             runtime._monitor = None
-            runtime._pump = None
             if runtime.desired == "stopped":
                 runtime.status = "stopped"
                 self._note(runtime, app, f"已停止（退出码 {code}）")
@@ -555,6 +709,37 @@ class Supervisor:
                 runtime.status = "failed"
                 runtime.desired = "stopped"
                 self._note(runtime, app, "达到重启上限或策略为 never，已放弃自动拉起（可手动启动）")
+
+    async def _reap_adopted(self, runtime: ManagedRuntime) -> None:
+        """接管进程的回收：没有 asyncio.Process 句柄，只能按 PID 存活判断。"""
+        app = self.registry.get(runtime.app_id)
+        if app is None:
+            self.runtimes.pop(runtime.app_id, None)
+            return
+        if self._pid_alive(runtime.pid):
+            return
+        self._clear_pidfile(app)
+        runtime.adopted = False
+        runtime.pid = None
+        runtime.exited_at = time.time()
+        if runtime.desired == "stopped":
+            runtime.status = "stopped"
+            self._note(runtime, app, "已停止")
+            return
+        # 接管期间拿不到退出码：按失败处理（-1），让策略决定是否重拉
+        code = -1
+        runtime.last_code = code
+        self._note(runtime, app, "接管的进程已退出（退出码未知，按失败计）")
+        if self._should_restart(runtime, app, code):
+            runtime.fails.append(time.time())
+            runtime.restart_count += 1
+            runtime.status = "restarting"
+            delay = float(app.get("restart_delay", 2))
+            runtime._stop_timer = asyncio.create_task(self._delayed_start(app["id"], delay))
+        else:
+            runtime.status = "failed"
+            runtime.desired = "stopped"
+            self._note(runtime, app, "达到重启上限或策略为 never，已放弃自动拉起（可手动启动）")
 
     def _should_restart(self, runtime: ManagedRuntime, app: dict, code: int) -> bool:
         policy = app.get("restart", "on-failure")
@@ -581,17 +766,30 @@ class Supervisor:
             runtime = self.runtimes.get(app_id)
             if runtime is None or runtime.desired != "running":
                 return
-            if runtime.proc and runtime.proc.returncode is None:
-                return  # 已被手动启动，避免重复拉起
-            with contextlib.suppress(AppError):
-                await self._spawn(runtime, app)
+            async with self._app_lock(runtime):
+                if runtime.live_pid():
+                    return  # 已被手动启动/已接管，避免重复拉起
+                with contextlib.suppress(AppError):
+                    await self._spawn(runtime, app)
 
     # ---- 操作 ----
+    @staticmethod
+    def _app_lock(runtime: ManagedRuntime) -> asyncio.Lock:
+        """每个应用一把异步锁：start / stop / 延迟重启必须串行。
+
+        原实现只检查 ``runtime.proc`` 就 ``await _spawn()``，而赋值发生在
+        ``await`` 之后：双击启动、客户端超时重试、自启与手动启动并发时都会
+        真的拉出两个进程，其中一个失去跟踪（审查 P1-4 实测：shutdown 后残留孤儿）。
+        """
+        if runtime._lock is None:
+            runtime._lock = asyncio.Lock()
+        return runtime._lock
+
     def _runtime(self, app: dict) -> ManagedRuntime:
         runtime = self.runtimes.get(app["id"])
         if runtime is None:
             runtime = ManagedRuntime(app_id=app["id"])
-            runtime.log = AppLog(self.log_dir / f"{a_name(app)}.log")
+            runtime.log = AppLog(self.log_dir / f"{a_name(app)}.log", rotate=False)
             self.runtimes[app["id"]] = runtime
         return runtime
 
@@ -605,30 +803,43 @@ class Supervisor:
         if app is None:
             raise AppError("应用不存在")
         runtime = self._runtime(app)
-        if runtime.proc and runtime.proc.returncode is None:
+        async with self._app_lock(runtime):
+            if runtime.live_pid():
+                return self.snapshot(app)
+            if runtime._stop_timer:
+                runtime._stop_timer.cancel()
+                runtime._stop_timer = None
+            runtime.desired = "running"
+            runtime.fails.clear()
+            runtime.status = "starting"
+            if not autostart:
+                self._note(runtime, app, "启动")
+            await self._spawn(runtime, app)
             return self.snapshot(app)
-        if runtime._stop_timer:
-            runtime._stop_timer.cancel()
-            runtime._stop_timer = None
-        runtime.desired = "running"
-        runtime.fails.clear()
-        runtime.status = "starting"
-        if not autostart:
-            self._note(runtime, app, "启动")
-        await self._spawn(runtime, app)
-        return self.snapshot(app)
 
     async def _spawn(self, runtime: ManagedRuntime, app: dict) -> None:
         env = {**os.environ, "SERVERPANEL_APP": a_name(app)}
         env.update({str(k): str(v) for k, v in (app.get("env") or {}).items()})
         args = shell_argv(app["command"])
+        log_path = self._log_path(app)
+        # 输出**直接追加到日志文件**，不经过面板的管道：管道读端随面板进程一起
+        # 消失，应用下一次写日志就会 EPIPE/SIGPIPE 被杀——那样"面板升级不中断
+        # 托管应用"就是空话。落盘后前端仍按字节偏移增量跟随（AppLog.read）。
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        except OSError as exc:
+            runtime.status = "failed"
+            runtime.desired = "stopped"
+            self._note(runtime, app, f"打开日志文件失败：{exc}")
+            raise AppError(f"打开日志文件失败：{exc}")
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args,
                 cwd=app.get("cwd") or None,
                 env=env,
                 stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
+                stdout=log_fd,            # 子进程直接写文件（继承这个 fd）
                 stderr=asyncio.subprocess.STDOUT,
                 start_new_session=True,   # 脱离面板进程组，面板升级不连带杀死应用
             )
@@ -637,63 +848,60 @@ class Supervisor:
             runtime.desired = "stopped"
             self._note(runtime, app, f"启动失败：{exc}")
             raise AppError(f"启动失败：{exc}")
+        finally:
+            # 子进程已继承该 fd；父进程这份必须关掉，否则文件永远被占着
+            with contextlib.suppress(OSError):
+                os.close(log_fd)
         runtime.proc = proc
+        runtime.pid = proc.pid
+        runtime.adopted = False
         runtime.status = "running"
         runtime.started_at = time.time()
         runtime.last_code = None
+        # pidfile 是"跨面板实例交接"的唯一凭据：升级后新实例靠它认领进程
+        self._write_pidfile(app, proc.pid)
         self._note(runtime, app, f"已启动（PID {proc.pid}）")
-        runtime._pump = asyncio.create_task(self._pump_output(runtime, app, proc))
-
-    async def _pump_output(self, runtime: ManagedRuntime, app: dict, proc) -> None:
-        """持续把子进程输出写进日志（stdout/stderr 已合流）。"""
-        stream = proc.stdout
-        if stream is None:
-            return
-        try:
-            while True:
-                chunk = await stream.read(4096)
-                if not chunk:
-                    break
-                if runtime.log:
-                    runtime.log.append(chunk.decode("utf-8", "replace"))
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return
-
-    @staticmethod
-    def _cancel_pump(runtime: ManagedRuntime) -> None:
-        task = runtime._pump
-        runtime._pump = None
-        if task is not None and not task.done():
-            task.cancel()
-
-    async def _finish_pump(self, runtime: ManagedRuntime, timeout: float = 1.5) -> None:
-        """等待输出泵自然收尾（进程已退出时它会读到 EOF 自行结束）。"""
-        task = runtime._pump
-        if task is None:
-            return
-        if not task.done():
-            with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
-        self._cancel_pump(runtime)
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await task
 
     async def stop(self, app_id: str, timeout: float = DEFAULT_TIMEOUT) -> dict:
         app = self.registry.get(app_id)
         if app is None:
             raise AppError("应用不存在")
         runtime = self._runtime(app)
+        # 与 start 共用同一把锁：否则「启动中收到停止」会先看到 proc=None 就返回，
+        # 随后启动流程把进程拉起来，用户看到的状态却是 stopped
+        async with self._app_lock(runtime):
+            return await self._stop_locked(runtime, app, timeout)
+
+    async def _stop_locked(self, runtime: ManagedRuntime, app: dict,
+                           timeout: float) -> dict:
         runtime.desired = "stopped"
         if runtime._stop_timer:
             runtime._stop_timer.cancel()
             runtime._stop_timer = None
+        if runtime.adopted:
+            # 接管的进程没有 asyncio.Process：按 PID 发信号并轮询存活
+            pid = runtime.pid
+            runtime.adopted = False
+            runtime.pid = None
+            if pid and self._pid_alive(pid):
+                self._signal_group(pid, SIG_TERM)
+                deadline = time.time() + timeout
+                while time.time() < deadline and self._pid_alive(pid):
+                    await asyncio.sleep(0.2)
+                if self._pid_alive(pid):
+                    self._signal_group(pid, SIG_KILL)
+                    await asyncio.sleep(0.3)
+            self._clear_pidfile(app)
+            runtime.status = "stopped"
+            runtime.exited_at = time.time()
+            self._note(runtime, app, "已停止（接管的进程）")
+            return self.snapshot(app)
         proc = runtime.proc
         if proc is None or proc.returncode is not None:
             runtime.proc = None
+            runtime.pid = None
             runtime.status = "stopped"
-            self._cancel_pump(runtime)
+            self._clear_pidfile(app)
             return self.snapshot(app)
         # 向整个进程组发送 TERM：应用自己 fork 的子进程也要一起收走
         self._signal_group(proc.pid, SIG_TERM)
@@ -704,11 +912,12 @@ class Supervisor:
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(proc.wait(), timeout=3)
         runtime.proc = None
+        runtime.pid = None
         runtime.last_code = proc.returncode
         runtime.exited_at = time.time()
         runtime.status = "stopped"
-        await self._finish_pump(runtime)
         self._close_pipe(proc)
+        self._clear_pidfile(app)
         self._note(runtime, app, "已停止")
         return self.snapshot(app)
 
@@ -753,7 +962,7 @@ class Supervisor:
         }
         if runtime is None:
             runtime = ManagedRuntime(app_id=app_id)
-            runtime.log = AppLog(self.log_dir / f"{a_name(app)}.log")
+            runtime.log = AppLog(self.log_dir / f"{a_name(app)}.log", rotate=False)
             self.runtimes[app_id] = runtime
         base.update(runtime.snapshot(app))
         return {**app, "runtime": base}
@@ -782,7 +991,13 @@ class Supervisor:
         runtime = self._runtime(app)
         assert runtime.log is not None
         data = runtime.log.read(offset=offset, limit=limit, tail_lines=tail_lines)
-        data["memory"] = runtime.log.memory_lines(200)
+        memory = runtime.log.memory_lines(200)
+        if not memory:
+            # 输出由子进程直接落盘（不再经过面板管道），内存环里可能没有内容
+            # （面板刚重启完就是这种情况）：用文件尾部回填，别让界面显示空白
+            tail = runtime.log.read(tail_lines=200)
+            memory = (tail.get("content") or "").splitlines()
+        data["memory"] = memory
         return data
 
     def clear_log(self, app_id: str) -> dict:
@@ -798,6 +1013,54 @@ class Supervisor:
 # ---------------------------------------------------------------- 全局单例
 
 supervisor = Supervisor()
+
+
+# ---------------------------------------------------------------- 跨实例交接标记
+#
+# 语义：CLI 在"要让面板重启但不想打断托管应用"时写标记；面板 lifespan 退出读到
+# 标记就跳过 shutdown（应用与 pidfile 都留着），新实例启动时 adopt_all() 认领。
+# 标记带 TTL：重启最终没发生（升级失败/命令被打断/有人 Ctrl-C）时不会让之后
+# 的 `--stop` 误以为"这次也该留着应用"。
+
+
+def survive_marker_path() -> Path:
+    return supervisor.registry.path.parent / SURVIVE_MARKER
+
+
+def mark_survive(ttl: float = SURVIVE_TTL) -> None:
+    """升级 / 重启前调用：告诉即将退出的面板"别杀托管应用"。"""
+    path = survive_marker_path()
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps({"ts": time.time(), "ttl": ttl}), "utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+
+
+def consume_survive() -> bool:
+    """读取并删除交接标记（一次性）。过期视为不存在。"""
+    path = survive_marker_path()
+    try:
+        data = json.loads(path.read_text("utf-8"))
+        path.unlink(missing_ok=True)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    try:
+        ts = float(data.get("ts") or 0)
+        ttl = float(data.get("ttl") or SURVIVE_TTL)
+    except (TypeError, ValueError):
+        return False
+    return ts > 0 and time.time() - ts <= ttl
+
+
+def clear_survive() -> None:
+    with contextlib.suppress(OSError):
+        survive_marker_path().unlink(missing_ok=True)
 
 
 def reload_registry() -> None:

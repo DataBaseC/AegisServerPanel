@@ -21,6 +21,10 @@ panel-supervisor.sh
 .supervisor.lock
 *.log.1
 
+# 冒烟脚本的默认工作目录（在仓库根下；跑完会产生临时配置、cookie 与测试文件，
+# 不该被 git add -A 带进提交。想放别处可用 SERVERPANEL_SMOKE_WORK=/tmp/…）
+.smoke-work/
+
 # 升级锁文件（flock 持有期间保留，进程退出后遗留也不该挡住下次升级）
 update.lock
 

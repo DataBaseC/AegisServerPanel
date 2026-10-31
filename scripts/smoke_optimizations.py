@@ -73,7 +73,7 @@ def main():
     FILES = files_dir
     cfg = os.path.join(conf_dir, "config.json")
     # 常驻应用注册表也必须隔离：否则临时实例会认领生产注册表里的应用，
-    # 退出时把它们当自己的托管进程收走（实测把 hermes-dashboard/gateway 停掉）。
+    # 退出时把它们当自己的托管进程收走（实测：会把生产环境的托管应用一起停掉）。
     env = dict(os.environ, SERVERPANEL_CONFIG=cfg,
                SERVERPANEL_APPS_DIR=os.path.join(WORK, "apps"))
     proc = subprocess.Popen(

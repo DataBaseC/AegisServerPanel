@@ -194,21 +194,28 @@ tar xzf AegisServerPanel-offline.tar.gz -C /root/aegis --strip-components=1
 serverpanel --restart && serverpanel --status""",
     ),
     Snippet(
-        id="panel-transfer", category="面板运维", title="代码分块传输（GitHub 不可达时）",
+        id="panel-transfer", category="面板运维", title="内网直传 / 分块传输（GitHub 不可达时）",
         language="bash",
-        note="SERVER_ACCESS.md 记录的可靠通道：本地 base64 → 分块走 exec API → 服务器校验后落盘",
-        code="""# 本地（PowerShell）：把 tar.gz 切成 20KB 的 base64 分块
-$b = [Convert]::ToBase64String([IO.File]::ReadAllBytes('bundle.tar.gz'))
+        note="首选「开发机 http.server + 目标机 curl」（500KB 秒级）；HTTP 完全不通时才退回 base64 分块走 exec",
+        code="""# 方案 A（首选）：开发机起临时 HTTP，目标机拉取并校验
+# 开发机
+git archive --format=tar.gz -o aegis.tar.gz HEAD && sha256sum aegis.tar.gz
+python -m http.server 8899 --bind 0.0.0.0 --directory .
+# 目标机
+curl -fsS --max-time 60 -o /root/deploy-tmp/aegis.tar.gz http://<开发机IP>:8899/aegis.tar.gz
+echo "<上面的 sha256>  /root/deploy-tmp/aegis.tar.gz" | sha256sum -c -
+
+# 方案 B（HTTP 完全不通时）：base64 分块走 exec API
+# 本地（PowerShell）
+$b = [Convert]::ToBase64String([IO.File]::ReadAllBytes('aegis.tar.gz'))
 $i = 0; $n = 20000
 while ($i -lt $b.Length) {
     $chunk = $b.Substring($i, [Math]::Min($n, $b.Length - $i))
-    # 逐块 POST /api/terminal/exec，服务器端 >> /tmp/bundle.b64
+    # 逐块 POST /api/terminal/exec，服务器端 >> /tmp/aegis.b64
     $i += $n
 }
-
-# 服务器：解码并校验
-base64 -d /tmp/bundle.b64 > /tmp/bundle.tar.gz
-md5sum /tmp/bundle.tar.gz""",
+# 服务器：解码 + 校验
+base64 -d /tmp/aegis.b64 > /tmp/aegis.tar.gz && sha256sum /tmp/aegis.tar.gz""",
     ),
     Snippet(
         id="panel-supervisor", category="面板运维", title="无 systemd 环境的守护与自启",

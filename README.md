@@ -136,7 +136,7 @@ AI Agent 与本地脚本接入时反复要用的代码一次给全，并**按当
 - **浏览增强**：点表头按名称/大小/时间排序、隐藏文件开关、目录一键「查看大小」（du）、图片直接预览、手机上自动隐藏权限/所有者列
 
 ### Agent 接入
-给本地脚本和 AI Agent 用的入口。详见下文「Agent 接入」。
+给本地脚本和 AI Agent 用的入口：`POST /api/terminal/exec` + `X-Agent-Token`。令牌可分 `full` / `readonly` 作用域、限定命令前缀、设有效期，明文只在创建时显示一次。详见下文「Agent 接入」。
 
 ### 设置
 修改面板密码、查看当前模式、Agent 令牌状态与运行环境信息。
@@ -294,13 +294,14 @@ panel-supervisor.sh / systemd
         └── 面板进程（FastAPI，root）
               ├── AppSupervisor（每 1.5s 回收 + 按策略重启）
               │     └── 托管应用…  start_new_session=True ⇒ 独立会话组
-              │                     stdout/stderr → logs/apps/<名称>.log（4MB 轮转）
+              │                     stdout/stderr → 直接追加 logs/apps/<名称>.log（不建管道）
+              │                     PID → logs/apps/<名称>.pid（跨面板实例交接）
               └── /api/panel/apps/*（全部要求内网模式）
 ```
 
 - **升级不断服**：升级 / 重启前 CLI 先写一个带 TTL 的**交接标记**（`<注册表目录>/.apps-survive`），面板 lifespan 退出时读到它就不结束托管应用；新实例启动时按每个应用的 `logs/apps/<名称>.pid` 认领仍在运行的那些（校验命令行防 PID 复用），既不重复拉起也不留孤儿。`serverpanel --stop` 会清掉标记并结束应用——「停面板 = 停应用」的语义不变
 - **停止即收尾**：`serverpanel --stop` / 面板 lifespan 退出时显式结束所有托管进程（含它们 fork 的子进程），避免无人认领的孤儿
-- **重启可对账**：面板重启后内存状态丢失，但注册表与日志都在磁盘上；CLI 会按注册表反查命令行，把"上个面板实例拉起的应用"重新纳入管理
+- **重启可对账**：pidfile 与注册表都在磁盘上，新实例启动时 `adopt_all()` 按 pidfile 认领（命令行不匹配就清掉，防 PID 被复用后误管别人的进程），CLI `--apps list` 也按注册表反查命令行。内存态（重启计数、日志偏移）确实会丢，但不会因此误拉起第二份
 - **递归防护**：注册时拒绝把面板自身命令（`-m app.main`）作为托管应用，否则会出现「应用重启 → 面板重启 → 应用重启」的雪崩
 
 ---
@@ -330,6 +331,9 @@ sudo SERVERPANEL_HOST=0.0.0.0 SERVERPANEL_PORT=9000 bash install.sh
 ```bash
 ./run.sh --port 8787
 ```
+
+同一台机器跑多套（或把状态放到别处）：`serverpanel --config /path/to/config.json`（等价于 `SERVERPANEL_CONFIG=...`）。
+它在**创建配置单例之前**解析，审计、指标库、应用注册表这些状态目录全部跟随配置文件所在目录，互不混写。唯一例外是回收站——root 部署固定在 `/var/lib/serverpanel/trash`（可能几个 GB，不塞 `/etc`），非 root 才退到配置目录旁；要单独指定用 `SERVERPANEL_TRASH_DIR`。
 
 ### 外部命令依赖（2.0 起可选）
 
@@ -392,6 +396,15 @@ sudo bash install.sh
 bash scripts/verify-apps.sh            # 默认检查 /root/aegis/AegisServerPanel
 ```
 
+再跑一遍深度冒烟（22 项，自己起独立实例在 8899，不碰生产配置）：
+
+```bash
+SERVERPANEL_SMOKE_WORK=/tmp/sp-smoke SERVERPANEL_SMOKE_PORT=8899 \
+  .venv/bin/python scripts/smoke_optimizations.py
+```
+
+> ⚠️ `SERVERPANEL_SMOKE_WORK` **必须显式指定在仓库之外**。它的默认值是代码根目录下的 `.smoke-work`，会撞上「面板自身配置目录 / 代码目录禁止通过文件管理写入」这条规则，导致 12 / 12b / 12c / 13 / 15 五条用例返回 403 假失败——那是产品语义生效，不是缺陷。
+
 ### 日常运维（一条命令搞定）
 
 ```bash
@@ -416,8 +429,15 @@ serverpanel --recipe list                      # 列出所有内置常用操作
 serverpanel --recipe run net-ping target=1.1.1.1
 ```
 
-> 面板停止时会把托管应用一并结束（托管进程与面板同生命周期），避免留下无人认领的孤儿；
-> 而**面板升级**只 TERM 面板服务进程本身、由守护重新拉起，所以升级期间托管应用不中断。
+> **面板停止 = 托管应用一并停止**（`--stop`、Ctrl-C、崩溃都算），避免留下无人认领的孤儿。
+>
+> **面板升级 / 重启 = 托管应用不中断**（2.0 起）：`--restart` 前 CLI 写一个带 TTL 的交接标记
+> （`<配置目录>/.apps-survive`，180 秒过期），退出中的面板读到它就跳过收进程；新实例启动时按
+> `logs/apps/<名称>.pid` 认领仍在跑的那些（会校验进程命令行，防 PID 被内核复用后误杀别人的进程），
+> 既不重复拉起也不留孤儿。`--stop` 会先清掉标记，语义不变。
+>
+> 注意：从**旧版本第一次**升级上来时，旧代码还不认识这套协议，托管应用会被停一次、再由自启拉起；
+> 从第二次重启起才真正无损。
 
 ### 升级
 
@@ -428,9 +448,70 @@ sudo serverpanel --update                # 跟随 origin/main
 sudo serverpanel --update --update-ref origin/main   # 显式指定分支/标签/commit
 ```
 
-升级流程内置多重保护：自动备份配置 → `git fetch`（网络失败立即中止，服务不受影响）→ 仓库有本地改动时默认中止（`--force` 自动 stash）→ 装依赖失败自动回退代码 → 重启 → `/healthz` 健康检查并断言版本 → **检查不过自动回滚旧版本并重启**。升级全程旧服务照常运行，直到新版本健康检查通过；重启后所有浏览器会话失效，需重新登录。
+升级流程内置多重保护：自动备份配置 → `git fetch`（网络失败立即中止，服务不受影响）→ 仓库有本地改动时默认中止（`--force` 自动 stash）→ 装依赖失败自动回退代码 → 重启 → `/healthz` 健康检查并断言版本 → **检查不过自动回滚旧版本并重启**。升级全程旧服务照常运行，直到新版本健康检查通过。
+
+关于那道"断言版本"的检查：`/healthz` **只对本机回环**请求返回 `version`（远端仍是 `{"ok": true}`，不外泄指纹），而升级是从 `127.0.0.1` 探的，所以「新版本没起来、旧进程还在应答」现在真的会被判失败并回滚——2.0 之前这个断言恒真，等于没校验。
+
+会话存在 `sessions.json` 里，**重启后仍然有效**，不需要重新登录；只有轮换配置或手动踢出会话才会失效。
+
+写脚本调用它时要知道的副作用：
+
+- **exec 通道会断 5~15 秒**（面板 TERM → 守护拉起 → 健康检查通过），客户端要重试 + 退避，别把一次 exec 当原子操作
+- **托管应用不中断**（机制见上一节），新面板需要 1~2 秒认领；认领时发现进程已死的，按各应用的 `restart` 策略处理
+- `static/*` 有更新时前端会在下次刷新拿到新版（Service Worker 走 network-first）
 
 > zip / 快照安装（目录无 `.git`）无法增量升级，`--update` 会给出迁移指引：克隆新目录 → 复用配置 → 停旧起新。
+
+### 从压缩包 / 内网直传部署（GitHub 不可达，或要先做影子预检）
+
+设备拉不到 GitHub、但开发机与设备在同一内网时，走「本机起 HTTP + 目标机 `curl`」：500KB 的包秒级传完，比 base64 分块走 exec 快一个量级。
+
+```bash
+# 1) 开发机：导出指定提交并算校验和，然后起临时 HTTP（用完就关）
+git archive --format=tar.gz -o aegis-<ref>.tar.gz <ref>
+sha256sum aegis-<ref>.tar.gz
+python -m http.server 8899 --bind 0.0.0.0 --directory .
+
+# 2) 目标机：拉取 + 校验（不一致就别往下走）
+curl -fsS --max-time 60 -o /root/deploy-tmp/aegis.tar.gz http://<开发机IP>:8899/aegis-<ref>.tar.gz
+echo "<上一步的 sha256>  /root/deploy-tmp/aegis.tar.gz" | sha256sum -c -
+```
+
+**先做影子预检**（隔离目录里把新代码跑起来，确认能启动再动生产）：
+
+```bash
+rm -rf /tmp/sp-pre /tmp/sp-pre-conf /tmp/sp-pre-apps
+mkdir -p /tmp/sp-pre /tmp/sp-pre-conf /tmp/sp-pre-apps
+tar xzf /root/deploy-tmp/aegis.tar.gz -C /tmp/sp-pre
+cp /etc/serverpanel/config.json /tmp/sp-pre-conf/config.json && chmod 600 /tmp/sp-pre-conf/config.json
+cd /tmp/sp-pre
+SERVERPANEL_CONFIG=/tmp/sp-pre-conf/config.json \
+SERVERPANEL_APPS_DIR=/tmp/sp-pre-apps \
+SERVERPANEL_METRICS_DB=/tmp/sp-pre-conf/metrics.db \
+  setsid nohup /root/aegis/AegisServerPanel/.venv/bin/python -m app.main \
+    --host 127.0.0.1 --port 8899 > /tmp/sp-pre.log 2>&1 &
+sleep 6 && curl -s http://127.0.0.1:8899/healthz    # 期望 {"ok":true,"version":"2.0"}
+```
+
+> ⚠️ `SERVERPANEL_APPS_DIR` 与 `SERVERPANEL_METRICS_DB` **必须隔离到生产之外**：新代码启动时会按注册表接管托管进程，若共用生产注册表，影子实例退出时会把线上应用一起收走。
+
+生产落盘（备份 → 覆盖 → 记账 → 重启）：
+
+```bash
+cd /root/aegis/AegisServerPanel
+BK=/root/deploy-backup; TS=$(date +%Y%m%d-%H%M%S); mkdir -p $BK
+tar czf $BK/code-$TS.tar.gz --exclude=.venv --exclude=.git --exclude=panel.log --exclude=logs .
+cp -a /etc/serverpanel/config.json $BK/config-$TS.json
+
+tar xzf /root/deploy-tmp/aegis.tar.gz --overwrite -C /root/aegis/AegisServerPanel
+.venv/bin/python -m compileall -q app                      # 语法级冒烟
+git add -A && git commit -m "deploy: <ref>"                # 设备侧记账，--show-version 才准
+( setsid nohup serverpanel --restart >/tmp/restart.log 2>&1 & )   # 必须后台化，否则响应被自己切断
+```
+
+落盘校验：目标机 `git write-tree` 应与开发机 `git rev-parse <ref>^{tree}` **完全一致**（逐字节，比逐个比文件可靠）。
+
+回滚：`git reset --hard <旧提交>` 或解包 `$BK/code-$TS.tar.gz`，再 `serverpanel --restart`；配置用同名 `config-*.json`。
 
 ### 自启动与持久化（容器 / PRoot / Termux 部署必读）
 
@@ -542,9 +623,9 @@ serverpanel --disable-internal      # 关闭内网模式（回到只读）
 
 serverpanel --set-password 新密码    # 重置面板密码（忘记密码时用）
 
-serverpanel --agent-token           # 生成 / 轮换 Agent 令牌
-serverpanel --show-agent-token      # 查看当前 Agent 令牌
-serverpanel --revoke-agent-token    # 吊销 Agent 令牌
+serverpanel --agent-token           # 新建一个 full 作用域令牌（明文只显示这一次）
+serverpanel --show-agent-token      # 列出令牌：id / 名称 / 作用域 / 过期时间（磁盘只存哈希，取不回明文）
+serverpanel --revoke-agent-token    # 吊销**全部** Agent 令牌，旧令牌立即失效
 serverpanel --show-version          # 版本与部署来源
 ```
 
@@ -557,9 +638,18 @@ serverpanel --show-version          # 版本与部署来源
 **准备**（内网模式下）：
 
 ```bash
-serverpanel --enable-internal
-serverpanel --agent-token      # 复制输出的令牌
+serverpanel --enable-internal    # Agent 通道只在完全控制模式下开放
+serverpanel --agent-token        # 新建 full 作用域令牌，明文只显示这一次
 ```
+
+令牌有两条获取路径：
+
+| 方式 | 作用域 | 适用 |
+|---|---|---|
+| `serverpanel --agent-token`（CLI） | `full` | 快速接入；等同 root |
+| 面板「安全中心 → Agent 令牌」 | `full` / `readonly`，可**限定命令前缀**、设**有效期**、随时单独吊销 | 长期运行的自动化，按最小权限发 |
+
+两种方式都**只存 SHA-256 哈希**：明文仅在创建那一瞬间显示，丢了只能重建。想知道有哪些令牌，用 `serverpanel --show-agent-token` 或面板列表（只有 id / 名称 / 作用域 / 过期时间）。
 
 **调用契约**
 
@@ -574,7 +664,7 @@ Content-Type: application/json
 → {"code": 0, "stdout": "...", "stderr": "..."}
 ```
 
-`command` 必填，`timeout` 取值 1~600 秒（默认 60），`code` 为命令退出码。
+`command` 必填，`timeout` 取值 1~600 秒（默认 60），`code` 为命令退出码；**负数表示被信号终止**（`-15` = SIGTERM，通常是超时后进程组被收走，或命令自己被 `pkill` 误伤）。
 
 **示例**
 
@@ -596,10 +686,29 @@ sp() {
 sp systemctl status nginx
 ```
 
+**调用纪律（都是踩过的坑）**
+
+- **一次 exec 不是原子操作**：`serverpanel --restart` / `--update` 会 TERM 面板，通道断 5~15 秒。客户端要「重试 + 退避」，别把一串有顺序依赖的动作塞进同一个请求。
+- **长任务不要占着 exec**：`timeout` 到点会向进程组发 TERM，连带杀掉这次请求 fork 出来的子进程。真·长任务用 `setsid nohup <cmd> > /tmp/x.log 2>&1 &` 后台化，再按日志轮询——面板重启也打断不了它。
+- **输出会被截断**：`stdout` / `stderr` 各最多回传 512KB（超出部分边读边丢，不会把面板撑爆）。需要全量就先落盘，再用 `tail` / `read_log` 分段取。
+- **要保活的东西交给托管应用**：`serverpanel --apps start <名称>` 拉起的进程独立成组、有 pidfile、面板升级时不中断，比在 exec 里 `nohup` 更可控（面板能看到状态、能重启它、能收走它 fork 的子进程）。
+- **命令按 shell 执行**（`sh -c`），需要指定目录用 `cwd`，不传则继承面板进程的 cwd。
+- 别用 `pkill -f <关键字>` 清理进程：exec 的 shell 自身命令行就含这个关键字，会把自己也杀掉（`code=-15`）。按 `/proc/*/cmdline` 精确匹配 argv 更稳。
+
+**判定服务活着 / 当前版本**
+
+```bash
+curl -sS http://<服务器IP>:8787/healthz    # {"ok":true} —— 远端不返回版本，避免暴露指纹
+curl -sS http://127.0.0.1:8787/healthz     # 服务器本机上才有 version 字段
+serverpanel --show-version                 # 面板版本 + 部署来源（设备侧代码版本）
+```
+
 **安全约束**
 
 - 令牌仅在内网模式下有效：一旦 `--disable-internal`，所有 Agent 请求立即 403
-- 令牌保存在 0600 权限的配置文件中，支持随时轮换与吊销；轮换后旧令牌立即失效
+- 令牌以 **SHA-256 哈希**存在 0600 的配置文件里，可随时新建、单独吊销或设有效期；吊销 / 过期后立即 401
+- `readonly` 作用域的令牌跑不了写操作、`sudo`，也读不到 `/proc/<pid>/root|cwd|fd` 这类魔法链接指向的文件
+- 令牌请放环境变量或 0600 文件，别写进命令行历史、更不要提交进仓库（面板自己也只在创建时显示一次）
 - 所有经由此接口执行的命令都会记入审计（来源标记为 Agent、来源 IP、命令、退出码、耗时），可在「Agent 接入」页面查看
 
 ---
@@ -671,11 +780,12 @@ sp systemctl status nginx
 ## 八、配置与数据
 
 - 配置文件：root 运行时为 `/etc/serverpanel/config.json`，普通用户为 `~/.config/serverpanel/config.json`，权限固定 `0600`
-- 可用 `SERVERPANEL_CONFIG` 环境变量或 `--config` 指定路径
-- 内容包含：密码哈希与盐、会话签名密钥、当前模式与切换时间、Agent 令牌
+- 可用 `SERVERPANEL_CONFIG` 环境变量或 `--config` 指定路径；它在**启动前**解析，审计目录、指标库、应用注册表等状态都跟随配置文件所在目录（回收站例外：root 部署固定在 `/var/lib/serverpanel/trash`，要改就用 `SERVERPANEL_TRASH_DIR`）
+- 内容包含：密码哈希与盐、会话签名密钥、当前模式与切换时间、Agent 令牌（只存 SHA-256 哈希，明文仅在创建时显示一次）
 - 常驻应用注册表：与配置文件同目录的 `apps.json`（权限 `0600`，原子替换写盘）；可用
   `SERVERPANEL_APPS_DIR` 指定独立目录（测试与多实例部署用）
-- 常驻应用日志：`<注册表目录>/logs/apps/<应用名>.log`，单文件超 4MB 自动轮转为 `.log.1`
+- 进程交接凭据：`<注册表目录>/logs/apps/<应用名>.pid`（原子替换写盘）。面板升级后，新实例靠它认领上一个实例拉起的进程
+- 常驻应用日志：`<注册表目录>/logs/apps/<应用名>.log`。输出由子进程**直接追加**，超过 `logs.app_max_bytes` 时**就地截断**保留尾部，不再生成 `.log.1`（rename 轮转会切断子进程正在写的 inode）
 - 快捷设置写在 `config.json` 的 `prefs` 命名空间（在「设置 → 快捷设置」里改即写入）：
 
   ```jsonc
@@ -775,6 +885,7 @@ serverpanel --host 0.0.0.0 --port 8787 --ssl-certfile /path/cert.pem --ssl-keyfi
 - **审计排空**：lifespan 退出调用 `audit.drain()`（刷盘但**不停**线程）——用 `close()` 会让本进程后续审计被静默丢弃。
 - **升级校验真正生效**：`/healthz` 只对**本机回环**请求附带 `version`（远端仍是 `{"ok": true}`，指纹不外泄），`manage.health_check` 版本不符一律判失败。此前 `expect_version` 永远匹配不上，旧进程还在响应就被当成"升级成功"，也无法证明回滚后跑的是哪一版。
 - **依赖**：`opentelemetry-api` 1.45.0 → 1.45.1（CVE-2026-114603）。
+- **文档**：部署教程新增「从压缩包 / 内网直传部署」（含影子预检与 `git write-tree` 落盘校验、回滚步骤）；「升级」改写为如实描述交互——升级不中断托管应用、exec 通道会断 5~15 秒、首次从旧版升级仍会停一次；冒烟补上 `SERVERPANEL_SMOKE_WORK` 的坑；Agent 说明书补「调用纪律」（重试 / 长任务后台化 / 512KB 输出上限 / `pkill` 自杀陷阱）与令牌作用域说明。
 - **验证**：`pytest` 全绿（Windows 开发机，含本轮新增回归）；`gen_sha256sums.py --check` 88 文件通过；`node --check static/app.js` 通过。
 
 ### 2.0（本仓库合入版：外包 1.6.0 + 2.0.0 + 2.0.1）

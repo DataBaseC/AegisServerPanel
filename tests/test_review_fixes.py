@@ -292,9 +292,17 @@ def test_config_flag_isolates_all_state_dirs(tmp_path):
     assert out.returncode == 0, out.stderr
     paths = [Path(line.strip()) for line in out.stdout.splitlines() if line.strip()]
     assert len(paths) == 4, out.stdout
+    audit_dir, metrics_db, trash_dir, registry = paths
     base = str(target.parent)
-    for path in paths:
+    for path in (audit_dir, metrics_db, registry):
         assert str(path).startswith(base), f"{path} 未跟随 --config（期望在 {base} 下）"
+    # 回收站是**有意**不跟随 --config 的：root 部署固定在 /var/lib/serverpanel/trash
+    # （回收站可能几个 GB，不能塞进 /etc）；非 root 才退到配置目录旁。
+    # 要给它单独指定位置用 SERVERPANEL_TRASH_DIR。
+    if os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() == 0:
+        assert str(trash_dir) == "/var/lib/serverpanel/trash", trash_dir
+    else:
+        assert str(trash_dir).startswith(base), f"非 root 时回收站应随配置目录：{trash_dir}"
 
 
 # ================================================================ 升级不打断托管应用

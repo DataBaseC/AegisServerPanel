@@ -761,7 +761,7 @@ serverpanel --host 0.0.0.0 --port 8787 --ssl-certfile /path/cert.pem --ssl-keyfi
 - **P0 数据丢失**：`shell.run(stdin=...)` 从未建立 stdin 管道 → `crontab -` 在 systemd 下读到 EOF，可能安装空 crontab（随后"读回校验失败→恢复"也走同一坏路径）。已补 `stdin=PIPE`，并加真实子进程回归（不再只靠 fake shell）。
 - **只读作用域提权**：`/proc/<pid>/root|cwd|fd` 是魔法链接，`cat /proc/self/root/etc/shadow` 能读真实根目录文件；`scopes._path_denied` 现在无条件拒绝（cat 与 wc/stat/file/du 共用）。
 - **升级不打断托管应用**：应用输出改为**直写日志文件**（管道读端随面板消失会让应用下次写日志就 EPIPE 被杀，此前"只 TERM 面板进程"实际保不住）；新增 `logs/apps/<名称>.pid` + `adopt_all()` 接管（校验命令行防 PID 复用）+ `.apps-survive` 交接标记（TTL 180s）；`--stop` 仍连带结束应用。日志上限改为就地截断（rename 会切断子进程正在写的 inode）。
-- **`--config` 真正隔离**：在创建 config 单例**之前**解析 argv —— 审计 / 指标 / 回收站 / 应用注册表全部跟随（此前只有主配置跟着走，多实例会混写状态）。
+- **`--config` 真正隔离**：在创建 config 单例**之前**解析 argv —— 审计 / 指标 / 应用注册表全部跟随（此前只有主配置跟着走，多实例会混写状态）。回收站是有意的例外：root 部署固定在 `/var/lib/serverpanel/trash`（可能几个 GB，不塞 `/etc`），非 root 才退到配置目录旁；要单独指定用 `SERVERPANEL_TRASH_DIR`。
 - **前端资源回收**：`res.own()` 登记的资源在**正常切视图**与掉登录时也会 dispose（此前只在渲染失败/渲染期切走时回收，日志页的 `tail` WebSocket 与安全中心 30s 轮询会残留）。
 - **覆盖写原子化**：临时文件 + `fsync` + `os.replace`，并保留原文件权限位；写到一半被 SIGKILL 不再留下半截文件。
 - **并发启动**：每个应用一把 `asyncio.Lock`，双击 / 客户端重试 / 自启并发只拉起一个进程。

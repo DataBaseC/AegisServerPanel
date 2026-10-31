@@ -29,8 +29,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt -c constraints.txt pytest==9.1.1 httpx==0.28.1
 
+      # 失败时把 FAILED 行以 ::error:: 注解的形式抛出来：Actions 的原始日志对未登录用户
+      # 不可见，注解是唯一能匿名读到的部分（否则只能让人登录截图才能定位）。
       - name: 单元测试
-        run: python -m pytest -q
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -q -ra --tb=short 2>&1 | tee pytest.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            grep -E "^(FAILED|ERROR)" pytest.log | head -10 | while IFS= read -r line; do
+              echo "::error title=pytest::$line"
+            done
+          fi
+          exit "$status"
 
       - name: 前端语法检查
         run: node --check static/app.js

@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aegis 桌面</title>
+<link rel="icon" href="/static/favicon.svg">
+<link rel="stylesheet" href="/static/vendor/xterm.css">
+<link rel="stylesheet" href="/static/desktop/desktop.css">
+</head>
+<body>
+<div class="desktop" id="desktop">
+  <div class="wallpaper" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="tb-left">
+      <button type="button" class="tb-btn" id="btn-activities">活动</button>
+      <span class="tb-app" id="tb-app">Aegis 桌面</span>
+    </div>
+    <div class="tb-right">
+      <span class="tb-mode" id="tb-mode">连接中…</span>
+      <span class="tb-clock" id="tb-clock"></span>
+    </div>
+  </header>
+
+  <main class="workspace" id="workspace">
+    <div class="window-layer" id="window-layer"></div>
+
+    <div class="desktop-icons" id="desktop-icons">
+      <button type="button" class="desktop-icon" id="icon-terminal">
+        <span class="di-glyph" aria-hidden="true">&gt;_</span>
+        <span class="di-text">终端</span>
+      </button>
+    </div>
+
+    <div class="empty-hint" id="empty-hint">
+      双击桌面图标，或点击下方 Dock 中的「终端」开始
+    </div>
+
+    <div class="launcher" id="launcher" hidden>
+      <div class="launcher-panel">
+        <div class="launcher-search">应用</div>
+        <div class="launcher-grid">
+          <button type="button" class="launcher-app" data-app="terminal">
+            <span class="la-glyph" aria-hidden="true">&gt;_</span>
+            <span>终端</span>
+          </button>
+          <button type="button" class="launcher-app disabled" disabled>
+            <span class="la-glyph" aria-hidden="true">▤</span>
+            <span>文件</span>
+          </button>
+          <button type="button" class="launcher-app disabled" disabled>
+            <span class="la-glyph" aria-hidden="true">◔</span>
+            <span>监视器</span>
+          </button>
+          <button type="button" class="launcher-app disabled" disabled>
+            <span class="la-glyph" aria-hidden="true">⚙</span>
+            <span>设置</span>
+          </button>
+        </div>
+        <p class="launcher-note">M0 原型：窗口管理器 + 多终端。其余应用后续里程碑接入。</p>
+      </div>
+    </div>
+  </main>
+
+  <footer class="dock" id="dock" aria-label="Dock"></footer>
+
+  <div class="toast-layer" id="toast-layer" aria-live="polite"></div>
+
+  <div class="login-overlay" id="login" hidden>
+    <form class="login-card" id="login-form" autocomplete="on">
+      <div class="login-logo" aria-hidden="true">&gt;_</div>
+      <h1>登录到桌面</h1>
+      <p class="login-sub" id="login-sub">使用面板账号进入 Web 桌面</p>
+      <label class="login-row" id="login-user-row" hidden>
+        <span>用户名</span>
+        <input id="login-user" name="username" autocomplete="username">
+      </label>
+      <label class="login-row">
+        <span>密码</span>
+        <input id="login-password" name="password" type="password"
+               autocomplete="current-password" required>
+      </label>
+      <label class="login-row" id="login-code-row" hidden>
+        <span>动态码</span>
+        <input id="login-code" name="code" inputmode="numeric" autocomplete="one-time-code">
+      </label>
+      <div class="login-error" id="login-error" hidden></div>
+      <button class="login-submit" type="submit" id="login-submit">登录</button>
+    </form>
+  </div>
+</div>
+
+<script src="/static/vendor/xterm.js"></script>
+<script src="/static/vendor/addon-fit.js"></script>
+<script type="module" src="/static/desktop/js/main.js"></script>
+</body>
+</html>

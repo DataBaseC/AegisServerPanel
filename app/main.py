@@ -32,6 +32,7 @@ from .routes import (
     app_routes,
     apps_routes,
     auth_routes,
+    desktop_routes,
     file_routes,
     infra_routes,
     log_routes,
@@ -237,6 +238,7 @@ for module in (
     market_routes,
     platform_routes,
     recording_routes,
+    desktop_routes,
 ):
     app.include_router(module.router)
 
@@ -271,6 +273,12 @@ async def system_version(_session: dict = Depends(require_auth)):
 @app.get("/")
 async def index():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/desktop")
+async def desktop_index():
+    """Web 桌面（M0 原型）：与控制台共用登录态与后端接口，前端独立。"""
+    return FileResponse(STATIC_DIR / "desktop" / "index.html")
 
 
 @app.get("/favicon.ico")

@@ -281,8 +281,9 @@ async function enterDesktop(status) {
   });
 
   const windows = (savedLayout && Array.isArray(savedLayout.windows)) ? savedLayout.windows : [];
+  // 公网模式不恢复终端窗口（否则每个窗口都会弹一次"需要内网模式"的提示）
   windows.forEach((item) => {
-    if (item && item.appId === "terminal") openTerminal(item);
+    if (internalMode && item && item.appId === "terminal") openTerminal(item);
   });
 
   // 首次进入桌面自动开一个终端，避免空白页；之后完全按保存的布局来

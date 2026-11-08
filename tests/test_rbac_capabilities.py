@@ -85,6 +85,7 @@ OPERATOR_ALLOWED_WRITES = [
      "网络工具：固定 argv + ops.check_target 拒 '-' 开头，无法注入选项"),
     (r"^/api/panel/infra/databases/probe$", "数据库只读探测"),
     (r"^/api/snippets(/.*)?$", "代码片段：纯文本存储，不自动执行"),
+    (r"^/api/desktop/layout$", "桌面布局：仅当前用户自己的窗口位置/尺寸，非关键数据"),
     (r"^/api/files(/.*)?$", "文件管理：路径级写根白名单在 file_routes 里另做一层判定"),
     (r"^/api/panel/logs(/.*)?$", "日志清理/跟随属运维日常（不落代码）"),
     (r"^/api/processes/[^/]+/(signal|nice)$",

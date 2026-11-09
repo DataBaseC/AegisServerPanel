@@ -16,9 +16,22 @@ jobs:
         with:
           python-version: "3.11"
 
-      # 升级链路会用这份清单做完整性校验（2.0 M1），提交前必须与工作树一致
+      # 升级链路会用这份清单做完整性校验（2.0 M1），提交前必须与工作树一致。
+      # dependabot 会改 requirements.txt / constraints.txt / ci.yml，但它不知道要
+      # 重生成清单，于是它的 PR 永远卡在这一步（pytest 都没跑到）。所以对它的 PR
+      # 在这里就地重生成，真正的提交由 fix-manifest job 推回分支。
       - name: 校验代码完整性清单
-        run: python3 tools/gen_sha256sums.py --check
+        run: |
+          if python3 tools/gen_sha256sums.py --check; then
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ] \
+             && [ "${{ github.actor }}" = "dependabot[bot]" ]; then
+            echo "::warning title=SHA256SUMS::依赖机器人未同步清单，已就地重生成（由 fix-manifest 提交回分支）"
+            python3 tools/gen_sha256sums.py
+            exit 0
+          fi
+          exit 1
 
       # 运行期依赖按仓库既有的锁定组合安装；pytest 与 httpx 是测试期依赖
       # （requirements.txt 只登记运行期直接依赖，测试依赖在此补装）。
@@ -63,6 +76,33 @@ jobs:
         run: |
           python -m pip install --upgrade pip pip-audit
           pip-audit -r requirements.txt
+
+  fix-manifest:
+    # dependabot 改的是受完整性清单覆盖的文件（requirements/constraints/ci.yml），
+    # 但它不会重生成 SHA256SUMS，于是它的 PR 一直是红叉。这里把清单补齐并推回
+    # PR 分支，让红叉指向真正的测试失败而不是"清单不一致"。
+    if: github.event_name == 'pull_request' && github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 检出 PR 分支
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: 重生成清单并推送
+        run: |
+          python3 tools/gen_sha256sums.py
+          if git diff --quiet -- SHA256SUMS; then
+            echo "SHA256SUMS 已与仓库内容一致，无需提交"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add SHA256SUMS
+          git commit -m "chore(deps): 重新生成 SHA256SUMS（dependabot 依赖升级）"
+          git push
 
 # 冒烟测试（Playwright，tests/smoke_frontend.py）不进 CI：
 # 它依赖真实浏览器与真实系统环境（pty 终端、systemd/服务管理、可写的

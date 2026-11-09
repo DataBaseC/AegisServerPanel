@@ -219,7 +219,6 @@ AegisServerPanel/
 │   ├── smoke_apps.py         # 常驻应用冒烟脚本（开发机可跑，验证守护与日志）
 │   ├── smoke_optimizations.py# 深度优化冒烟：起真服务走 HTTP 验证钳制/热加载/逃逸/白名单
 │   └── verify-apps.sh        # 服务器端常驻应用生命周期自检（不停面板）
-├── docs/                     # 优化报告与验收评审记录（历史留档）
 ├── install.sh                # 安装引导（环境检查 + venv + 依赖），其余交给 serverpanel --install
 ├── run.sh                    # 前台快速启动（调试用）
 ├── requirements.txt          # 直接依赖（~= 兼容约束）
